@@ -1,0 +1,65 @@
+name: build-image
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths: ['build/**', '.github/workflows/build-image.yml']
+permissions:
+  contents: read
+  packages: write
+concurrency:
+  group: build-image
+  cancel-in-progress: false
+jobs:
+  build:
+    # Public-repo hosted runner: 4 vCPU / 16 GB. The private-repo runner
+    # (2 vCPU / 7 GB) ran out of memory compiling the Iroha workspace.
+    runs-on: ubuntu-latest
+    timeout-minutes: 345
+    env:
+      COMMIT: 071e281e778c5928cab4d6e007b7ddc9b050df27
+      IMAGE: ghcr.io/radityaaa43/iroha3-rd-node:071e281e-stark
+      # One rustc for a large Iroha crate can take several GB; 3 jobs keeps
+      # the peak under 16 GB so the runner agent is not starved.
+      CARGO_BUILD_JOBS: 3
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - name: Free disk and add swap
+        run: |
+          nproc; free -g; df -h /
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache \
+            /usr/local/share/boost /usr/share/swift /usr/local/.ghcup /usr/local/share/powershell
+          docker system prune -af
+          # Best-effort swap: never block the build.
+          sudo swapoff -a || true
+          if sudo fallocate -l 6G /swapfile.build && sudo chmod 600 /swapfile.build \
+             && sudo mkswap /swapfile.build && sudo swapon /swapfile.build; then
+            echo "swap ok"
+          else
+            echo "::warning::swap setup failed"
+          fi
+          free -g; df -h /
+      - name: Fetch Iroha source
+        run: |
+          git init "$RUNNER_TEMP/iroha"
+          git -C "$RUNNER_TEMP/iroha" fetch --depth 1 https://github.com/hyperledger-iroha/iroha "$COMMIT"
+          git -C "$RUNNER_TEMP/iroha" checkout --detach FETCH_HEAD
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Build image
+        run: |
+          # Resource trace every 2 minutes, so a starved runner leaves evidence.
+          ( while sleep 120; do echo "::group::resources $(date -u +%H:%M)"; free -m | sed -n 2,3p; df -h / | tail -1; echo "::endgroup::"; done ) &
+          build/build-image.sh "$RUNNER_TEMP/iroha" "$IMAGE"
+      - name: Smoke
+        run: |
+          docker run --rm --entrypoint iroha3d "$IMAGE" --version
+          docker run --rm --entrypoint iroha "$IMAGE" --help > /dev/null
+          docker run --rm --entrypoint kagami "$IMAGE" --help > /dev/null
+      - name: Push
+        run: docker push "$IMAGE"
