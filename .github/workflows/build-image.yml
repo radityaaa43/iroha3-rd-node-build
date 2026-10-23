@@ -19,9 +19,10 @@ jobs:
     env:
       COMMIT: 071e281e778c5928cab4d6e007b7ddc9b050df27
       IMAGE: ghcr.io/radityaaa43/iroha3-rd-node:071e281e-stark
-      # One rustc for a large Iroha crate can take several GB; 3 jobs keeps
-      # the peak under 16 GB so the runner agent is not starved.
-      CARGO_BUILD_JOBS: 3
+      # Run 39929648703 with 3 jobs filled 16 GB RAM + 6 GB swap while the
+      # last heavy crates (iroha_core, iroha_torii, iroha) compiled and was
+      # killed (exit 143). One job also caps rustc's LLVM codegen threads.
+      CARGO_BUILD_JOBS: 1
     steps:
       - uses: actions/checkout@v4
         with:
@@ -34,7 +35,7 @@ jobs:
           docker system prune -af
           # Best-effort swap: never block the build.
           sudo swapoff -a || true
-          if sudo fallocate -l 6G /swapfile.build && sudo chmod 600 /swapfile.build \
+          if sudo fallocate -l 16G /swapfile.build && sudo chmod 600 /swapfile.build \
              && sudo mkswap /swapfile.build && sudo swapon /swapfile.build; then
             echo "swap ok"
           else
