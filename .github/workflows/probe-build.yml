@@ -1,0 +1,70 @@
+name: probe-build
+# Compile probe of an upstream Iroha commit. No docker, no registry, no secrets,
+# no artifacts: the build log tail is printed to the job log on failure.
+on:
+  workflow_dispatch:
+    inputs:
+      sha:
+        description: Full upstream hyperledger-iroha/iroha commit SHA
+        required: true
+permissions:
+  contents: read
+concurrency:
+  group: probe-build-${{ inputs.sha }}
+  cancel-in-progress: false
+jobs:
+  probe:
+    runs-on: ubuntu-latest
+    timeout-minutes: 350
+    env:
+      SHA: ${{ inputs.sha }}
+      CARGO_BUILD_JOBS: 1
+    steps:
+      - name: Validate sha
+        run: |
+          case "$SHA" in *[!0-9a-f]*|"") exit 1 ;; esac
+          test "${#SHA}" -eq 40
+      - name: Free disk and add swap
+        run: |
+          df -h /
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache \
+            /usr/local/share/boost /usr/share/swift /usr/local/.ghcup /usr/local/share/powershell
+          sudo swapoff -a || true
+          if sudo fallocate -l 16G /swapfile.build && sudo chmod 600 /swapfile.build \
+             && sudo mkswap /swapfile.build && sudo swapon /swapfile.build; then
+            echo "swap ok"
+          else
+            echo "::warning::swap setup failed"
+          fi
+          free -g; df -h /
+      - name: Fetch Iroha source
+        run: |
+          git init "$RUNNER_TEMP/iroha"
+          git -C "$RUNNER_TEMP/iroha" fetch --depth 1 https://github.com/hyperledger-iroha/iroha "$SHA"
+          git -C "$RUNNER_TEMP/iroha" checkout --detach FETCH_HEAD
+          test "$(git -C "$RUNNER_TEMP/iroha" rev-parse HEAD)" = "$SHA"
+      - name: Install the pin's toolchain
+        working-directory: ${{ runner.temp }}/iroha
+        run: |
+          cat rust-toolchain.toml
+          ch=$(sed -n 's/^channel *= *"\(.*\)"/\1/p' rust-toolchain.toml)
+          echo "TOOLCHAIN=$ch" >> "$GITHUB_ENV"
+          rustup toolchain install "$ch" --profile minimal
+          rustup run "$ch" rustc --version
+      - name: Build
+        working-directory: ${{ runner.temp }}/iroha
+        env:
+          IROHA_GIT_COMMIT_HASH: ${{ inputs.sha }}
+          VERGEN_GIT_SHA: ${{ inputs.sha }}
+        run: |
+          ( while sleep 120; do echo "::group::resources $(date -u +%H:%M)"; free -m | sed -n 2,3p; df -h / | tail -1; echo "::endgroup::"; done ) &
+          # zk-stark exists on irohad at both pins; external-software-signer-bin is not on these packages.
+          set +e
+          cargo +"$TOOLCHAIN" build --release --locked -p irohad -p iroha_cli -p iroha_kagami \
+            --features zk-stark 2>&1 | tee "$RUNNER_TEMP/build.log"
+          rc=${PIPESTATUS[0]}
+          if [ "$rc" -ne 0 ]; then
+            echo "::group::first errors"; grep -n -m5 -A12 '^error' "$RUNNER_TEMP/build.log"; echo "::endgroup::"
+            echo "::group::last 200 lines"; tail -n 200 "$RUNNER_TEMP/build.log"; echo "::endgroup::"
+          fi
+          exit "$rc"
