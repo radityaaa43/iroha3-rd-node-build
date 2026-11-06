@@ -1,27 +1,31 @@
 name: probe-build
 # Compile probe of an upstream Iroha commit. No docker, no registry, no secrets,
 # no artifacts: the build log tail is printed to the job log on failure.
+# workflow_dispatch needs the file on main, which is off limits, so the upstream
+# SHA is read from probe-sha.txt and the run starts on push of that file.
 on:
-  workflow_dispatch:
-    inputs:
-      sha:
-        description: Full upstream hyperledger-iroha/iroha commit SHA
-        required: true
+  push:
+    branches: [probe/upstream-pins]
+    paths: [probe-sha.txt]
 permissions:
   contents: read
 concurrency:
-  group: probe-build-${{ inputs.sha }}
+  group: probe-build-${{ github.sha }}
   cancel-in-progress: false
 jobs:
   probe:
     runs-on: ubuntu-latest
     timeout-minutes: 350
     env:
-      SHA: ${{ inputs.sha }}
       CARGO_BUILD_JOBS: 1
     steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
       - name: Validate sha
         run: |
+          SHA=$(tr -d ' \n' < probe-sha.txt)
+          echo "SHA=$SHA" >> "$GITHUB_ENV"
           case "$SHA" in *[!0-9a-f]*|"") exit 1 ;; esac
           test "${#SHA}" -eq 40
       - name: Free disk and add swap
@@ -54,8 +58,8 @@ jobs:
       - name: Build
         working-directory: ${{ runner.temp }}/iroha
         env:
-          IROHA_GIT_COMMIT_HASH: ${{ inputs.sha }}
-          VERGEN_GIT_SHA: ${{ inputs.sha }}
+          IROHA_GIT_COMMIT_HASH: ${{ env.SHA }}
+          VERGEN_GIT_SHA: ${{ env.SHA }}
         run: |
           ( while sleep 120; do echo "::group::resources $(date -u +%H:%M)"; free -m | sed -n 2,3p; df -h / | tail -1; echo "::endgroup::"; done ) &
           # zk-stark exists on irohad at both pins; external-software-signer-bin is not on these packages.
