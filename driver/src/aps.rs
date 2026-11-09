@@ -162,6 +162,12 @@ pub fn run_dvp(cfg: &Config, legs: Vec<Leg>, options: &Options) -> Result<()> {
             leg.funding >= leg.amount + reimbursement,
             "leg {ordinal}: insufficient payer note (rejected before proving)"
         );
+        // A zero-value change note makes the audit capsule seal fail after the pools are already
+        // activated ("private-settlement audit canonical encoding failed", measured 2026-11-10).
+        ensure!(
+            leg.funding > leg.amount + reimbursement,
+            "leg {ordinal}: payer note leaves no change; fund at least 1 more (rejected before proving)"
+        );
     }
     let (sponsor, sponsor_key) = cfg.sponsor("bi")?;
     let sponsor_id = AccountId::new(sponsor_key.public_key().clone());
