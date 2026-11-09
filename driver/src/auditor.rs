@@ -169,6 +169,7 @@ pub fn run(cfg: Config) -> Result<()> {
         let result = match (method, path) {
             ("GET", "/healthz") => Ok("{}".to_owned()),
             ("GET", "/keys") => auditor.keys(),
+            ("GET", p) if p.starts_with("/records/") => auditor.records(&p["/records/".len()..]),
             ("POST", "/approve") => serde_json::from_str(body)
                 .map_err(Into::into)
                 .and_then(|request| auditor.approve(&request))
@@ -186,6 +187,25 @@ pub fn run(cfg: Config) -> Result<()> {
 }
 
 impl Auditor {
+    /// BI's own decrypted records for one bundle (Lensa's BI lens). Read-only; the store only
+    /// holds legs this auditor decided. The id is checked as 64 hex so it cannot leave store_dir.
+    fn records(&self, bundle_id: &str) -> Result<String> {
+        ensure!(
+            bundle_id.len() == 64 && bundle_id.bytes().all(|b| b.is_ascii_hexdigit()),
+            "bad bundle id"
+        );
+        let dir = self.cfg.auditor.store_dir.join(bundle_id.to_ascii_lowercase());
+        let mut records = Vec::new();
+        if dir.is_dir() {
+            for entry in std::fs::read_dir(dir)? {
+                let record: Record = serde_json::from_slice(&std::fs::read(entry?.path())?)?;
+                records.push(record);
+            }
+        }
+        records.sort_by_key(|record| record.leg);
+        Ok(serde_json::to_string(&records)?)
+    }
+
     fn keys(&self) -> Result<String> {
         Ok(serde_json::to_string(&Keys {
             signing: self.signing.public_key().to_string(),

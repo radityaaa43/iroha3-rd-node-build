@@ -342,7 +342,8 @@ pub fn run_dvp(cfg: &Config, legs: Vec<Leg>, options: &Options) -> Result<()> {
             client
                 .submit_private_settlement_bundle_v1(&request)
                 .wrap_err("submit abort")?;
-            let outcome = wait_receipt(cfg, final_manifest.bundle_id)?;
+            let (outcome, height) = wait_receipt(cfg, final_manifest.bundle_id)?;
+            print_result(&final_manifest, &governed, &request.transaction.hash().to_string(), outcome, height);
             return check_outcome(outcome, options.expect);
         }
         println!("leg {ordinal} audited");
@@ -376,8 +377,9 @@ pub fn run_dvp(cfg: &Config, legs: Vec<Leg>, options: &Options) -> Result<()> {
     client
         .submit_private_settlement_bundle_v1(&request)
         .wrap_err("submit finalization")?;
-    let outcome = wait_receipt(cfg, final_manifest.bundle_id)?;
+    let (outcome, height) = wait_receipt(cfg, final_manifest.bundle_id)?;
     println!("settled after {:?}", started.elapsed());
+    print_result(&final_manifest, &governed, &request.transaction.hash().to_string(), outcome, height);
     check_outcome(outcome, options.expect)?;
 
     if options.replay {
@@ -385,13 +387,37 @@ pub fn run_dvp(cfg: &Config, legs: Vec<Leg>, options: &Options) -> Result<()> {
             Err(error) => println!("replay rejected: {error:#}"),
             Ok(_) => {
                 thread::sleep(Duration::from_secs(10));
-                let again = wait_receipt(cfg, final_manifest.bundle_id)?;
+                let (again, _) = wait_receipt(cfg, final_manifest.bundle_id)?;
                 ensure!(again == "finalized", "replay changed the receipt to {again}");
                 println!("replay accepted by Torii but receipt unchanged (finalized once)");
             }
         }
     }
     Ok(())
+}
+
+/// One machine-readable line for callers (Lensa): public identifiers only, no amounts or
+/// parties (those stay in the payers' wallets and in BI's audit store).
+fn print_result(manifest: &AtomicPrivateSettlementV1, governed: &[Governed], carrier_tx: &str, outcome: &str, height: u64) {
+    let legs = governed
+        .iter()
+        .map(|leg| {
+            serde_json::json!({
+                "lane": leg.route.lane_id.as_u32(),
+                "pool_id": hex::encode(leg.governance.body.pool_id.as_ref()),
+            })
+        })
+        .collect::<Vec<_>>();
+    println!(
+        "result_json={}",
+        serde_json::json!({
+            "bundle_id": hex::encode(manifest.bundle_id.as_ref()),
+            "carrier_tx": carrier_tx,
+            "outcome": outcome,
+            "height": height,
+            "legs": legs,
+        })
+    );
 }
 
 fn check_outcome(outcome: &'static str, expect: Expect) -> Result<()> {
@@ -424,7 +450,7 @@ fn bounded_fee_for(fee_asset: &str) -> Result<FeePaymentIntent> {
 }
 
 /// Wait until every node reports the same terminal receipt kind.
-fn wait_receipt(cfg: &Config, bundle_id: Hash) -> Result<&'static str> {
+fn wait_receipt(cfg: &Config, bundle_id: Hash) -> Result<(&'static str, u64)> {
     let clients = cfg
         .torii
         .keys()
@@ -433,11 +459,13 @@ fn wait_receipt(cfg: &Config, bundle_id: Hash) -> Result<&'static str> {
     let deadline = Instant::now() + FINALITY_TIMEOUT;
     loop {
         let mut kinds = Vec::new();
+        let mut height = 0;
         for (party, client) in &clients {
             let kind = match client.client().private_settlement_bundle_receipt_v1(bundle_id) {
                 Ok(PrivateSettlementBundleReceiptResponseV1::Pending { .. }) => "pending",
                 Ok(PrivateSettlementBundleReceiptResponseV1::Finalized(receipt)) => {
                     ensure!(!receipt.legs.is_empty(), "{party}: empty finalized receipt");
+                    height = receipt.finalized_height;
                     "finalized"
                 }
                 Ok(PrivateSettlementBundleReceiptResponseV1::Aborted(_)) => "aborted",
@@ -449,7 +477,7 @@ fn wait_receipt(cfg: &Config, bundle_id: Hash) -> Result<&'static str> {
             kinds.push(kind);
         }
         if kinds.iter().all(|kind| *kind != "pending" && *kind == kinds[0]) {
-            return Ok(kinds[0]);
+            return Ok((kinds[0], height));
         }
         ensure!(
             !kinds.contains(&"finalized") || !kinds.contains(&"aborted"),
