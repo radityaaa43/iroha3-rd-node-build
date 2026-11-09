@@ -19,7 +19,6 @@ use std::{
 
 use eyre::{Result, WrapErr, ensure, eyre};
 use iroha::{
-    blocking::Client,
     client::{
         AccountTransactionDraft, PrivateSettlementBundleReceiptResponseV1,
         PrivateSettlementLegUploadRequestV1, TransactionWaitOptions,

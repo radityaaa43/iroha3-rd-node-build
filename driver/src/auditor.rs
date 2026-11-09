@@ -244,10 +244,9 @@ impl Auditor {
             &self.signing,
             &evaluator,
         );
-        let (verdict, plaintext) = seen
-            .into_inner()
-            .expect("evaluator lock")
-            .ok_or_else(|| eyre!("capsule did not decrypt: {:?}", approval.err()))?;
+        let Some((verdict, plaintext)) = seen.into_inner().expect("evaluator lock") else {
+            return Err(eyre!("capsule did not decrypt: {:?}", approval.err()));
+        };
         if let Err(reason) = verdict {
             write_record(&record_path, &bundle_id, leg, &format!("rejected: {reason}"), &plaintext)?;
             eprintln!("bundle={bundle_id} leg={leg} rejected: {reason}");

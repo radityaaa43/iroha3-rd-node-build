@@ -42,7 +42,9 @@ jobs:
           free -g; df -h /
       # Upstream deps dominate build time (~2 h cold). The key changes only with upstream or
       # the driver's manifest; source edits reuse the cached dependency artifacts.
-      - uses: actions/cache@v4
+      # restore + explicit save (always): a failing driver compile still keeps the ~1 h of
+      # upstream dependency artifacts, so the fix-up run starts warm.
+      - uses: actions/cache/restore@v4
         with:
           path: |
             ${{ env.WORK }}/cargo-home
@@ -55,6 +57,13 @@ jobs:
         run: |
           ( while sleep 120; do echo "::group::resources $(date -u +%H:%M)"; free -m | sed -n 2,3p; df -h / | tail -1; echo "::endgroup::"; done ) &
           driver/build.sh test
+      - uses: actions/cache/save@v4
+        if: always()
+        with:
+          path: |
+            ${{ env.WORK }}/cargo-home
+            ${{ env.WORK }}/target
+          key: driver-071e281e-${{ hashFiles('driver/Cargo.toml') }}-${{ github.sha }}
       - name: Build
         run: driver/build.sh build
       - name: Image
