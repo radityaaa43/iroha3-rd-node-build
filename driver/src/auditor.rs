@@ -5,7 +5,12 @@
 //! quorum, decrypts it with BI's key, applies local rules, submits the approval quorum, and
 //! keeps the plaintext in its store (O5). Logs carry digests only.
 
-use std::{path::PathBuf, sync::Mutex};
+use std::{
+    io::Write,
+    os::unix::fs::OpenOptionsExt,
+    path::{Path, PathBuf},
+    sync::Mutex,
+};
 
 use eyre::{Result, WrapErr, ensure, eyre};
 use iroha::{
@@ -27,7 +32,7 @@ use iroha_core::private_settlement::{
     PrivateSettlementAuditEvaluationV1, PrivateSettlementAuditorSidecarViewV1,
     PrivateSettlementSidecarLifecycleV1, approve_private_settlement_leg_v1,
 };
-use iroha_crypto::{Hash, HybridKeyPair, KeyPair, PublicKey};
+use iroha_crypto::{Hash, HybridKeyPair, HybridSecretKey, KeyPair, PublicKey};
 use serde::{Deserialize, Serialize};
 
 use crate::{
@@ -79,13 +84,29 @@ pub fn evaluate(
     Ok(())
 }
 
-/// BI's signing key and hybrid (X25519 + ML-KEM-768) capsule key, both from one seed so
-/// a restarted pod keeps the identity named in already-activated pool policies.
-pub fn auditor_keys(seed: &[u8; 32]) -> Result<(KeyPair, HybridKeyPair)> {
-    let mut rng = iroha_crypto::rng_from_seed_slice(
-        &[b"rd-dfabi:bi-auditor:hybrid:v1".as_slice(), seed.as_slice()].concat(),
-    );
-    Ok((signing_key(seed), HybridKeyPair::generate(&mut rng)?))
+/// BI's capsule decryption key (X25519 + ML-KEM-768), stored as `<x25519 hex>:<ml-kem hex>`.
+/// It cannot be derived from the signing seed: upstream ML-KEM generation is hedged with OS
+/// entropy (`iroha_crypto::hybrid::HybridKeyPair::try_generate`). A restarted pod must load the
+/// same key named in already-activated pool policies, and old keys stay readable for O5.
+pub fn write_hybrid(path: &Path) -> Result<()> {
+    let pair = HybridKeyPair::generate(&mut rand::rngs::OsRng)?;
+    let (x25519, kyber) = pair.secret().to_bytes();
+    std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(path)?
+        .write_all(format!("{}:{}", hex::encode(x25519), hex::encode(kyber)).as_bytes())?;
+    Ok(())
+}
+
+pub fn read_hybrid(path: &Path) -> Result<HybridSecretKey> {
+    let text = std::fs::read_to_string(path).wrap_err_with(|| format!("read {}", path.display()))?;
+    let (x25519, kyber) = text
+        .trim()
+        .split_once(':')
+        .ok_or_else(|| eyre!("{} is not <x25519>:<ml-kem>", path.display()))?;
+    Ok(HybridSecretKey::from_bytes(hex::decode(x25519)?, hex::decode(kyber)?)?)
 }
 
 #[derive(Serialize, Deserialize)]
@@ -127,12 +148,13 @@ struct Auditor {
     cfg: Config,
     rules: Rules,
     signing: KeyPair,
-    hybrid: HybridKeyPair,
+    hybrid: HybridSecretKey,
     client: Client,
 }
 
 pub fn run(cfg: Config) -> Result<()> {
-    let (signing, hybrid) = auditor_keys(&cfg.seed("bi-auditor")?)?;
+    let signing = signing_key(&cfg.seed("bi-auditor")?);
+    let hybrid = read_hybrid(&cfg.key_dir.join("bi-auditor.hybrid"))?;
     std::fs::create_dir_all(&cfg.auditor.store_dir)?;
     let auditor = Auditor {
         rules: Rules::from_config(&cfg)?,
@@ -240,7 +262,7 @@ impl Auditor {
             &governance,
             fetched.authoritative_height,
             &AccountId::new(self.signing.public_key().clone()),
-            self.hybrid.secret(),
+            &self.hybrid,
             &self.signing,
             &evaluator,
         );
@@ -359,14 +381,16 @@ mod tests {
     }
 
     #[test]
-    fn auditor_keys_are_stable_for_a_seed() {
-        let (a, ha) = auditor_keys(&[7; 32]).unwrap();
-        let (b, hb) = auditor_keys(&[7; 32]).unwrap();
-        assert_eq!(a.public_key(), b.public_key());
+    fn hybrid_key_survives_a_file_round_trip() {
+        let path = std::env::temp_dir().join(format!("rd-dfabi-hybrid-{}", std::process::id()));
+        write_hybrid(&path).unwrap();
+        assert!(write_hybrid(&path).is_err(), "must refuse to overwrite");
+        let (a, b) = (read_hybrid(&path).unwrap(), read_hybrid(&path).unwrap());
         assert_eq!(
-            enc(&PrivateSettlementHybridPublicKeyV1::from_hybrid(ha.public())).unwrap(),
-            enc(&PrivateSettlementHybridPublicKeyV1::from_hybrid(hb.public())).unwrap()
+            enc(&PrivateSettlementHybridPublicKeyV1::from_hybrid(a.public())).unwrap(),
+            enc(&PrivateSettlementHybridPublicKeyV1::from_hybrid(b.public())).unwrap()
         );
+        std::fs::remove_file(path).unwrap();
     }
 
     #[test]

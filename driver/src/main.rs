@@ -1,6 +1,7 @@
 //! rd-dfabi: private RD/DFABI settlement driver for the Iroha 3 PoC (plan 2, item (b)).
 //!
 //!   rd-dfabi keys new <dir> <name>     write <dir>/<name>.seed (0600), print its public key
+//!   rd-dfabi keys new-hybrid <dir> <name>  write <dir>/<name>.hybrid (0600): auditor capsule key
 //!   rd-dfabi keys show <dir> <name>    print the public key of an existing seed
 //!   rd-dfabi auditor <config>          run the BI auditor service
 //!   rd-dfabi prove-selftest <peers.json>  offline: prove one leg, print time and peak RSS
@@ -38,6 +39,12 @@ fn main() -> Result<()> {
                 .open(&path)?
                 .write_all(hex::encode(seed).as_bytes())?;
             println!("{name} {}", signing_key(&seed).public_key());
+            Ok(())
+        }
+        ["keys", "new-hybrid", dir, name] => {
+            let path = Path::new(dir).join(format!("{name}.hybrid"));
+            auditor::write_hybrid(&path)?;
+            println!("{name} hybrid key written to {}", path.display());
             Ok(())
         }
         ["keys", "show", dir, name] => {
