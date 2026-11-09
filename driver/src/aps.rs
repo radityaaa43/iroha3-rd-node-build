@@ -226,22 +226,25 @@ pub fn run_dvp(cfg: &Config, legs: Vec<Leg>, options: &Options) -> Result<()> {
             )?)
         })
         .collect::<Result<Vec<_>>>()?;
+    // One transaction per pool: each activation routes to its own dataspace
+    // (queue/router.rs ActivatePrivateSettlementPoolV1 => route.dataspace_id). Both in one
+    // transaction (as upstream localnet does) becomes a cross-dataspace NativeAmx plan that
+    // never got a lane payload on this cluster: queued forever, no block, 300 s timeout.
     let account = sponsor.account_client();
-    let activation = account
-        .prepare_transaction(AccountTransactionDraft::new(
-            activations,
-            fee.clone(),
-            Metadata::default(),
-        ))
-        .and_then(|payload| account.sign_transaction(payload))
-        .wrap_err("build pool activation")?;
-    let activation_hash = sponsor
-        .submit_transaction_and_wait(&activation)
-        .wrap_err("activate pools")?;
-    println!("pool_activation_tx={activation_hash}");
-    for governed in &governed {
+    for (governed, activation) in governed.iter().zip(activations) {
+        let activation = account
+            .prepare_transaction(AccountTransactionDraft::new(
+                vec![activation],
+                fee.clone(),
+                Metadata::default(),
+            ))
+            .and_then(|payload| account.sign_transaction(payload))
+            .wrap_err("build pool activation")?;
+        let activation_hash = sponsor
+            .submit_transaction_and_wait(&activation)
+            .wrap_err_with(|| format!("activate pool lane {}", governed.route.lane_id))?;
         println!(
-            "pool lane={} pool_id={}",
+            "pool_activation_tx={activation_hash} lane={} pool_id={}",
             governed.route.lane_id,
             hex::encode(governed.governance.body.pool_id.as_ref())
         );
