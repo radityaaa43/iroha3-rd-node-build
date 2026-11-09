@@ -321,14 +321,14 @@ pub fn run_dvp(cfg: &Config, legs: Vec<Leg>, options: &Options) -> Result<()> {
     }
     println!("legs uploaded");
 
-    for (ordinal, governed) in governed.iter().enumerate() {
+    for (ordinal, leg) in governed.iter().enumerate() {
         let response: ApproveResponse = auditor_call(
             cfg,
             "POST",
             "/approve",
             &serde_json::to_string(&ApproveRequest {
-                governance: enc(&governed.governance)?,
-                policy: enc(&governed.policy)?,
+                governance: enc(&leg.governance)?,
+                policy: enc(&leg.policy)?,
                 payload_digest: enc(&final_manifest.legs[ordinal].payload_digest)?,
             })?,
         )?;
