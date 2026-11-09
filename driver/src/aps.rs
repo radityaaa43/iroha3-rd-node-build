@@ -575,7 +575,7 @@ pub fn prove_selftest(peers_json: &Path) -> Result<()> {
 /// sanitized `bad_request` on failure; the client always sends JSON. Report which part of the
 /// material does not survive the same JSON round trip, before the request is sent.
 fn json_roundtrip_report(m: &PrivateSettlementProvisionalLegMaterialV1) {
-    fn check<T: norito::json::JsonSerialize + norito::json::JsonDeserialize>(name: &str, value: &T) {
+    fn check<T: norito::json::JsonSerialize + norito::json::JsonDeserialize>(leg: u8, name: &str, value: &T) {
         let verdict = match norito::json::to_vec(value) {
             Err(error) => format!("encode error: {error}"),
             Ok(bytes) => match norito::json::from_slice::<T>(&bytes) {
@@ -583,17 +583,18 @@ fn json_roundtrip_report(m: &PrivateSettlementProvisionalLegMaterialV1) {
                 Err(error) => format!("decode error: {error}"),
             },
         };
-        println!("json_roundtrip leg={} {name}: {verdict}", m.statement.leg_ordinal);
+        println!("json_roundtrip leg={leg} {name}: {verdict}");
     }
-    check("material", m);
-    check("manifest", &m.manifest);
-    check("audit_policy", &m.audit_policy);
-    check("committee_authority", &m.committee_authority);
-    check("statement", &m.statement);
-    check("proof", &m.proof);
-    check("delta", &m.delta);
-    check("audit_capsule", &m.audit_capsule);
-    check("availability_body", &m.availability_body);
+    let leg = m.statement.leg_ordinal;
+    check(leg, "material", m);
+    check(leg, "manifest", &m.manifest);
+    check(leg, "audit_policy", &m.audit_policy);
+    check(leg, "committee_authority", &m.committee_authority);
+    check(leg, "statement", &m.statement);
+    check(leg, "proof", &m.proof);
+    check(leg, "delta", &m.delta);
+    check(leg, "audit_capsule", &m.audit_capsule);
+    check(leg, "availability_body", &m.availability_body);
 }
 
 fn peak_rss() -> String {
