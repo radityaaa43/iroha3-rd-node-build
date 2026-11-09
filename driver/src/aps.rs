@@ -512,50 +512,50 @@ fn committee_authority(
 /// Offline: build and prove one RD leg against a synthetic route, then print wall time
 /// and peak RSS. No network access. Sizes the Job memory limit and smoke-tests the image.
 pub fn prove_selftest(peers_json: &Path) -> Result<()> {
-    let route = PrivateSettlementRouteV1 {
-        dataspace_id: DataSpaceId::new(1),
-        lane_id: LaneId::new(1),
+    // A bundle needs 2..=255 legs: govern both routes, prove leg 0 only.
+    let route = |lane: u32| PrivateSettlementRouteV1 {
+        dataspace_id: DataSpaceId::new(u64::from(lane)),
+        lane_id: LaneId::new(lane),
         lane_incarnation: Hash::new(b"rd-dfabi-selftest"),
     };
-    let (authority, _) = committee_authority(peers_json, route)?;
+    let (authority, _) = committee_authority(peers_json, route(1))?;
     let network_id = NetworkId::from_genesis_hash(HashOf::from_untyped_unchecked(Hash::new(
         b"rd-dfabi-selftest-network",
     )));
     let auditor_key = fixture_key(0x30);
     let mut rng = iroha_crypto::rng_from_seed_slice(&rnd());
     let hybrid = iroha_crypto::HybridKeyPair::generate(&mut rng)?;
-    let governed = govern(
-        route,
-        "7onbjg2gRXveoAAUFsohCZyGW98t".parse()?,
-        100,
-        100 + EXPIRY_BLOCKS,
-        auditor_key.public_key(),
-        &PrivateSettlementHybridPublicKeyV1::from_hybrid(hybrid.public()),
-    )?;
+    let encryption = PrivateSettlementHybridPublicKeyV1::from_hybrid(hybrid.public());
+    let governed = [(1, "7onbjg2gRXveoAAUFsohCZyGW98t"), (2, "4mBWK1JCwQdHLDPpuVKc56eLsXka")]
+        .into_iter()
+        .map(|(lane, asset)| {
+            govern(route(lane), asset.parse()?, 100, 100 + EXPIRY_BLOCKS, auditor_key.public_key(), &encryption)
+        })
+        .collect::<Result<Vec<_>>>()?;
     let sponsor_key = fixture_key(0x31);
     let leg = Leg {
         lane: 1,
-        asset: governed.governance.body.asset_definition_id.clone(),
+        asset: governed[0].governance.body.asset_definition_id.clone(),
         payer: fixture_key(0x32),
         recipient: fixture_key(0x33),
         funding: 1_000,
         amount: 100,
     };
+    let salt = rnd();
     let manifest = proof_manifest(
         network_id,
         101,
         100 + EXPIRY_BLOCKS,
         AccountId::new(sponsor_key.public_key().clone()),
         bounded_fee_for("6TEAJqbb8oEPmLncoNiMRbLEK6tw")?,
-        std::slice::from_ref(&governed),
-        rnd(),
+        &governed,
+        salt,
     )?;
     let started = Instant::now();
     let funding = funding(leg.funding)?;
     let authority_digest = authority.digest()?;
-    let salt = rnd();
     on_big_stack(|| {
-        prepare_leg(0, &leg, &governed, funding, &manifest, authority_digest, &sponsor_key, salt)
+        prepare_leg(0, &leg, &governed[0], funding, &manifest, authority_digest, &sponsor_key, salt)
     })?;
     println!(
         "prove-selftest ok elapsed_ms={} {}",
