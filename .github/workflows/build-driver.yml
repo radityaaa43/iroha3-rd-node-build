@@ -18,7 +18,8 @@ jobs:
     timeout-minutes: 345
     env:
       IMAGE: ghcr.io/radityaaa43/iroha3-rd-driver
-      WORK: ${{ github.workspace }}/../work
+      # actions/cache rejects paths containing ".." (cache save silently failed).
+      WORK: /home/runner/work/cargo-work
       JOBS: 1
       CPUS: 4
       MEM: 14g
