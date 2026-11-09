@@ -11,3 +11,16 @@ cluster access, and no self-hosted runners.
 
 Build locally: `build/build-image.sh <iroha-source-at-071e281e> [tag]`.
 CI: `.github/workflows/build-image.yml` (GitHub-hosted runner).
+
+## Driver `rd-dfabi`
+
+`driver/` is the client for Atomic Private Settlement (`AtomicPrivateSettlementV1`)
+scenarios: a DvP coordinator and the BI auditor service, following upstream
+`integration_tests/tests/nexus/atomic_private_settlement_localnet.rs` @ `071e281e`.
+It holds no keys or cluster config; those are supplied at run time.
+
+- Image: `ghcr.io/radityaaa43/iroha3-rd-driver:<commit8>`
+- Build/test: `driver/build.sh test|build` (resource-capped container, upstream
+  workspace @ `071e281e`; never run an uncapped build on a shared VM)
+- Offline check: `rd-dfabi prove-selftest driver/fixtures/peers.json`
+- CI: `.github/workflows/build-driver.yml`

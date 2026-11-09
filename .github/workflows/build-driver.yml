@@ -1,0 +1,79 @@
+name: build-driver
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths: ['driver/**', '.github/workflows/build-driver.yml']
+permissions:
+  contents: read
+  packages: write
+concurrency:
+  group: build-driver
+  cancel-in-progress: false
+jobs:
+  build:
+    # Public-repo hosted runner: 4 vCPU / 16 GB. Same limits as build-image.yml, where 3
+    # cargo jobs filled 16 GB RAM + 6 GB swap on iroha_core.
+    runs-on: ubuntu-latest
+    timeout-minutes: 345
+    env:
+      IMAGE: ghcr.io/radityaaa43/iroha3-rd-driver
+      WORK: ${{ github.workspace }}/../work
+      JOBS: 1
+      CPUS: 4
+      MEM: 14g
+      MEM_SWAP: 30g
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - name: Free disk and add swap
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache \
+            /usr/local/share/boost /usr/share/swift /usr/local/.ghcup /usr/local/share/powershell
+          docker system prune -af
+          sudo swapoff -a || true
+          if sudo fallocate -l 16G /swapfile.build && sudo chmod 600 /swapfile.build \
+             && sudo mkswap /swapfile.build && sudo swapon /swapfile.build; then
+            echo "swap ok"
+          else
+            echo "::warning::swap setup failed"
+          fi
+          free -g; df -h /
+      # Upstream deps dominate build time (~2 h cold). The key changes only with upstream or
+      # the driver's manifest; source edits reuse the cached dependency artifacts.
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ${{ env.WORK }}/cargo-home
+            ${{ env.WORK }}/target
+          key: driver-071e281e-${{ hashFiles('driver/Cargo.toml') }}-${{ github.sha }}
+          restore-keys: |
+            driver-071e281e-${{ hashFiles('driver/Cargo.toml') }}-
+            driver-071e281e-
+      - name: Test
+        run: |
+          ( while sleep 120; do echo "::group::resources $(date -u +%H:%M)"; free -m | sed -n 2,3p; df -h / | tail -1; echo "::endgroup::"; done ) &
+          driver/build.sh test
+      - name: Build
+        run: driver/build.sh build
+      - name: Image
+        run: |
+          tag=$(git rev-parse --short=8 HEAD)
+          echo "TAG=$tag" >> "$GITHUB_ENV"
+          docker build -t "$IMAGE:$tag" driver
+      # Offline: no keys, no network. Proves one leg and prints peak RSS (sizes the Job).
+      - name: Smoke
+        run: |
+          docker run --rm --network none -v "$PWD/driver/fixtures:/f:ro" "$IMAGE:$TAG" prove-selftest /f/peers.json
+          mkdir -m 777 "$RUNNER_TEMP/k"
+          docker run --rm --network none -v "$RUNNER_TEMP/k:/k" "$IMAGE:$TAG" keys new /k smoke
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Push
+        run: |
+          docker push "$IMAGE:$TAG"
+          echo "pushed $IMAGE:$TAG" >> "$GITHUB_STEP_SUMMARY"

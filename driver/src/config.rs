@@ -1,0 +1,135 @@
+use std::{
+    collections::BTreeMap,
+    path::{Path, PathBuf},
+};
+
+use eyre::{Result, WrapErr, eyre};
+use iroha::blocking::Client;
+use iroha_crypto::{Algorithm, ExposedPrivateKey, KeyPair};
+use serde::Deserialize;
+use url::Url;
+
+/// One TOML file shared by the coordinator (`dvp`) and `bi-auditor`.
+#[derive(Debug, Deserialize)]
+pub struct Config {
+    #[serde(skip)]
+    pub path: PathBuf,
+    pub chain: String,
+    /// genesis.expected_hash (network id), as in client.toml.
+    pub network_id_file: PathBuf,
+    pub account_domain: String,
+    /// Operator client.toml: the sponsor (CanEnactGovernance, holds the fee asset).
+    /// Coordinator only; the auditor never reads it.
+    #[serde(default)]
+    pub client_toml: PathBuf,
+    /// network/public/peers.json: party, BLS public key and PoP of each validator.
+    pub peers_json: PathBuf,
+    /// Directory with `<name>.seed` files (hex, 32 bytes).
+    pub key_dir: PathBuf,
+    pub fee_asset: String,
+    /// host:port of bi-auditor.
+    pub auditor_url: String,
+    /// Party -> Torii base URL, all four validators.
+    pub torii: BTreeMap<String, Url>,
+    pub assets: Assets,
+    pub lanes: Lanes,
+    #[serde(default)]
+    pub auditor: AuditorConfig,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct Assets {
+    pub rd: String,
+    pub dfabi: String,
+}
+
+/// Lane ids. Dataspace id equals lane id in network/nexus.toml (ds-rd 1, ds-dfabi 2).
+#[derive(Debug, Deserialize)]
+pub struct Lanes {
+    pub rd: u32,
+    pub dfabi: u32,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct AuditorConfig {
+    pub listen: String,
+    pub store_dir: PathBuf,
+    pub max_rd: u128,
+    pub max_dfabi: u128,
+    /// Wallet public keys (`ed0120...`) accepted as payer or recipient.
+    pub parties: Vec<String>,
+}
+
+impl Default for AuditorConfig {
+    fn default() -> Self {
+        Self {
+            listen: "0.0.0.0:8090".into(),
+            store_dir: "/audit-store".into(),
+            max_rd: 1_000_000,
+            max_dfabi: 10_000,
+            parties: Vec::new(),
+        }
+    }
+}
+
+impl Config {
+    pub fn load(path: &Path) -> Result<Self> {
+        let text =
+            std::fs::read_to_string(path).wrap_err_with(|| format!("read {}", path.display()))?;
+        let mut config: Self = toml::from_str(&text).wrap_err("parse config")?;
+        config.path = path.to_path_buf();
+        Ok(config)
+    }
+
+    pub fn torii(&self, party: &str) -> Result<&Url> {
+        self.torii.get(party).ok_or_else(|| eyre!("no torii for {party}"))
+    }
+
+    /// Sponsor client (operator client.toml) bound to `party`'s Torii, plus its key.
+    pub fn sponsor(&self, party: &str) -> Result<(Client, KeyPair)> {
+        let mut config = iroha::config::Config::load_file(&self.client_toml)
+            .map_err(|e| eyre!("load {}: {e:?}", self.client_toml.display()))?;
+        config.torii_api_url = self.torii(party)?.clone();
+        let key = config.key_pair.clone();
+        Ok((Client::new(config)?, key))
+    }
+
+    /// Client whose account is `key` itself (the auditor: no operator key in its pod).
+    pub fn client_with_key(&self, party: &str, key: &KeyPair) -> Result<Client> {
+        let mut account = toml::Table::new();
+        account.insert("domain".into(), self.account_domain.clone().into());
+        account.insert(
+            "private_key".into(),
+            ExposedPrivateKey(key.private_key().clone()).to_string().into(),
+        );
+        account.insert("public_key".into(), key.public_key().to_string().into());
+        let mut table = toml::Table::new();
+        table.insert("chain".into(), self.chain.clone().into());
+        table.insert(
+            "network_id_file".into(),
+            self.network_id_file.display().to_string().into(),
+        );
+        table.insert("torii_url".into(), self.torii(party)?.to_string().into());
+        table.insert("account".into(), account.into());
+        let config = iroha::config::Config::load_table(&self.path, table)
+            .map_err(|e| eyre!("build client config: {e:?}"))?;
+        Client::new(config)
+    }
+
+    pub fn seed(&self, name: &str) -> Result<[u8; 32]> {
+        read_seed(&self.key_dir.join(format!("{name}.seed")))
+    }
+}
+
+pub fn read_seed(path: &Path) -> Result<[u8; 32]> {
+    let text = std::fs::read_to_string(path).wrap_err_with(|| format!("read {}", path.display()))?;
+    let bytes = hex::decode(text.trim()).wrap_err("seed is not hex")?;
+    bytes
+        .try_into()
+        .map_err(|_| eyre!("{} is not 32 bytes", path.display()))
+}
+
+/// Ed25519 key of a wallet or the auditor, derived from its seed.
+pub fn signing_key(seed: &[u8; 32]) -> KeyPair {
+    KeyPair::from_seed(seed.to_vec(), Algorithm::Ed25519)
+}
