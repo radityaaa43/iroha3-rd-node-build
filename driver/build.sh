@@ -30,6 +30,9 @@ if [ ! -d "$WORK/iroha/.git" ]; then
   git -C "$WORK/iroha" remote add origin https://github.com/hyperledger-iroha/iroha
   git -C "$WORK/iroha" fetch -q --depth 1 origin "$IROHA_COMMIT"
   git -C "$WORK/iroha" checkout -q FETCH_HEAD
+  # Cargo fingerprints workspace crates by mtime. A fresh clone (every CI run) would be newer
+  # than the cached target and rebuild all of upstream (~55 min); pin mtimes to the commit time.
+  find "$WORK/iroha" -path "$WORK/iroha/.git" -prune -o -exec touch -h -d "@$(git -C "$WORK/iroha" log -1 --format=%ct)" {} +
 fi
 [ "$(git -C "$WORK/iroha" rev-parse HEAD)" = "$IROHA_COMMIT" ] || { echo "upstream is not $IROHA_COMMIT" >&2; exit 1; }
 # Driver joins the workspace so it shares upstream's Cargo.lock and [patch] section.
