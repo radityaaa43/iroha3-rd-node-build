@@ -88,7 +88,12 @@ use crate::{
 
 /// Bundles expire this many blocks after the authority context (max_expiry_blocks = 7200).
 const EXPIRY_BLOCKS: u64 = 1_000;
-const SIDECAR_RETENTION_BLOCKS: u64 = 4_096;
+/// Must be >= the peers' `nexus.atomic_private_settlement.sidecar_retention_blocks`: Torii
+/// rejects an availability share whose retention ends before `stored_at + that value`
+/// (torii private_settlement.rs validate_availability_share_policy). Our network keeps the
+/// upstream default 1_000_000 (network/nexus.toml does not override it; the upstream localnet
+/// test sets 4096, which made every committee member answer 400).
+const SIDECAR_RETENTION_BLOCKS: u64 = 1_000_000;
 /// Fee ceiling signed into the manifest; each carrier costs per_instruction_fee = 0.001.
 const FEE_SIGNED_MAXIMUM: u64 = 1;
 /// Private note the sponsor gets back on leg 0 (reimbursement leg). Same value goes into
@@ -284,9 +289,6 @@ pub fn run_dvp(cfg: &Config, legs: Vec<Leg>, options: &Options) -> Result<()> {
     }
 
     let materials = provisional_materials(manifest, &prepared, &governed, &committees)?;
-    for material in &materials {
-        json_roundtrip_report(material);
-    }
     let client = sponsor.client();
     let certificates = materials
         .iter()
@@ -569,32 +571,6 @@ pub fn prove_selftest(peers_json: &Path) -> Result<()> {
         peak_rss()
     );
     Ok(())
-}
-
-/// Torii decodes the availability-share body with `norito::json::from_slice` and answers a
-/// sanitized `bad_request` on failure; the client always sends JSON. Report which part of the
-/// material does not survive the same JSON round trip, before the request is sent.
-fn json_roundtrip_report(m: &PrivateSettlementProvisionalLegMaterialV1) {
-    fn check<T: norito::json::JsonSerialize + norito::json::JsonDeserialize>(leg: u8, name: &str, value: &T) {
-        let verdict = match norito::json::to_vec(value) {
-            Err(error) => format!("encode error: {error}"),
-            Ok(bytes) => match norito::json::from_slice::<T>(&bytes) {
-                Ok(_) => format!("ok ({} bytes)", bytes.len()),
-                Err(error) => format!("decode error: {error}"),
-            },
-        };
-        println!("json_roundtrip leg={leg} {name}: {verdict}");
-    }
-    let leg = m.statement.leg_ordinal;
-    check(leg, "material", m);
-    check(leg, "manifest", &m.manifest);
-    check(leg, "audit_policy", &m.audit_policy);
-    check(leg, "committee_authority", &m.committee_authority);
-    check(leg, "statement", &m.statement);
-    check(leg, "proof", &m.proof);
-    check(leg, "delta", &m.delta);
-    check(leg, "audit_capsule", &m.audit_capsule);
-    check(leg, "availability_body", &m.availability_body);
 }
 
 fn peak_rss() -> String {
