@@ -29,7 +29,7 @@ pub fn request(addr: &str, method: &str, path: &str, body: &str) -> Result<(u16,
         .nth(1)
         .and_then(|s| s.parse().ok())
         .ok_or_else(|| eyre!("bad status line: {status_line:?}"))?;
-    Ok((status, read_message(&mut reader)?))
+    Ok((status, read_message(&mut reader, true)?))
 }
 
 /// Serve requests one at a time (serialising approvals is intended).
@@ -55,7 +55,9 @@ fn serve_one(
     reader.read_line(&mut request_line)?;
     let mut parts = request_line.split_whitespace();
     let (method, path) = (parts.next().unwrap_or(""), parts.next().unwrap_or(""));
-    let body = read_message(&mut reader)?;
+    // A request without Content-Length has no body (RFC 9112 6.3); reading to EOF would hang a
+    // client such as fetch() that keeps the connection open for the response.
+    let body = read_message(&mut reader, false)?;
     let (status, response) = handler(method, path, &body);
     write!(
         stream,
@@ -65,8 +67,8 @@ fn serve_one(
     Ok(())
 }
 
-/// Headers, then a Content-Length body (or up to EOF without one).
-fn read_message(reader: &mut impl BufRead) -> Result<String> {
+/// Headers, then a Content-Length body; without one, up to EOF (`until_eof`) or empty.
+fn read_message(reader: &mut impl BufRead, until_eof: bool) -> Result<String> {
     let mut length = None;
     loop {
         let mut line = String::new();
@@ -86,6 +88,7 @@ fn read_message(reader: &mut impl BufRead) -> Result<String> {
             body.resize(n, 0);
             reader.read_exact(&mut body)?;
         }
+        None if !until_eof => {}
         None => {
             reader.take(MAX_BODY as u64).read_to_end(&mut body)?;
         }
@@ -112,5 +115,22 @@ mod tests {
         server.join().unwrap();
         assert_eq!(status, 201);
         assert_eq!(body, "POST /approve {\"a\":1}");
+    }
+
+    #[test]
+    fn get_without_content_length_is_answered_while_the_client_keeps_the_connection_open() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = std::thread::spawn(move || {
+            let (stream, _) = listener.accept().unwrap();
+            serve_one(stream, &|method, path, body| (200, format!("{method} {path} [{body}]"))).unwrap();
+        });
+        let mut client = TcpStream::connect(addr).unwrap();
+        client.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+        client.write_all(b"GET /records/ab HTTP/1.1\r\nHost: x\r\n\r\n").unwrap(); // no shutdown: like fetch()
+        let mut response = String::new();
+        BufReader::new(&client).read_to_string(&mut response).unwrap();
+        server.join().unwrap();
+        assert!(response.ends_with("GET /records/ab []"), "{response}");
     }
 }
