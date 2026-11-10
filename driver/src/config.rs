@@ -27,6 +27,9 @@ pub struct Config {
     /// Directory with `<name>.seed` files (hex, 32 bytes).
     pub key_dir: PathBuf,
     pub fee_asset: String,
+    /// Long-lived pool index written by `pool-init` and appended by every finalized bundle.
+    #[serde(default = "default_pools_file")]
+    pub pools_file: PathBuf,
     /// host:port of bi-auditor.
     pub auditor_url: String,
     /// Party -> Torii base URL, all four validators.
@@ -72,6 +75,10 @@ impl Default for AuditorConfig {
     }
 }
 
+fn default_pools_file() -> PathBuf {
+    "/pools/pools.json".into()
+}
+
 impl Config {
     pub fn load(path: &Path) -> Result<Self> {
         let text =
@@ -114,6 +121,15 @@ impl Config {
         let config = iroha::config::Config::load_table(&self.path, table)
             .map_err(|e| eyre!("build client config: {e:?}"))?;
         Client::new(config)
+    }
+
+    /// `<key_dir>/<name>.note`: hex spend secret followed by hex view secret (64 bytes).
+    pub fn note_keys(&self, name: &str) -> Result<crate::wallet::NoteKeys> {
+        let path = self.key_dir.join(format!("{name}.note"));
+        let text = std::fs::read_to_string(&path).wrap_err_with(|| format!("read {}", path.display()))?;
+        let bytes = hex::decode(text.trim()).wrap_err("note key is not hex")?;
+        eyre::ensure!(bytes.len() == 64, "{} is not 64 bytes", path.display());
+        Ok(crate::wallet::NoteKeys { spend: bytes[..32].try_into()?, view: bytes[32..].try_into()? })
     }
 
     pub fn seed(&self, name: &str) -> Result<[u8; 32]> {

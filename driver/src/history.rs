@@ -7,7 +7,7 @@
 //! outputs. The bundle-id index is ours (public, non-secret); the chain is the authority: every
 //! delta must continue the previous root, and the rebuilt tree must reproduce each new root.
 
-use std::collections::BTreeSet;
+use std::collections::BTreeMap;
 
 use eyre::{Result, ensure, eyre};
 use iroha::data_model::{
@@ -29,7 +29,8 @@ pub struct PoolHistory {
     pub tree: PoolTree,
     pub epoch: u64,
     pub outputs: Vec<OutputRow>,
-    pub nullifiers: BTreeSet<PrivacyNullifierV1>,
+    /// Published nullifier -> bundle id that spent it.
+    pub spent_in: BTreeMap<PrivacyNullifierV1, String>,
 }
 
 impl PoolHistory {
@@ -39,7 +40,7 @@ impl PoolHistory {
         sorted.sort_unstable();
         let mut tree = PoolTree::new(pool_id)?;
         tree.append(&sorted)?;
-        Ok(Self { pool_id, tree, epoch: 1, outputs: Vec::new(), nullifiers: BTreeSet::new() })
+        Ok(Self { pool_id, tree, epoch: 1, outputs: Vec::new(), spent_in: BTreeMap::new() })
     }
 
     pub fn root(&self) -> PrivacyRootV1 {
@@ -55,8 +56,10 @@ impl PoolHistory {
         self.tree.append(&delta.output_commitments)?;
         ensure!(self.root() == delta.new_root, "rebuilt tree root differs from the finalized new root");
         self.epoch = delta.new_epoch;
-        self.nullifiers.extend(delta.nullifiers.iter().copied());
         let bundle_id = hex::encode(delta.bundle_id.as_ref());
+        for nullifier in &delta.nullifiers {
+            self.spent_in.insert(*nullifier, bundle_id.clone());
+        }
         for (commitment, encrypted) in delta.output_commitments.iter().zip(&delta.encrypted_outputs) {
             self.outputs.push(OutputRow { commitment: *commitment, encrypted: encrypted.clone(), bundle_id: bundle_id.clone(), height });
         }

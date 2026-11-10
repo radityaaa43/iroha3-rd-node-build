@@ -91,7 +91,7 @@ use crate::{
 };
 
 /// Bundles expire this many blocks after the authority context (max_expiry_blocks = 7200).
-const EXPIRY_BLOCKS: u64 = 1_000;
+pub(crate) const EXPIRY_BLOCKS: u64 = 1_000;
 /// Must be >= the peers' `nexus.atomic_private_settlement.sidecar_retention_blocks`: Torii
 /// rejects an availability share whose retention ends before `stored_at + that value`
 /// (torii private_settlement.rs validate_availability_share_policy). Our network keeps the
@@ -102,7 +102,7 @@ const SIDECAR_RETENTION_BLOCKS: u64 = 1_000_000;
 const FEE_SIGNED_MAXIMUM: u64 = 1;
 /// Private note the sponsor gets back on leg 0 (reimbursement leg). Same value goes into
 /// the reimbursement terms commitment and into the leg plaintext.
-const SPONSOR_REIMBURSEMENT: u128 = 1;
+pub(crate) const SPONSOR_REIMBURSEMENT: u128 = 1;
 /// The prover recurses deeply; upstream runs it on 64 MiB stacks.
 const PROVER_STACK_BYTES: usize = 64 * 1024 * 1024;
 const POLL_INTERVAL: Duration = Duration::from_millis(500);
@@ -131,21 +131,21 @@ pub struct Options {
     pub replay: bool,
 }
 
-struct Governed {
-    route: PrivateSettlementRouteV1,
-    policy: PrivateSettlementAuditPolicyV1,
-    governance: PrivateSettlementPoolGovernanceV1,
+pub(crate) struct Governed {
+    pub route: PrivateSettlementRouteV1,
+    pub policy: PrivateSettlementAuditPolicyV1,
+    pub governance: PrivateSettlementPoolGovernanceV1,
 }
 
 pub struct Funding {
-    opening: PrivateSettlementAuditNoteOpeningV1,
+    pub opening: PrivateSettlementAuditNoteOpeningV1,
     spending_secret: [u8; 32],
     /// Positive input in slot 0, unspent reserve (value 1) in slot 1.
     input_commitments: [PrivacyCommitmentV1; 2],
 }
 
 impl Funding {
-    fn activation_commitments(&self) -> [PrivacyCommitmentV1; 2] {
+    pub fn activation_commitments(&self) -> [PrivacyCommitmentV1; 2] {
         let mut commitments = self.input_commitments;
         commitments.sort_unstable();
         commitments
@@ -183,7 +183,7 @@ impl LegNotes {
     }
 }
 
-struct Committee {
+pub(crate) struct Committee {
     authority: PrivateSettlementCommitteeAuthorityV1,
     endpoints: Vec<Url>,
 }
@@ -330,7 +330,24 @@ pub fn run_dvp(cfg: &Config, legs: Vec<Leg>, options: &Options) -> Result<()> {
         println!("leg {ordinal} proved after {:?} {}", started.elapsed(), peak_rss());
     }
 
-    let materials = provisional_materials(manifest, &prepared, &governed, &committees)?;
+    settle(cfg, &sponsor, manifest, &prepared, &governed, &committees, started, options)?;
+    Ok(())
+}
+
+/// Upload, audit, prepare, commit and finalize proved legs; prints `result_json=`.
+/// Returns whether the bundle finalized (an audit rejection aborts it).
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn settle(
+    cfg: &Config,
+    sponsor: &iroha::blocking::Client,
+    manifest: AtomicPrivateSettlementV1,
+    prepared: &[AtomicPrivateSettlementPreparedLegV1],
+    governed: &[Governed],
+    committees: &[Committee],
+    started: Instant,
+    options: &Options,
+) -> Result<Option<(String, u64)>> {
+    let materials = provisional_materials(manifest, prepared, governed, committees)?;
     let client = sponsor.client();
     let certificates = materials
         .iter()
@@ -385,8 +402,9 @@ pub fn run_dvp(cfg: &Config, legs: Vec<Leg>, options: &Options) -> Result<()> {
                 .submit_private_settlement_bundle_v1(&request)
                 .wrap_err("submit abort")?;
             let (outcome, height) = wait_receipt(cfg, final_manifest.bundle_id)?;
-            print_result(&final_manifest, &governed, &request.transaction.hash().to_string(), outcome, height);
-            return check_outcome(outcome, options.expect);
+            print_result(&final_manifest, governed, &request.transaction.hash().to_string(), outcome, height);
+            check_outcome(outcome, options.expect)?;
+            return Ok(None);
         }
         println!("leg {ordinal} audited");
     }
@@ -421,7 +439,7 @@ pub fn run_dvp(cfg: &Config, legs: Vec<Leg>, options: &Options) -> Result<()> {
         .wrap_err("submit finalization")?;
     let (outcome, height) = wait_receipt(cfg, final_manifest.bundle_id)?;
     println!("settled after {:?}", started.elapsed());
-    print_result(&final_manifest, &governed, &request.transaction.hash().to_string(), outcome, height);
+    print_result(&final_manifest, governed, &request.transaction.hash().to_string(), outcome, height);
     check_outcome(outcome, options.expect)?;
 
     if options.replay {
@@ -435,7 +453,7 @@ pub fn run_dvp(cfg: &Config, legs: Vec<Leg>, options: &Options) -> Result<()> {
             }
         }
     }
-    Ok(())
+    Ok((outcome == "finalized").then(|| (hex::encode(final_manifest.bundle_id.as_ref()), height)))
 }
 
 /// One machine-readable line for callers (Lensa): public identifiers only, no amounts or
@@ -462,7 +480,7 @@ fn print_result(manifest: &AtomicPrivateSettlementV1, governed: &[Governed], car
     );
 }
 
-fn check_outcome(outcome: &'static str, expect: Expect) -> Result<()> {
+pub(crate) fn check_outcome(outcome: &'static str, expect: Expect) -> Result<()> {
     println!("outcome={outcome}");
     let want = match expect {
         Expect::Finalized => "finalized",
@@ -476,7 +494,7 @@ fn max_carrier_bytes() -> u64 {
     u64::try_from(PRIVATE_SETTLEMENT_MAX_RECEIPT_BYTES_V1).expect("V1 carrier ceiling fits u64")
 }
 
-fn bounded_fee(cfg: &Config) -> Result<FeePaymentIntent> {
+pub(crate) fn bounded_fee(cfg: &Config) -> Result<FeePaymentIntent> {
     bounded_fee_for(&cfg.fee_asset)
 }
 
@@ -530,7 +548,7 @@ fn wait_receipt(cfg: &Config, bundle_id: Hash) -> Result<(&'static str, u64)> {
     }
 }
 
-fn auditor_call<T: for<'de> Deserialize<'de>>(cfg: &Config, method: &str, path: &str, body: &str) -> Result<T> {
+pub(crate) fn auditor_call<T: for<'de> Deserialize<'de>>(cfg: &Config, method: &str, path: &str, body: &str) -> Result<T> {
     let (status, response) = crate::http::request(&cfg.auditor_url, method, path, body)
         .wrap_err("call bi-auditor")?;
     ensure!(status == 200, "bi-auditor {path} returned {status}: {response}");
@@ -705,6 +723,7 @@ pub fn prove_continuation_selftest(peers_json: &Path) -> Result<()> {
     let manifest2 = proof_manifest(network_id, 102, 100 + EXPIRY_BLOCKS, AccountId::new(sponsor_key.public_key().clone()), fee, &governed, salt2)?;
     let leg2 = Leg { lane: 1, asset, payer: fixture_key(0x33), recipient: fixture_key(0x34), funding: received.value, amount: 40 };
     let notes2 = LegNotes { recipient: carol, change: bob.clone() };
+    let expected_nullifier = crate::wallet::note_nullifier(pool_id, &bob.spend, &received)?;
     let spend = Spend::Continue { opening: received, secret: bob.spend, tree, epoch: 2 };
     let second = on_big_stack(|| {
         prepare_leg(0, &leg2, &governed[0], spend, &notes2, &manifest2, authority_digest, &sponsor_key, salt2)
@@ -712,11 +731,12 @@ pub fn prove_continuation_selftest(peers_json: &Path) -> Result<()> {
     verify_atomic_private_settlement_v1(&manifest2, &second.statement, genesis, 102, &second.proof)
         .map_err(|e| eyre!("continuation proof rejected: {e:?}"))?;
     ensure!(second.statement.old_epoch == 2 && second.statement.new_epoch == 3, "continuation epochs");
+    ensure!(second.statement.nullifiers[0] == expected_nullifier, "wallet nullifier differs from the proved one");
     println!("continuation_verified=true elapsed_ms={} {}", started.elapsed().as_millis(), peak_rss());
     Ok(())
 }
 
-fn peak_rss() -> String {
+pub(crate) fn peak_rss() -> String {
     std::fs::read_to_string("/proc/self/status")
         .ok()
         .and_then(|status| {
@@ -740,11 +760,11 @@ where
     Ok(norito::decode_canonical(&hex::decode(text)?)?)
 }
 
-fn rnd() -> [u8; 32] {
+pub(crate) fn rnd() -> [u8; 32] {
     rand::random()
 }
 
-fn on_big_stack<T: Send>(work: impl FnOnce() -> Result<T> + Send) -> Result<T> {
+pub(crate) fn on_big_stack<T: Send>(work: impl FnOnce() -> Result<T> + Send) -> Result<T> {
     thread::scope(|scope| {
         thread::Builder::new()
             .name("aps-prover".into())
@@ -755,11 +775,23 @@ fn on_big_stack<T: Send>(work: impl FnOnce() -> Result<T> + Send) -> Result<T> {
     })
 }
 
-fn govern(
+pub(crate) fn govern(
     route: PrivateSettlementRouteV1,
     asset: AssetDefinitionId,
     height: u64,
     expiry_height: u64,
+    auditor_key: &PublicKey,
+    auditor_encryption: &PrivateSettlementHybridPublicKeyV1,
+) -> Result<Governed> {
+    govern_until(route, asset, height, Some(expiry_height + 1), auditor_key, auditor_encryption)
+}
+
+/// `retirement: None` keeps the policy and pool mapping valid indefinitely (long-lived pools).
+pub(crate) fn govern_until(
+    route: PrivateSettlementRouteV1,
+    asset: AssetDefinitionId,
+    height: u64,
+    retirement: Option<u64>,
     auditor_key: &PublicKey,
     auditor_encryption: &PrivateSettlementHybridPublicKeyV1,
 ) -> Result<Governed> {
@@ -770,7 +802,7 @@ fn govern(
         revision: 1,
         key_epoch: 1,
         activation_height: height,
-        retirement_height: Some(expiry_height + 1),
+        retirement_height: retirement,
         min_approvals: 1,
         auditors: vec![PrivateSettlementAuditorV1 {
             auditor_id: AccountId::new(auditor_key.clone()),
@@ -787,16 +819,20 @@ fn govern(
         PrivateSettlementPoolGovernanceLifecycleV1 {
             governance_revision: 1,
             activation_height: height,
-            retirement_height: Some(expiry_height + 1),
+            retirement_height: retirement,
         },
     )?;
     Ok(Governed { route, policy, governance })
 }
 
-fn funding(value: u128) -> Result<Funding> {
+pub(crate) fn funding(value: u128) -> Result<Funding> {
+    funding_with_secret(value, rnd())
+}
+
+/// Origin funding whose positive note is spendable with `secret` (a party's note spend key).
+pub(crate) fn funding_with_secret(value: u128, owner_secret: [u8; 32]) -> Result<Funding> {
     let mut notes = Vec::with_capacity(2);
-    for value in [value, 1] {
-        let secret = rnd();
+    for (value, secret) in [(value, owner_secret), (1, rnd())] {
         let mut opening = PrivateSettlementAuditNoteOpeningV1 {
             active: true,
             commitment: PrivacyCommitmentV1::new([0; 32]),
@@ -829,7 +865,7 @@ fn fixture_key(seed: u8) -> KeyPair {
     crate::config::signing_key(&[seed; 32])
 }
 
-fn proof_manifest(
+pub(crate) fn proof_manifest(
     network_id: NetworkId,
     authority_context_height: u64,
     expiry_height: u64,
@@ -1010,7 +1046,7 @@ fn note_opening(active: bool, value: u128) -> PrivateSettlementAuditNoteOpeningV
 }
 
 #[allow(clippy::too_many_arguments)]
-fn prepare_leg(
+pub(crate) fn prepare_leg(
     ordinal: usize,
     leg: &Leg,
     governed: &Governed,
