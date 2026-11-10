@@ -141,7 +141,7 @@ pub struct Funding {
     pub opening: PrivateSettlementAuditNoteOpeningV1,
     spending_secret: [u8; 32],
     /// Positive input in slot 0, unspent reserve (value 1) in slot 1.
-    input_commitments: [PrivacyCommitmentV1; 2],
+    pub input_commitments: [PrivacyCommitmentV1; 2],
 }
 
 impl Funding {
@@ -184,8 +184,8 @@ impl LegNotes {
 }
 
 pub(crate) struct Committee {
-    authority: PrivateSettlementCommitteeAuthorityV1,
-    endpoints: Vec<Url>,
+    pub authority: PrivateSettlementCommitteeAuthorityV1,
+    pub endpoints: Vec<Url>,
 }
 
 pub fn run_dvp(cfg: &Config, legs: Vec<Leg>, options: &Options) -> Result<()> {
@@ -351,7 +351,7 @@ pub(crate) fn settle(
     let client = sponsor.client();
     let certificates = materials
         .iter()
-        .zip(&committees)
+        .zip(committees)
         .map(|(material, committee)| {
             client.certify_private_settlement_leg_availability_v1(&committee.endpoints, material)
         })
@@ -363,7 +363,7 @@ pub(crate) fn settle(
     }
     final_manifest.validate()?;
     for (ordinal, ((material, certificate), committee)) in
-        materials.iter().zip(&certificates).zip(&committees).enumerate()
+        materials.iter().zip(&certificates).zip(committees).enumerate()
     {
         let request = PrivateSettlementLegUploadRequestV1 {
             manifest: final_manifest.clone(),
