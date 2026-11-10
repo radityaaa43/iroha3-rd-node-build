@@ -5,6 +5,14 @@
 //!   rd-dfabi keys show <dir> <name>    print the public key of an existing seed
 //!   rd-dfabi auditor <config>          run the BI auditor service
 //!   rd-dfabi prove-selftest <peers.json>  offline: prove one leg, print time and peak RSS
+//!   rd-dfabi prove-continuation-selftest <peers.json>  offline gate G1a: spend a received note
+//!   rd-dfabi keys new-note <dir> <name>  write <dir>/<name>.note (0600): note spend + view secrets
+//!   rd-dfabi pool-init <config> --rd-reserve N --dfabi-reserve N  one-time: long-lived RD/DFABI pools, BI reserve
+//!   rd-dfabi pay <config> --asset rd|dfabi --from P --to Q --amount N  private payment in the shared pools
+//!   rd-dfabi dvp-shared <config> --buyer P --seller P --rd N --dfabi N   DvP in the shared pools
+//!   rd-dfabi wallet <config> --party P   balances and movements from the chain (wallet_json=)
+//!   rd-dfabi abort-bundle <config> --bundle <hex>  release the pool reservations of a stuck bundle
+//!   rd-dfabi pool-history <config> --asset rd|dfabi  rebuilt pool head (gate G3)
 //!   rd-dfabi dvp <config> --buyer P --seller P --rd N --dfabi N
 //!            [--rd-funding N] [--dfabi-funding N] [--expect finalized|aborted] [--replay]
 //!
@@ -14,7 +22,11 @@
 mod aps;
 mod auditor;
 mod config;
+mod history;
 mod http;
+mod pools;
+mod tree;
+mod wallet;
 
 use std::{collections::BTreeMap, io::Write, os::unix::fs::OpenOptionsExt, path::Path};
 
@@ -47,6 +59,18 @@ fn main() -> Result<()> {
             println!("{name} hybrid key written to {}", path.display());
             Ok(())
         }
+        ["keys", "new-note", dir, name] => {
+            let path = Path::new(dir).join(format!("{name}.note"));
+            let keys = wallet::NoteKeys::random();
+            std::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .mode(0o600)
+                .open(&path)?
+                .write_all(format!("{}{}", hex::encode(keys.spend), hex::encode(keys.view)).as_bytes())?;
+            println!("{name} note keys written to {}", path.display());
+            Ok(())
+        }
         ["keys", "show", dir, name] => {
             let seed = read_seed(&Path::new(dir).join(format!("{name}.seed")))?;
             println!("{name} {}", signing_key(&seed).public_key());
@@ -54,7 +78,37 @@ fn main() -> Result<()> {
         }
         ["auditor", config] => auditor::run(Config::load(Path::new(config))?),
         ["prove-selftest", peers_json] => aps::prove_selftest(Path::new(peers_json)),
+        ["prove-continuation-selftest", peers_json] => aps::prove_continuation_selftest(Path::new(peers_json)),
         ["dvp", config, rest @ ..] => dvp(&Config::load(Path::new(config))?, rest),
+        ["pool-init", config, rest @ ..] => {
+            let flags = flags(rest)?;
+            pools::pool_init(&Config::load(Path::new(config))?, flags.number("rd-reserve")?, flags.number("dfabi-reserve")?)
+        }
+        ["pool-history", config, "--asset", asset] => pools::pool_history(&Config::load(Path::new(config))?, pools::Asset::parse(asset)?),
+        ["pay", config, rest @ ..] => {
+            let flags = flags(rest)?;
+            pools::pay(
+                &Config::load(Path::new(config))?,
+                pools::Asset::parse(flags.get("asset")?)?,
+                flags.get("from")?,
+                flags.get("to")?,
+                flags.number("amount")?,
+                &Options { expect: Expect::Finalized, replay: false },
+            )
+        }
+        ["dvp-shared", config, rest @ ..] => {
+            let flags = flags(rest)?;
+            pools::dvp(
+                &Config::load(Path::new(config))?,
+                flags.get("buyer")?,
+                flags.get("seller")?,
+                flags.number("rd")?,
+                flags.number("dfabi")?,
+                &Options { expect: Expect::Finalized, replay: false },
+            )
+        }
+        ["abort-bundle", config, "--bundle", bundle] => pools::abort_bundle(&Config::load(Path::new(config))?, bundle),
+        ["wallet", config, "--party", party] => pools::wallet(&Config::load(Path::new(config))?, party),
         _ => bail!("usage: see the header of apps/rd-dfabi/src/main.rs"),
     }
 }
@@ -104,4 +158,26 @@ fn dvp(cfg: &Config, rest: &[&str]) -> Result<()> {
         },
     ];
     aps::run_dvp(cfg, legs, &Options { expect, replay })
+}
+
+struct Flags<'a>(BTreeMap<&'a str, &'a str>);
+
+impl<'a> Flags<'a> {
+    fn get(&self, name: &str) -> Result<&'a str> {
+        self.0.get(name).copied().ok_or_else(|| eyre!("missing --{name}"))
+    }
+
+    fn number(&self, name: &str) -> Result<u128> {
+        Ok(self.get(name)?.parse()?)
+    }
+}
+
+fn flags<'a>(rest: &[&'a str]) -> Result<Flags<'a>> {
+    let mut map = BTreeMap::new();
+    let mut iter = rest.iter();
+    while let Some(flag) = iter.next() {
+        let value = iter.next().ok_or_else(|| eyre!("{flag} needs a value"))?;
+        map.insert(flag.trim_start_matches("--"), *value);
+    }
+    Ok(Flags(map))
 }

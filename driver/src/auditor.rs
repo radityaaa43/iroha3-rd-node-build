@@ -169,6 +169,7 @@ pub fn run(cfg: Config) -> Result<()> {
         let result = match (method, path) {
             ("GET", "/healthz") => Ok("{}".to_owned()),
             ("GET", "/keys") => auditor.keys(),
+            ("GET", "/records") => list_records(&auditor.cfg.auditor.store_dir).and_then(|r| Ok(serde_json::to_string(&r)?)),
             ("GET", p) if p.starts_with("/records/") => auditor.records(&p["/records/".len()..]),
             ("POST", "/approve") => serde_json::from_str(body)
                 .map_err(Into::into)
@@ -325,6 +326,25 @@ impl Auditor {
     }
 }
 
+/// Every leg this auditor decided (BI's history across all bundles), by bundle then leg.
+/// Callers order bundles by height from the public pool index.
+fn list_records(store_dir: &Path) -> Result<Vec<Record>> {
+    let mut records = Vec::new();
+    if store_dir.is_dir() {
+        for bundle in std::fs::read_dir(store_dir)? {
+            let bundle = bundle?.path();
+            if !bundle.is_dir() {
+                continue;
+            }
+            for leg in std::fs::read_dir(bundle)? {
+                records.push(serde_json::from_slice::<Record>(&std::fs::read(leg?.path())?)?);
+            }
+        }
+    }
+    records.sort_by(|a, b| (&a.bundle_id, a.leg).cmp(&(&b.bundle_id, b.leg)));
+    Ok(records)
+}
+
 fn read_record(path: &PathBuf) -> Result<Option<Record>> {
     match std::fs::read_to_string(path) {
         Ok(text) => Ok(Some(serde_json::from_str(&text)?)),
@@ -374,6 +394,24 @@ mod tests {
             max_amount: vec![(RD.parse().unwrap(), 1_000_000), (DFABI.parse().unwrap(), 10_000)],
             parties: vec![account(1), account(2)],
         }
+    }
+
+    #[test]
+    fn records_lists_every_bundle_by_bundle_then_leg() {
+        let dir = std::env::temp_dir().join(format!("rd-dfabi-records-{}", rand::random::<u64>()));
+        for (bundle, leg) in [("bb", 1u8), ("aa", 1), ("bb", 0), ("aa", 0)] {
+            let path = dir.join(bundle).join(format!("{leg}.json"));
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            let record = Record {
+                bundle_id: bundle.into(), leg, verdict: "approved".into(), payer: "p".into(), recipient: "r".into(),
+                asset: "a".into(), amount: "1".into(), memo_hex: String::new(), plaintext_norito_hex: String::new(),
+            };
+            std::fs::write(path, serde_json::to_string(&record).unwrap()).unwrap();
+        }
+        let got = list_records(&dir).unwrap().iter().map(|r| (r.bundle_id.clone(), r.leg)).collect::<Vec<_>>();
+        assert_eq!(got, [("aa".into(), 0), ("aa".into(), 1), ("bb".into(), 0), ("bb".into(), 1)]);
+        assert!(list_records(&dir.join("missing")).unwrap().is_empty());
+        std::fs::remove_dir_all(dir).unwrap();
     }
 
     #[test]
