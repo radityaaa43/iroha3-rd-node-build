@@ -169,7 +169,7 @@ pub fn run(cfg: Config) -> Result<()> {
         let result = match (method, path) {
             ("GET", "/healthz") => Ok("{}".to_owned()),
             ("GET", "/keys") => auditor.keys(),
-            ("GET", "/records") => Ok(serde_json::to_string(&list_records(&auditor.cfg.auditor.store_dir)?)?),
+            ("GET", "/records") => list_records(&auditor.cfg.auditor.store_dir).and_then(|r| Ok(serde_json::to_string(&r)?)),
             ("GET", p) if p.starts_with("/records/") => auditor.records(&p["/records/".len()..]),
             ("POST", "/approve") => serde_json::from_str(body)
                 .map_err(Into::into)
