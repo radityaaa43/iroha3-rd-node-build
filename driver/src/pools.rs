@@ -20,7 +20,10 @@ use iroha::{
     data_model::{
         account::AccountId,
         isi::private_settlement::ActivatePrivateSettlementPoolV1,
-        nexus::{PrivateSettlementAuditNoteOpeningV1, PrivateSettlementHybridPublicKeyV1, PrivateSettlementRouteV1},
+        nexus::{
+            PrivateSettlementAuditNoteOpeningV1, PrivateSettlementHybridPublicKeyV1, PrivateSettlementReceiptV1,
+            PrivateSettlementRouteV1,
+        },
         privacy::{PrivacyCommitmentV1, PrivacyPoolIdV1, PrivacyProtocolIdV1},
     },
 };
@@ -76,6 +79,7 @@ impl Asset {
 #[derive(Serialize, Deserialize, Clone)]
 pub struct BundleRef {
     pub id: String,
+    /// 0 while in flight (recorded before submission, so a finalized bundle is never lost).
     pub height: u64,
 }
 
@@ -135,24 +139,46 @@ impl PoolRecord {
         Ok(PrivacyPoolIdV1::new(hex32(&self.pool_id)?))
     }
 
-    /// Rebuild the pool from the chain: origin, then each finalized receipt's delta for this pool.
-    pub fn history(&self, client: &Client) -> Result<PoolHistory> {
+    /// Rebuild the pool from the chain: origin, then the delta for this pool of every listed bundle
+    /// that finalized, in finalization order. Aborted or in-flight bundles moved nothing.
+    pub fn history(&self, client: &Client, cache: &Path) -> Result<PoolHistory> {
         let pool_id = self.pool_id()?;
         let origin = self.origin.iter().map(|c| Ok(PrivacyCommitmentV1::new(hex32(c)?))).collect::<Result<Vec<_>>>()?;
         let mut history = PoolHistory::new(pool_id, &origin)?;
+        let mut finalized = Vec::new();
         for bundle in &self.bundles {
-            let receipt = match client.client().private_settlement_bundle_receipt_v1(Hash::prehashed(hex32(&bundle.id)?))? {
-                PrivateSettlementBundleReceiptResponseV1::Finalized(receipt) => receipt,
-                _ => bail!("bundle {} has no finalized receipt", bundle.id),
-            };
+            if let Some(receipt) = finalized_receipt(client, cache, &bundle.id)? {
+                finalized.push(receipt);
+            }
+        }
+        finalized.sort_by_key(|receipt| receipt.finalized_height);
+        for receipt in finalized {
             let leg = receipt
                 .legs
                 .iter()
                 .find(|leg| leg.delta.pool_id == pool_id)
-                .ok_or_else(|| eyre!("bundle {} has no leg in this pool", bundle.id))?;
+                .ok_or_else(|| eyre!("a finalized bundle has no leg in this pool"))?;
             history.apply(&leg.delta, receipt.finalized_height)?;
         }
         Ok(history)
+    }
+}
+
+/// A finalized receipt is immutable public data: cached on disk once read.
+fn finalized_receipt(client: &Client, cache: &Path, id: &str) -> Result<Option<PrivateSettlementReceiptV1>> {
+    let file = cache.join(format!("{id}.norito.hex"));
+    if let Ok(text) = std::fs::read_to_string(&file) {
+        return Ok(Some(dec(text.trim())?));
+    }
+    match client.client().private_settlement_bundle_receipt_v1(Hash::prehashed(hex32(id)?))? {
+        PrivateSettlementBundleReceiptResponseV1::Finalized(receipt) => {
+            std::fs::create_dir_all(cache)?;
+            let tmp = file.with_extension("tmp");
+            std::fs::write(&tmp, enc(&receipt)?)?;
+            std::fs::rename(tmp, &file)?;
+            Ok(Some(receipt))
+        }
+        _ => Ok(None),
     }
 }
 
@@ -169,6 +195,10 @@ fn write_secret(path: &Path, text: &str) -> Result<()> {
         .wrap_err_with(|| format!("create {}", path.display()))?
         .write_all(text.as_bytes())?;
     Ok(())
+}
+
+fn receipt_cache(cfg: &Config) -> PathBuf {
+    cfg.pools_file.with_file_name("receipts")
 }
 
 fn origin_note_path(cfg: &Config, asset: Asset) -> PathBuf {
@@ -296,7 +326,7 @@ fn run_bundle(cfg: &Config, legs: [LegSpec; 2], options: &Options, kind: &str) -
     let mut governed = Vec::new();
     for (ordinal, leg) in legs.iter().enumerate() {
         let record = pools.get(leg.asset);
-        let history = record.history(&sponsor)?;
+        let history = record.history(&sponsor, &receipt_cache(cfg))?;
         let keys = cfg.note_keys(&leg.payer)?;
         let (unspent, _) = scan(&history, &keys, &origin_notes(cfg, &leg.payer, leg.asset)?)?;
         let reimbursement = if ordinal == 0 { SPONSOR_REIMBURSEMENT } else { 0 };
@@ -347,13 +377,25 @@ fn run_bundle(cfg: &Config, legs: [LegSpec; 2], options: &Options, kind: &str) -
         })?);
         println!("leg {ordinal} proved after {:?} {}", started.elapsed(), peak_rss());
     }
-    if let Some((id, height)) = settle(cfg, &sponsor, manifest, &prepared, &governed, &committees, started, options)? {
-        for asset in [Asset::Rd, Asset::Dfabi] {
-            pools.get_mut(asset).bundles.push(BundleRef { id: id.clone(), height });
-        }
-        pools.save(&cfg.pools_file)?;
-        println!("kind={kind}");
+    let id = hex::encode(manifest.bundle_id.as_ref());
+    for asset in [Asset::Rd, Asset::Dfabi] {
+        pools.get_mut(asset).bundles.push(BundleRef { id: id.clone(), height: 0 });
     }
+    pools.save(&cfg.pools_file)?;
+    let outcome = settle(cfg, &sponsor, manifest, &prepared, &governed, &committees, started, options);
+    for asset in [Asset::Rd, Asset::Dfabi] {
+        let bundles = &mut pools.get_mut(asset).bundles;
+        match &outcome {
+            Ok(Some((_, height))) => bundles.iter_mut().filter(|b| b.id == id).for_each(|b| b.height = *height),
+            // aborted (or failed and aborted): it moved nothing; a failure whose abort also failed
+            // stays listed and history() reads its final state from the chain
+            Ok(None) => bundles.retain(|b| b.id != id),
+            Err(_) => {}
+        }
+    }
+    pools.save(&cfg.pools_file)?;
+    outcome?;
+    println!("kind={kind}");
     Ok(())
 }
 
@@ -365,7 +407,7 @@ pub fn wallet(cfg: &Config, party: &str) -> Result<()> {
     let mut balances = serde_json::Map::new();
     let mut items = Vec::new();
     for asset in [Asset::Rd, Asset::Dfabi] {
-        let history = pools.get(asset).history(&client)?;
+        let history = pools.get(asset).history(&client, &receipt_cache(cfg))?;
         let (unspent, spent) = scan(&history, &keys, &origin_notes(cfg, party, asset)?)?;
         let balance: u128 = unspent.iter().map(|n| n.opening.value).sum();
         balances.insert(asset.name().into(), balance.to_string().into());
@@ -401,7 +443,7 @@ pub fn wallet(cfg: &Config, party: &str) -> Result<()> {
 pub fn pool_history(cfg: &Config, asset: Asset) -> Result<()> {
     let pools = PoolFile::load(&cfg.pools_file)?;
     let (client, _) = cfg.sponsor("bi")?;
-    let history = pools.get(asset).history(&client)?;
+    let history = pools.get(asset).history(&client, &receipt_cache(cfg))?;
     println!(
         "pool_history asset={} epoch={} leaves={} root={}",
         asset.name(),
@@ -412,3 +454,13 @@ pub fn pool_history(cfg: &Config, asset: Asset) -> Result<()> {
     Ok(())
 }
 
+
+/// Abort a stuck bundle (prepared but never registered) to release the pool reservations.
+pub fn abort_bundle(cfg: &Config, bundle: &str) -> Result<()> {
+    let (sponsor, _) = cfg.sponsor("bi")?;
+    let status = sponsor.client().private_settlement_bundle_status_v1(Hash::prehashed(hex32(bundle)?))?;
+    let manifest = status.manifest.ok_or_else(|| eyre!("the node retains no manifest for this bundle"))?;
+    crate::aps::abort_bundle(cfg, sponsor.client(), &manifest)?;
+    println!("aborted bundle={bundle}");
+    Ok(())
+}

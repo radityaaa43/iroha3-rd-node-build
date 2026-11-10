@@ -11,6 +11,7 @@
 //!   rd-dfabi pay <config> --asset rd|dfabi --from P --to Q --amount N  private payment in the shared pools
 //!   rd-dfabi dvp-shared <config> --buyer P --seller P --rd N --dfabi N   DvP in the shared pools
 //!   rd-dfabi wallet <config> --party P   balances and movements from the chain (wallet_json=)
+//!   rd-dfabi abort-bundle <config> --bundle <hex>  release the pool reservations of a stuck bundle
 //!   rd-dfabi pool-history <config> --asset rd|dfabi  rebuilt pool head (gate G3)
 //!   rd-dfabi dvp <config> --buyer P --seller P --rd N --dfabi N
 //!            [--rd-funding N] [--dfabi-funding N] [--expect finalized|aborted] [--replay]
@@ -106,6 +107,7 @@ fn main() -> Result<()> {
                 &Options { expect: Expect::Finalized, replay: false },
             )
         }
+        ["abort-bundle", config, "--bundle", bundle] => pools::abort_bundle(&Config::load(Path::new(config))?, bundle),
         ["wallet", config, "--party", party] => pools::wallet(&Config::load(Path::new(config))?, party),
         _ => bail!("usage: see the header of apps/rd-dfabi/src/main.rs"),
     }

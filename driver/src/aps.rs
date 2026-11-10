@@ -412,19 +412,36 @@ pub(crate) fn settle(
     let endpoints = committees.iter().map(|c| c.endpoints.clone()).collect::<Vec<_>>();
     let authorities = committees.iter().map(|c| c.authority.clone()).collect::<Vec<_>>();
     let deltas = prepared.iter().map(|leg| leg.delta.clone()).collect::<Vec<_>>();
-    let barrier = client
-        .prepare_private_settlement_bundle_v1(&endpoints, &final_manifest, &authorities, &deltas)
-        .wrap_err("prepare votes")?;
-    client
-        .register_private_settlement_prepare_and_wait_v1(
-            &barrier,
-            max_carrier_bytes(),
-            TransactionWaitOptions {
-                timeout: FINALITY_TIMEOUT,
-                poll_interval: POLL_INTERVAL,
-            },
-        )
-        .wrap_err("register prepare")?;
+    // Prepare votes stage each leg and reserve its pool head (iroha_core sidecar_store.rs
+    // ensure_reservations_available_v1): a bundle that stops here would lock both pools until
+    // expiry. Abort it so the global terminal record releases the reservations.
+    let prepared_phase = (|| -> Result<_> {
+        let barrier = client
+            .prepare_private_settlement_bundle_v1(&endpoints, &final_manifest, &authorities, &deltas)
+            .wrap_err("prepare votes")?;
+        client
+            .register_private_settlement_prepare_and_wait_v1(
+                &barrier,
+                max_carrier_bytes(),
+                TransactionWaitOptions {
+                    timeout: FINALITY_TIMEOUT,
+                    poll_interval: POLL_INTERVAL,
+                },
+            )
+            .wrap_err("register prepare")?;
+        Ok(barrier)
+    })();
+    let barrier = match prepared_phase {
+        Ok(barrier) => barrier,
+        Err(error) => {
+            eprintln!("prepare failed, aborting the bundle to release pool reservations: {error:#}");
+            match abort_bundle(cfg, client, &final_manifest) {
+                Ok(()) => println!("bundle aborted"),
+                Err(abort) => eprintln!("abort failed (pools stay reserved until expiry): {abort:#}"),
+            }
+            return Err(error);
+        }
+    };
     println!("prepare registered");
     let commits = client
         .recover_or_commit_private_settlement_bundle_v1(&endpoints, &barrier)
@@ -454,6 +471,20 @@ pub(crate) fn settle(
         }
     }
     Ok((outcome == "finalized").then(|| (hex::encode(final_manifest.bundle_id.as_ref()), height)))
+}
+
+/// Abort a bundle that has not finalized (sponsor-signed carrier, before expiry) and wait until
+/// all four validators report it aborted; this releases its pool/nullifier/output reservations.
+pub(crate) fn abort_bundle(cfg: &Config, client: &iroha::client::Client, manifest: &AtomicPrivateSettlementV1) -> Result<()> {
+    let request = client.build_private_settlement_abort_request_v1(
+        manifest,
+        PrivateSettlementAbortReasonV1::ParticipantRejected,
+        max_carrier_bytes(),
+    )?;
+    client.submit_private_settlement_bundle_v1(&request).wrap_err("submit abort")?;
+    let (outcome, _) = wait_receipt(cfg, manifest.bundle_id)?;
+    ensure!(outcome == "aborted", "abort ended as {outcome}");
+    Ok(())
 }
 
 /// One machine-readable line for callers (Lensa): public identifiers only, no amounts or
@@ -510,7 +541,7 @@ fn bounded_fee_for(fee_asset: &str) -> Result<FeePaymentIntent> {
 }
 
 /// Wait until every node reports the same terminal receipt kind.
-fn wait_receipt(cfg: &Config, bundle_id: Hash) -> Result<(&'static str, u64)> {
+pub(crate) fn wait_receipt(cfg: &Config, bundle_id: Hash) -> Result<(&'static str, u64)> {
     let clients = cfg
         .torii
         .keys()
