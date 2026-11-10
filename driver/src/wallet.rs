@@ -32,6 +32,17 @@ impl NoteKeys {
     pub fn view_public(&self) -> Result<[u8; 32]> {
         Ok(ivm_private_recipient_public_key_v1(&self.view)?)
     }
+    /// Keys the payer's change note is addressed to: same spend secret, a view secret derived from
+    /// the party's own. A leg's three outputs need distinct view keys (data model
+    /// PrivateSettlementAuditPlaintextV1::validate_output_authorizations), and a payer can also
+    /// be the recipient (BI -> BI companion leg).
+    pub fn for_change(&self) -> Self {
+        use sha2::{Digest as _, Sha256};
+        let mut h = Sha256::new();
+        h.update(b"rd-dfabi.change-view.v1");
+        h.update(self.view);
+        Self { spend: self.spend, view: h.finalize().into() }
+    }
 }
 
 /// Open one encrypted pool output with `keys`; `None` when it is not addressed to them.
@@ -123,7 +134,11 @@ pub fn scan(
         }
     }
     for row in &history.outputs {
-        if let Some(opening) = open_output(history.pool_id, row.commitment, &row.encrypted, keys)? {
+        let opened = match open_output(history.pool_id, row.commitment, &row.encrypted, keys)? {
+            Some(opening) => Some(opening),
+            None => open_output(history.pool_id, row.commitment, &row.encrypted, &keys.for_change())?,
+        };
+        if let Some(opening) = opened {
             if seen.insert(opening.commitment) && opening.value > 0 {
                 found.push(OwnedNote { opening, bundle_id: Some(row.bundle_id.clone()), height: row.height });
             }

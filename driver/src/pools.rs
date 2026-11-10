@@ -338,7 +338,7 @@ fn run_bundle(cfg: &Config, legs: [LegSpec; 2], options: &Options, kind: &str) -
             funding: note.opening.value,
             amount: leg.amount,
         };
-        let notes = LegNotes { recipient: cfg.note_keys(&leg.recipient)?, change: keys.clone() };
+        let notes = LegNotes { recipient: cfg.note_keys(&leg.recipient)?, change: keys.for_change() };
         let spend = Spend::Continue { opening: note.opening, secret: keys.spend, tree: history.tree, epoch: history.epoch };
         let authority_digest = committees[ordinal].authority.digest()?;
         prepared.push(on_big_stack(|| {

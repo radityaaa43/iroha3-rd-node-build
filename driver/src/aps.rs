@@ -722,7 +722,7 @@ pub fn prove_continuation_selftest(peers_json: &Path) -> Result<()> {
     let salt2 = rnd();
     let manifest2 = proof_manifest(network_id, 102, 100 + EXPIRY_BLOCKS, AccountId::new(sponsor_key.public_key().clone()), fee, &governed, salt2)?;
     let leg2 = Leg { lane: 1, asset, payer: fixture_key(0x33), recipient: fixture_key(0x34), funding: received.value, amount: 40 };
-    let notes2 = LegNotes { recipient: carol, change: bob.clone() };
+    let notes2 = LegNotes { recipient: carol, change: bob.for_change() };
     let expected_nullifier = crate::wallet::note_nullifier(pool_id, &bob.spend, &received)?;
     let spend = Spend::Continue { opening: received, secret: bob.spend, tree, epoch: 2 };
     let second = on_big_stack(|| {
