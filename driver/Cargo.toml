@@ -16,6 +16,7 @@ iroha_primitives = { workspace = true }
 norito = { workspace = true, default-features = false, features = ["node-codec"] }
 eyre = { workspace = true }
 hex = { workspace = true, features = ["std"] }
+sha2 = "0.10.9"
 rand = { workspace = true }
 toml = { workspace = true }
 url = { workspace = true, features = ["serde"] }

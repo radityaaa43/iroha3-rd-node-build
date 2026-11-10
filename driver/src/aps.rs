@@ -56,13 +56,15 @@ use iroha::{
 };
 use iroha_core::privacy_engines::{
     atomic_private_settlement::{
-        AtomicPrivateSettlementPreparedLegV1, AtomicPrivateSettlementProvisionalLegInputV1,
+        AtomicPrivateSettlementInputSecretV1, AtomicPrivateSettlementPreparedLegV1,
+        AtomicPrivateSettlementProvisionalLegInputV1,
         atomic_private_settlement_audit_input_commitment_v1,
         complete_atomic_private_settlement_prepared_leg_v1,
         consume_atomic_private_settlement_wallet_bundle_v1,
         derive_atomic_private_settlement_input_nullifiers_v1,
         encode_atomic_private_settlement_wallet_bundle_v1,
         finalize_atomic_private_settlement_provisional_bundle_v1,
+        verify_atomic_private_settlement_v1,
         plan_atomic_private_settlement_bootstrap_v1,
         prepare_atomic_private_settlement_funding_note_v1,
         prepare_atomic_private_settlement_input_openings_v1,
@@ -84,6 +86,8 @@ use url::Url;
 use crate::{
     auditor::{ApproveRequest, ApproveResponse, Keys},
     config::Config,
+    tree::PoolTree,
+    wallet::{NoteKeys, open_output},
 };
 
 /// Bundles expire this many blocks after the authority context (max_expiry_blocks = 7200).
@@ -133,7 +137,7 @@ struct Governed {
     governance: PrivateSettlementPoolGovernanceV1,
 }
 
-struct Funding {
+pub struct Funding {
     opening: PrivateSettlementAuditNoteOpeningV1,
     spending_secret: [u8; 32],
     /// Positive input in slot 0, unspent reserve (value 1) in slot 1.
@@ -145,6 +149,37 @@ impl Funding {
         let mut commitments = self.input_commitments;
         commitments.sort_unstable();
         commitments
+    }
+}
+
+/// Where a leg's positive input note comes from.
+pub enum Spend {
+    /// Origin note of a pool activated for this bundle (fresh two-note tree).
+    Bootstrap(Funding),
+    /// A note already in a live pool: `tree` holds every commitment in ledger order, the pool
+    /// is at `epoch`, and `secret` is the spend secret behind `opening.spending_authority`.
+    Continue { opening: PrivateSettlementAuditNoteOpeningV1, secret: [u8; 32], tree: PoolTree, epoch: u64 },
+}
+
+impl Spend {
+    fn value(&self) -> u128 {
+        match self {
+            Self::Bootstrap(funding) => funding.opening.value,
+            Self::Continue { opening, .. } => opening.value,
+        }
+    }
+}
+
+/// Note keys the leg's settlement output and change output are addressed to.
+pub struct LegNotes {
+    pub recipient: NoteKeys,
+    pub change: NoteKeys,
+}
+
+impl LegNotes {
+    /// Throwaway keys (DvP on fresh pools: nobody spends these notes again).
+    pub fn random() -> Self {
+        Self { recipient: NoteKeys::random(), change: NoteKeys::random() }
     }
 }
 
@@ -284,7 +319,8 @@ pub fn run_dvp(cfg: &Config, legs: Vec<Leg>, options: &Options) -> Result<()> {
                 ordinal,
                 leg,
                 governed,
-                funding,
+                Spend::Bootstrap(funding),
+                &LegNotes::random(),
                 &manifest,
                 authority_digest,
                 &sponsor_key,
@@ -597,13 +633,86 @@ pub fn prove_selftest(peers_json: &Path) -> Result<()> {
     let funding = funding(leg.funding)?;
     let authority_digest = authority.digest()?;
     on_big_stack(|| {
-        prepare_leg(0, &leg, &governed[0], funding, &manifest, authority_digest, &sponsor_key, salt)
+        prepare_leg(0, &leg, &governed[0], Spend::Bootstrap(funding), &LegNotes::random(), &manifest, authority_digest, &sponsor_key, salt)
     })?;
     println!(
         "prove-selftest ok elapsed_ms={} {}",
         started.elapsed().as_millis(),
         peak_rss()
     );
+    Ok(())
+}
+
+/// Gate G1a (offline): settlement 2 spends the note settlement 1 paid out, in the same pool.
+/// Input 0 is the received output (path from the client-side tree), input 1 a virtual dummy.
+/// Both proofs must verify. Prints no amounts.
+pub fn prove_continuation_selftest(peers_json: &Path) -> Result<()> {
+    let route = |lane: u32| PrivateSettlementRouteV1 {
+        dataspace_id: DataSpaceId::new(u64::from(lane)),
+        lane_id: LaneId::new(lane),
+        lane_incarnation: Hash::new(b"rd-dfabi-selftest"),
+    };
+    let (authority, _) = committee_authority(peers_json, route(1))?;
+    let authority_digest = authority.digest()?;
+    let network_id = NetworkId::from_genesis_hash(HashOf::from_untyped_unchecked(Hash::new(
+        b"rd-dfabi-selftest-network",
+    )));
+    let auditor_key = fixture_key(0x30);
+    let mut rng = iroha_crypto::rng_from_seed_slice(&rnd());
+    let hybrid = iroha_crypto::HybridKeyPair::generate(&mut rng)?;
+    let encryption = PrivateSettlementHybridPublicKeyV1::from_hybrid(hybrid.public());
+    let governed = [(1, "7onbjg2gRXveoAAUFsohCZyGW98t"), (2, "4mBWK1JCwQdHLDPpuVKc56eLsXka")]
+        .into_iter()
+        .map(|(lane, asset)| {
+            govern(route(lane), asset.parse()?, 100, 100 + EXPIRY_BLOCKS, auditor_key.public_key(), &encryption)
+        })
+        .collect::<Result<Vec<_>>>()?;
+    let pool_id = governed[0].governance.body.pool_id;
+    let sponsor_key = fixture_key(0x31);
+    let fee = bounded_fee_for("6TEAJqbb8oEPmLncoNiMRbLEK6tw")?;
+    let genesis = *network_id.as_genesis_hash().as_ref();
+    let (alice, bob, carol) = (NoteKeys::random(), NoteKeys::random(), NoteKeys::random());
+    let asset = governed[0].governance.body.asset_definition_id.clone();
+    let started = Instant::now();
+
+    // Settlement 1: alice's origin note pays bob 100 (bootstrap, as every DvP does today).
+    let funding1 = funding(1_000)?;
+    let mut tree = PoolTree::new(pool_id)?;
+    tree.append(&funding1.activation_commitments())?;
+    let salt1 = rnd();
+    let manifest1 = proof_manifest(network_id, 101, 100 + EXPIRY_BLOCKS, AccountId::new(sponsor_key.public_key().clone()), fee.clone(), &governed, salt1)?;
+    let leg1 = Leg { lane: 1, asset: asset.clone(), payer: fixture_key(0x32), recipient: fixture_key(0x33), funding: 1_000, amount: 100 };
+    let notes1 = LegNotes { recipient: bob.clone(), change: alice };
+    let first = on_big_stack(|| {
+        prepare_leg(0, &leg1, &governed[0], Spend::Bootstrap(funding1), &notes1, &manifest1, authority_digest, &sponsor_key, salt1)
+    })?;
+    verify_atomic_private_settlement_v1(&manifest1, &first.statement, genesis, 101, &first.proof)
+        .map_err(|e| eyre!("settlement 1 proof rejected: {e:?}"))?;
+    tree.append(&first.statement.output_commitments)?;
+    ensure!(tree.root() == first.statement.new_root, "client tree root differs from settlement 1 successor root");
+
+    // bob finds his note among the public outputs with his view key alone.
+    let mut received = None;
+    for (commitment, encrypted) in first.statement.output_commitments.iter().zip(&first.statement.encrypted_outputs) {
+        if let Some(opening) = open_output(pool_id, *commitment, encrypted, &bob)? {
+            received = Some(opening);
+        }
+    }
+    let received = received.ok_or_else(|| eyre!("bob found no note addressed to him"))?;
+
+    // Settlement 2: bob spends the received note, paying carol 40 (change 59, reimbursement 1).
+    let salt2 = rnd();
+    let manifest2 = proof_manifest(network_id, 102, 100 + EXPIRY_BLOCKS, AccountId::new(sponsor_key.public_key().clone()), fee, &governed, salt2)?;
+    let leg2 = Leg { lane: 1, asset, payer: fixture_key(0x33), recipient: fixture_key(0x34), funding: received.value, amount: 40 };
+    let notes2 = LegNotes { recipient: carol, change: bob.clone() };
+    let spend = Spend::Continue { opening: received, secret: bob.spend, tree, epoch: 2 };
+    let second = on_big_stack(|| {
+        prepare_leg(0, &leg2, &governed[0], spend, &notes2, &manifest2, authority_digest, &sponsor_key, salt2)
+    })?;
+    verify_atomic_private_settlement_v1(&manifest2, &second.statement, genesis, 102, &second.proof)
+        .map_err(|e| eyre!("continuation proof rejected: {e:?}"))?;
+    ensure!(second.statement.old_epoch == 2 && second.statement.new_epoch == 3, "continuation epochs");
+    println!("continuation_verified=true elapsed_ms={} {}", started.elapsed().as_millis(), peak_rss());
     Ok(())
 }
 
@@ -905,7 +1014,8 @@ fn prepare_leg(
     ordinal: usize,
     leg: &Leg,
     governed: &Governed,
-    funding: Funding,
+    spend: Spend,
+    notes: &LegNotes,
     manifest: &AtomicPrivateSettlementV1,
     authority_digest: Hash,
     sponsor_key: &KeyPair,
@@ -955,13 +1065,19 @@ fn prepare_leg(
 
     let payer = &leg.payer;
     let recipient = &leg.recipient;
-    let initial_commitments = funding.activation_commitments();
-    let input_secrets = [funding.spending_secret, rnd()];
-    let output_secrets = [rnd(), rnd(), rnd()];
-    let view_secrets = [rnd(), rnd(), rnd()];
+    let (positive_input, positive_secret) = match &spend {
+        Spend::Bootstrap(funding) => (funding.opening.clone(), funding.spending_secret),
+        Spend::Continue { opening, secret, .. } => (opening.clone(), *secret),
+    };
+    let input_secrets = [positive_secret, rnd()];
+    let output_secrets = [notes.recipient.spend, notes.change.spend, rnd()];
+    let view_secrets = [notes.recipient.view, notes.change.view, rnd()];
     let ephemeral_secrets = [rnd(), rnd(), rnd()];
     let reimbursement = if ordinal == 0 { SPONSOR_REIMBURSEMENT } else { 0 };
-    let change = leg.funding - leg.amount - reimbursement;
+    let change = spend
+        .value()
+        .checked_sub(leg.amount + reimbursement)
+        .ok_or_else(|| eyre!("leg {ordinal}: insufficient payer note"))?;
     let output = |role, signer: &KeyPair, view_secret, ephemeral_secret, active, value| {
         Ok::<_, eyre::Report>(PrivateSettlementAuditOutputV1 {
             role,
@@ -1001,7 +1117,7 @@ fn prepare_leg(
         reimbursement_terms_salt: reimbursement_salt,
         memo: format!("rd-dfabi-leg-{ordinal}").into_bytes(),
         policy_references: vec![governed.governance.governance_digest],
-        inputs: vec![funding.opening, note_opening(false, 0)],
+        inputs: vec![positive_input.clone(), note_opening(false, 0)],
         outputs: vec![
             output(
                 PrivateSettlementAuditOutputRoleV1::SettlementRecipient,
@@ -1037,7 +1153,7 @@ fn prepare_leg(
     }
     prepare_atomic_private_settlement_input_openings_v1(manifest, &statement, &mut plaintext.inputs)?;
     ensure!(
-        plaintext.inputs[0].commitment == funding.input_commitments[0],
+        plaintext.inputs[0].commitment == positive_input.commitment,
         "settlement changed its already-funded positive input"
     );
     statement.nullifiers = derive_atomic_private_settlement_input_nullifiers_v1(
@@ -1100,24 +1216,51 @@ fn prepare_leg(
         &mut capsule_rng,
     )?;
     statement.audit_capsule_digest = capsule.digest()?;
-    let bootstrap = plan_atomic_private_settlement_bootstrap_v1(
-        statement.pool_id,
-        funding.input_commitments,
-        statement
-            .output_commitments
-            .as_slice()
-            .try_into()
-            .map_err(|_| eyre!("output commitment shape changed"))?,
-        input_secrets,
-    )?;
-    ensure!(
-        bootstrap.initial_commitments == initial_commitments,
-        "bootstrap origin differs from the activated funding"
-    );
-    statement.old_root = bootstrap.old_root;
-    statement.new_root = bootstrap.new_root;
-    statement.old_epoch = bootstrap.old_epoch;
-    statement.new_epoch = bootstrap.new_epoch;
+    let outputs: [PrivacyCommitmentV1; 3] = statement
+        .output_commitments
+        .as_slice()
+        .try_into()
+        .map_err(|_| eyre!("output commitment shape changed"))?;
+    let input_witnesses = match spend {
+        Spend::Bootstrap(funding) => {
+            let bootstrap = plan_atomic_private_settlement_bootstrap_v1(
+                statement.pool_id,
+                funding.input_commitments,
+                outputs,
+                input_secrets,
+            )?;
+            ensure!(
+                bootstrap.initial_commitments == funding.activation_commitments(),
+                "bootstrap origin differs from the activated funding"
+            );
+            statement.old_root = bootstrap.old_root;
+            statement.new_root = bootstrap.new_root;
+            statement.old_epoch = bootstrap.old_epoch;
+            statement.new_epoch = bootstrap.new_epoch;
+            bootstrap.into_input_secrets()
+        }
+        Spend::Continue { opening, tree, epoch, .. } => {
+            let position = tree
+                .position(opening.commitment)
+                .ok_or_else(|| eyre!("leg {ordinal}: payer note is not in the pool"))?;
+            let mut successor = tree.clone();
+            successor.append(&outputs)?;
+            statement.old_root = tree.root();
+            statement.new_root = successor.root();
+            statement.old_epoch = epoch;
+            statement.new_epoch = epoch + 1;
+            // Input 1 is a virtual dummy: never inserted, any non-zero path (upstream relation.rs
+            // wallet_continues_settlement_with_fresh_virtual_dummy_without_bootstrap).
+            [
+                AtomicPrivateSettlementInputSecretV1::new(input_secrets[0], u32::try_from(position)?, tree.path(position)?)?,
+                AtomicPrivateSettlementInputSecretV1::new(
+                    input_secrets[1],
+                    u32::try_from(position ^ 1)?,
+                    [[0xED; 32]; crate::tree::DEPTH],
+                )?,
+            ]
+        }
+    };
     statement.validate()?;
     let wallet_id = format!("rd-dfabi-leg-{ordinal}");
     let owner_bundle = encode_atomic_private_settlement_wallet_bundle_v1(
@@ -1127,7 +1270,7 @@ fn prepare_leg(
         &capsule,
         &governed.policy,
         &plaintext,
-        &bootstrap.into_input_secrets(),
+        &input_witnesses,
     )?;
     let mut owner_material = owner_bundle.to_vec();
     let prepared = consume_atomic_private_settlement_wallet_bundle_v1(
@@ -1165,4 +1308,15 @@ fn provisional_materials(
         })
         .collect::<Result<Vec<_>, _>>()?;
     Ok(finalize_atomic_private_settlement_provisional_bundle_v1(manifest, inputs)?.materials)
+}
+
+#[cfg(test)]
+mod continuation_tests {
+    use std::path::Path;
+
+    #[test]
+    fn continuation_leg_proves_and_verifies() {
+        super::prove_continuation_selftest(Path::new(concat!(env!("CARGO_MANIFEST_DIR"), "/fixtures/peers.json")))
+            .expect("gate G1a: a received note is spendable in the same pool");
+    }
 }

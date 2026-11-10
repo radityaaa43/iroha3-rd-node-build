@@ -5,6 +5,7 @@
 //!   rd-dfabi keys show <dir> <name>    print the public key of an existing seed
 //!   rd-dfabi auditor <config>          run the BI auditor service
 //!   rd-dfabi prove-selftest <peers.json>  offline: prove one leg, print time and peak RSS
+//!   rd-dfabi prove-continuation-selftest <peers.json>  offline gate G1a: spend a received note
 //!   rd-dfabi dvp <config> --buyer P --seller P --rd N --dfabi N
 //!            [--rd-funding N] [--dfabi-funding N] [--expect finalized|aborted] [--replay]
 //!
@@ -14,7 +15,10 @@
 mod aps;
 mod auditor;
 mod config;
+mod history;
 mod http;
+mod tree;
+mod wallet;
 
 use std::{collections::BTreeMap, io::Write, os::unix::fs::OpenOptionsExt, path::Path};
 
@@ -54,6 +58,7 @@ fn main() -> Result<()> {
         }
         ["auditor", config] => auditor::run(Config::load(Path::new(config))?),
         ["prove-selftest", peers_json] => aps::prove_selftest(Path::new(peers_json)),
+        ["prove-continuation-selftest", peers_json] => aps::prove_continuation_selftest(Path::new(peers_json)),
         ["dvp", config, rest @ ..] => dvp(&Config::load(Path::new(config))?, rest),
         _ => bail!("usage: see the header of apps/rd-dfabi/src/main.rs"),
     }
