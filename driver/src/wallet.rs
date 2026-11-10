@@ -32,15 +32,19 @@ impl NoteKeys {
     pub fn view_public(&self) -> Result<[u8; 32]> {
         Ok(ivm_private_recipient_public_key_v1(&self.view)?)
     }
-    /// Keys the payer's change note is addressed to: same spend secret, a view secret derived from
-    /// the party's own. A leg's three outputs need distinct view keys (data model
-    /// PrivateSettlementAuditPlaintextV1::validate_output_authorizations), and a payer can also
-    /// be the recipient (BI -> BI companion leg).
-    pub fn for_change(&self) -> Self {
+    /// One-time keys for one output: same spend secret, a view secret derived from the party's own
+    /// view secret, the bundle, the pool and the output role (0 recipient, 1 change). A recipient id is
+    /// public on chain, so a fixed view key would link every payment of a party; a leg's outputs and
+    /// a bundle's outputs must also have distinct recipient ids (data model validate_output_authorizations,
+    /// PrivateSettlementPrepareBarrierV1::validate_shape). The owner re-derives it when scanning.
+    pub fn one_time(&self, bundle_id: &[u8; 32], pool_id: &[u8; 32], role: u8) -> Self {
         use sha2::{Digest as _, Sha256};
         let mut h = Sha256::new();
-        h.update(b"rd-dfabi.change-view.v1");
+        h.update(b"rd-dfabi.one-time-view.v1");
         h.update(self.view);
+        h.update(bundle_id);
+        h.update(pool_id);
+        h.update([role]);
         Self { spend: self.spend, view: h.finalize().into() }
     }
 }
@@ -134,10 +138,15 @@ pub fn scan(
         }
     }
     for row in &history.outputs {
-        let opened = match open_output(history.pool_id, row.commitment, &row.encrypted, keys)? {
-            Some(opening) => Some(opening),
-            None => open_output(history.pool_id, row.commitment, &row.encrypted, &keys.for_change())?,
-        };
+        let bundle: [u8; 32] = hex::decode(&row.bundle_id)?.try_into().map_err(|_| eyre!("bundle id"))?;
+        let pool = *history.pool_id.as_ref();
+        let mut opened = None;
+        for role in [0, 1] {
+            if let Some(opening) = open_output(history.pool_id, row.commitment, &row.encrypted, &keys.one_time(&bundle, &pool, role))? {
+                opened = Some(opening);
+                break;
+            }
+        }
         if let Some(opening) = opened {
             if seen.insert(opening.commitment) && opening.value > 0 {
                 found.push(OwnedNote { opening, bundle_id: Some(row.bundle_id.clone()), height: row.height });
@@ -192,6 +201,16 @@ mod tests {
         let notes = [note(5), note(5)];
         assert!(pick_note(&notes, 8).is_err());
         assert_eq!(pick_note(&notes, 4).unwrap().opening.value, 5);
+    }
+
+    #[test]
+    fn one_time_keys_differ_per_bundle_pool_and_role_and_keep_the_spend_key() {
+        let k = NoteKeys::random();
+        let (b1, b2, p) = ([1; 32], [2; 32], [3; 32]);
+        let views = [k.one_time(&b1, &p, 0).view, k.one_time(&b1, &p, 1).view, k.one_time(&b2, &p, 0).view, k.view];
+        assert_eq!(views.iter().collect::<std::collections::BTreeSet<_>>().len(), 4);
+        assert_eq!(k.one_time(&b1, &p, 0).spend, k.spend);
+        assert_eq!(k.one_time(&b1, &p, 0).view, k.one_time(&b1, &p, 0).view);
     }
 
     #[test]

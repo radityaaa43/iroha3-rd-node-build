@@ -338,7 +338,8 @@ fn run_bundle(cfg: &Config, legs: [LegSpec; 2], options: &Options, kind: &str) -
             funding: note.opening.value,
             amount: leg.amount,
         };
-        let notes = LegNotes { recipient: cfg.note_keys(&leg.recipient)?, change: keys.for_change() };
+        let (bundle, pool) = (*manifest.bundle_id.as_ref(), *governed[ordinal].governance.body.pool_id.as_ref());
+        let notes = LegNotes { recipient: cfg.note_keys(&leg.recipient)?.one_time(&bundle, &pool, 0), change: keys.one_time(&bundle, &pool, 1) };
         let spend = Spend::Continue { opening: note.opening, secret: keys.spend, tree: history.tree, epoch: history.epoch };
         let authority_digest = committees[ordinal].authority.digest()?;
         prepared.push(on_big_stack(|| {
