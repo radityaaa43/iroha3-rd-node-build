@@ -28,6 +28,7 @@
 //! A DvP is one bundle: leg 0 RD buyer -> seller in ds-rd, leg 1 DFABI seller -> buyer in
 //! ds-dfabi. Each payer's origin note (funding) is issued when its leg's pool is activated.
 
+mod approval;
 mod aps;
 mod auditor;
 mod client_toml;

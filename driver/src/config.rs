@@ -151,4 +151,31 @@ pub fn read_seed(path: &Path) -> Result<[u8; 32]> {
 /// Ed25519 key of a wallet or the auditor, derived from its seed.
 pub fn signing_key(seed: &[u8; 32]) -> KeyPair {
     KeyPair::from_seed(seed.to_vec(), Algorithm::Ed25519)
+
+    #[test]
+    fn audit_policy_defaults_to_the_single_auditor_url_with_one_approval() {
+        let policy = config("").audit_policy().unwrap();
+        assert_eq!((policy.min_approvals, policy.auditor_urls), (1, vec!["a:1".to_owned()]));
+    }
+
+    #[test]
+    fn policy_from_config_two_of_three_parses() {
+        let cfg = config("[audit]\nmin_approvals = 2\nauditor_urls = [\"bi:8090\", \"a:8090\", \"b:8090\"]\n");
+        let policy = cfg.audit_policy().unwrap();
+        assert_eq!(policy.min_approvals, 2);
+        assert_eq!(policy.auditor_urls, ["bi:8090", "a:8090", "b:8090"]);
+    }
+
+    #[test]
+    fn policy_from_config_refuses_k_zero_k_above_n_no_auditor_and_duplicates() {
+        for bad in [
+            "[audit]\nmin_approvals = 0\nauditor_urls = [\"bi:8090\"]\n",
+            "[audit]\nmin_approvals = 4\nauditor_urls = [\"bi:8090\", \"a:8090\", \"b:8090\"]\n",
+            "[audit]\nmin_approvals = 1\nauditor_urls = []\n",
+            "[audit]\nmin_approvals = 1\nauditor_urls = [\"bi:8090\", \"bi:8090\"]\n",
+            "[audit]\nmin_approvals = 1\n",
+        ] {
+            assert!(config(bad).audit_policy().is_err(), "{bad:?} must be refused");
+        }
+    }
 }
