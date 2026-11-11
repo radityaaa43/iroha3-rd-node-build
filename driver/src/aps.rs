@@ -12,6 +12,7 @@
 //! respendable. Public RD/DFABI balances never move.
 
 use std::{
+    cell::Cell,
     path::Path,
     thread,
     time::{Duration, Instant},
@@ -21,7 +22,7 @@ use eyre::{Result, WrapErr, ensure, eyre};
 use iroha::{
     client::{
         AccountTransactionDraft, PrivateSettlementBundleReceiptResponseV1,
-        PrivateSettlementLegUploadRequestV1, TransactionWaitOptions,
+        PrivateSettlementLegUploadRequestV1, TransactionWaitOptions, TxConfirmationStatus,
     },
     data_model::{
         NetworkId,
@@ -330,12 +331,13 @@ pub fn run_dvp(cfg: &Config, legs: Vec<Leg>, options: &Options) -> Result<()> {
         println!("leg {ordinal} proved after {:?} {}", started.elapsed(), peak_rss());
     }
 
-    settle(cfg, &sponsor, manifest, &prepared, &governed, &committees, started, options)?;
+    settle(cfg, &sponsor, manifest, &prepared, &governed, &committees, started, options, &Cell::new(false))?;
     Ok(())
 }
 
 /// Upload, audit, prepare, commit and finalize proved legs; prints `result_json=`.
-/// Returns whether the bundle finalized (an audit rejection aborts it).
+/// Returns whether the bundle finalized (an audit rejection aborts it). `aborted` is set when a failed stage
+/// after Prepare was aborted successfully, so the caller knows nothing moved and nothing stays reserved.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn settle(
     cfg: &Config,
@@ -346,6 +348,7 @@ pub(crate) fn settle(
     committees: &[Committee],
     started: Instant,
     options: &Options,
+    aborted: &Cell<bool>,
 ) -> Result<Option<(String, u64)>> {
     let materials = provisional_materials(manifest, prepared, governed, committees)?;
     let client = sponsor.client();
@@ -419,19 +422,34 @@ pub(crate) fn settle(
         let barrier = client
             .prepare_private_settlement_bundle_v1(&endpoints, &final_manifest, &authorities, &deltas)
             .wrap_err("prepare votes")?;
-        client
-            .register_private_settlement_prepare_and_wait_v1(
-                &barrier,
-                max_carrier_bytes(),
-                TransactionWaitOptions {
-                    timeout: FINALITY_TIMEOUT,
-                    poll_interval: POLL_INTERVAL,
-                },
-            )
+        let request = client
+            .build_private_settlement_prepare_registration_request_v1(&barrier, max_carrier_bytes())
             .wrap_err("register prepare")?;
+        let hash = request.transaction.hash();
+        register_with_recheck(
+            || {
+                client.submit_private_settlement_bundle_v1(&request).wrap_err("register prepare")?;
+                client
+                    .wait_for_transaction_applied(
+                        hash,
+                        TransactionWaitOptions { timeout: FINALITY_TIMEOUT, poll_interval: POLL_INTERVAL },
+                    )
+                    .wrap_err("register prepare")?;
+                Ok(())
+            },
+            // One idempotent GET of the same tx on a fresh client (a new connection pool).
+            || {
+                let (fresh, _) = cfg.sponsor("bi")?;
+                Ok(matches!(fresh.client().get_transaction_status(hash)?, Some(TxConfirmationStatus::Applied)))
+            },
+        )?;
         Ok(barrier)
     })();
-    let abort = || abort_bundle(cfg, client, &final_manifest);
+    let abort = || -> Result<()> {
+        abort_bundle(cfg, client, &final_manifest)?;
+        aborted.set(true);
+        Ok(())
+    };
     let barrier = abort_on_error(prepared_phase, "prepare", abort)?;
     println!("prepare registered");
     // Past this point the pools are reserved too: any failure before a terminal receipt aborts the bundle.
@@ -515,8 +533,20 @@ fn receipt_error(kinds: &[&str], expired: bool) -> Result<()> {
 /// once, on a fresh connection, whether the registration transaction was applied anyway: then the bundle is
 /// prepared and the flow goes on. Otherwise the original error is returned and the caller aborts.
 fn register_with_recheck(register: impl FnOnce() -> Result<()>, applied: impl FnOnce() -> Result<bool>) -> Result<()> {
-    let _ = applied;
-    register()
+    match register() {
+        Ok(()) => Ok(()),
+        Err(error) => match applied() {
+            Ok(true) => {
+                eprintln!("prepare registration wait failed but the transaction is Applied, continuing: {error:#}");
+                Ok(())
+            }
+            Ok(false) => Err(error),
+            Err(check) => {
+                eprintln!("prepare re-check failed: {check:#}");
+                Err(error)
+            }
+        },
+    }
 }
 
 /// Runs `abort` when `result` failed, so a failed stage never leaves pool reservations held until expiry.
@@ -532,7 +562,7 @@ fn abort_on_error<T>(result: Result<T>, stage: &str, abort: impl FnOnce() -> Res
                 Err(abort) if abort.downcast_ref::<FinalizedSeen>().is_some() => {
                     eprintln!("the bundle had finalized, nothing to release: {abort:#}");
                 }
-                Err(abort) => eprintln!("abort failed (pools stay reserved until expiry): {abort:#}"),
+                Err(abort) => eprintln!("abort failed (pools stay reserved until the bundle expires; `abort-bundle <bundle_id printed above>` retries): {abort:#}"),
             }
         }
     }

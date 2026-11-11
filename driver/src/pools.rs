@@ -7,6 +7,7 @@
 //! origin commitments, finalized bundle ids); note openings and secrets stay in the key dir.
 
 use std::{
+    cell::Cell,
     io::Write,
     os::unix::fs::OpenOptionsExt,
     path::{Path, PathBuf},
@@ -405,8 +406,9 @@ fn run_bundle(cfg: &Config, legs: [LegSpec; 2], options: &Options, kind: &str) -
             pools.get_mut(asset).bundles.push(BundleRef { id: id.clone(), height: 0 });
         }
     })?;
-    let outcome = settle(cfg, &sponsor, manifest, &prepared, &governed, &committees, started, options);
-    let end = bundle_end(&outcome, false);
+    let aborted = Cell::new(false);
+    let outcome = settle(cfg, &sponsor, manifest, &prepared, &governed, &committees, started, options, &aborted);
+    let end = bundle_end(&outcome, aborted.get());
     PoolFile::update(&cfg.pools_file, |pools| record_end(pools, &id, &end))?;
     outcome?;
     println!("kind={kind}");
@@ -422,10 +424,12 @@ enum BundleEnd {
     Kept,
 }
 
-fn bundle_end(outcome: &Result<Option<(String, u64)>>, _aborted: bool) -> BundleEnd {
+/// `aborted`: a failed stage was aborted successfully, so the bundle moved nothing.
+fn bundle_end(outcome: &Result<Option<(String, u64)>>, aborted: bool) -> BundleEnd {
     match outcome {
         Ok(Some((_, height))) => BundleEnd::Finalized(*height),
         Ok(None) => BundleEnd::Dropped,
+        Err(_) if aborted => BundleEnd::Dropped,
         Err(_) => BundleEnd::Kept,
     }
 }
