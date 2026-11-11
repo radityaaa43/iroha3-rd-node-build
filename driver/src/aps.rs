@@ -487,6 +487,12 @@ pub(crate) fn abort_bundle(cfg: &Config, client: &iroha::client::Client, manifes
     Ok(())
 }
 
+/// Runs `abort` when `result` failed, so a failed stage never leaves pool reservations held until expiry.
+/// The stage's own error is returned; a failed abort is only reported.
+fn abort_on_error<T>(result: Result<T>, _stage: &str, _abort: impl FnOnce() -> Result<()>) -> Result<T> {
+    result
+}
+
 /// One machine-readable line for callers (Lensa): public identifiers only, no amounts or
 /// parties (those stay in the payers' wallets and in BI's audit store).
 fn print_result(manifest: &AtomicPrivateSettlementV1, governed: &[Governed], carrier_tx: &str, outcome: &str, height: u64) {
@@ -1385,5 +1391,45 @@ mod continuation_tests {
     fn continuation_leg_proves_and_verifies() {
         super::prove_continuation_selftest(Path::new(concat!(env!("CARGO_MANIFEST_DIR"), "/fixtures/peers.json")))
             .expect("gate G1a: a received note is spendable in the same pool");
+    }
+}
+
+#[cfg(test)]
+mod abort_tests {
+    use std::cell::Cell;
+
+    use super::*;
+
+    #[test]
+    fn a_failed_stage_aborts_once_and_keeps_its_error() {
+        let aborts = Cell::new(0);
+        let result: Result<()> = abort_on_error(Err(eyre!("commit votes")), "commit", || {
+            aborts.set(aborts.get() + 1);
+            Ok(())
+        });
+        assert_eq!(aborts.get(), 1);
+        assert_eq!(result.unwrap_err().to_string(), "commit votes");
+    }
+
+    #[test]
+    fn a_failed_abort_does_not_hide_the_stage_error() {
+        let aborts = Cell::new(0);
+        let result: Result<()> = abort_on_error(Err(eyre!("submit finalization")), "finalize", || {
+            aborts.set(aborts.get() + 1);
+            Err(eyre!("abort ended as finalized"))
+        });
+        assert_eq!(aborts.get(), 1);
+        assert_eq!(result.unwrap_err().to_string(), "submit finalization");
+    }
+
+    #[test]
+    fn a_good_stage_does_not_abort() {
+        let aborts = Cell::new(0);
+        let result = abort_on_error(Ok(7), "commit", || {
+            aborts.set(aborts.get() + 1);
+            Ok(())
+        });
+        assert_eq!(aborts.get(), 0);
+        assert_eq!(result.unwrap(), 7);
     }
 }
