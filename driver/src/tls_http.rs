@@ -171,7 +171,8 @@ mod tests {
     fn serve(dir: &Path) -> (Server, u16) {
         let port = TcpListener::bind("127.0.0.1:0").unwrap().local_addr().unwrap().port();
         let child = Command::new("openssl")
-            .args(["s_server", "-accept", &port.to_string(), "-cert", dir.join("server.crt").to_str().unwrap(), "-key", dir.join("server.key").to_str().unwrap(), "-CAfile", dir.join("client-ca.crt").to_str().unwrap(), "-Verify", "1", "-www", "-quiet"])
+            // s_server only LOGS verification errors by default: -verify_return_error makes a bad client cert abort the handshake
+            .args(["s_server", "-accept", &port.to_string(), "-cert", dir.join("server.crt").to_str().unwrap(), "-key", dir.join("server.key").to_str().unwrap(), "-CAfile", dir.join("client-ca.crt").to_str().unwrap(), "-Verify", "1", "-verify_return_error", "-www", "-quiet"])
             .stdout(Stdio::null())
             .stderr(Stdio::null())
             .spawn()
