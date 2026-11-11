@@ -1,0 +1,2 @@
+# tags that live workloads resolve BY TAG today (peers: sts spec, read 2026-11-12). No workflow may push exactly these.
+iroha3-rd-node:071e281e-stark

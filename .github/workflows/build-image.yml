@@ -1,9 +1,7 @@
 name: build-image
+# Manual only (ANALYST R15 / supply chain): an image is published when someone dispatches it, never as a side effect of a merge.
 on:
   workflow_dispatch:
-  push:
-    branches: [main]
-    paths: ['build/**', '.github/workflows/build-image.yml']
 permissions:
   contents: read
   packages: write
@@ -18,7 +16,9 @@ jobs:
     timeout-minutes: 345
     env:
       COMMIT: 071e281e778c5928cab4d6e007b7ddc9b050df27
-      IMAGE: ghcr.io/radityaaa43/iroha3-rd-node:071e281e-stark
+      # IMMUTABLE tag: <upstream commit8>-stark-<node-build git sha>. The plain 071e281e-stark is used BY TAG by the live peers and is never pushed again
+      # (ci/test-image-tags.sh). Pin by the digest recorded in the Digest step.
+      IMAGE: ghcr.io/radityaaa43/iroha3-rd-node:071e281e-stark-${{ github.sha }}
       # Run 39929648703 with 3 jobs filled 16 GB RAM + 6 GB swap while the
       # last heavy crates (iroha_core, iroha_torii, iroha) compiled and was
       # killed (exit 143). One job also caps rustc's LLVM codegen threads.
@@ -68,3 +68,12 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: ci/check-package-visibility.sh iroha3-rd-node
+      - name: Digest (pin by digest, never by tag)
+        run: |
+          d=$(docker inspect --format '{{index .RepoDigests 0}}' "$IMAGE")
+          {
+            echo "pushed ${IMAGE}"
+            echo ""
+            echo "pull by digest: \`${d}\`"
+          } >> "$GITHUB_STEP_SUMMARY"
+          echo "digest=${d}"
