@@ -558,7 +558,7 @@ fn abort_on_error<T>(result: Result<T>, stage: &str, abort: impl FnOnce() -> Res
         } else {
             eprintln!("{stage} failed, aborting the bundle to release pool reservations: {error:#}");
             match abort() {
-                Ok(()) => println!("bundle aborted"),
+                Ok(()) => eprintln!("bundle aborted"), // stderr: Lensa logs only stderr, stdout is parsed
                 Err(abort) if abort.downcast_ref::<FinalizedSeen>().is_some() => {
                     eprintln!("the bundle had finalized, nothing to release: {abort:#}");
                 }
