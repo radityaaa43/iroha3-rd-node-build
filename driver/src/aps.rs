@@ -431,30 +431,26 @@ pub(crate) fn settle(
             .wrap_err("register prepare")?;
         Ok(barrier)
     })();
-    let barrier = match prepared_phase {
-        Ok(barrier) => barrier,
-        Err(error) => {
-            eprintln!("prepare failed, aborting the bundle to release pool reservations: {error:#}");
-            match abort_bundle(cfg, client, &final_manifest) {
-                Ok(()) => println!("bundle aborted"),
-                Err(abort) => eprintln!("abort failed (pools stay reserved until expiry): {abort:#}"),
-            }
-            return Err(error);
-        }
-    };
+    let abort = || abort_bundle(cfg, client, &final_manifest);
+    let barrier = abort_on_error(prepared_phase, "prepare", abort)?;
     println!("prepare registered");
-    let commits = client
-        .recover_or_commit_private_settlement_bundle_v1(&endpoints, &barrier)
-        .wrap_err("commit votes")?;
-    let request = client.build_private_settlement_finalization_request_v1(
-        &barrier,
-        &commits,
-        max_carrier_bytes(),
-    )?;
-    client
-        .submit_private_settlement_bundle_v1(&request)
-        .wrap_err("submit finalization")?;
-    let (outcome, height) = wait_receipt(cfg, final_manifest.bundle_id)?;
+    // Past this point the pools are reserved too: any failure before a terminal receipt aborts the bundle.
+    let finalization = (|| -> Result<_> {
+        let commits = client
+            .recover_or_commit_private_settlement_bundle_v1(&endpoints, &barrier)
+            .wrap_err("commit votes")?;
+        let request = client.build_private_settlement_finalization_request_v1(
+            &barrier,
+            &commits,
+            max_carrier_bytes(),
+        )?;
+        client
+            .submit_private_settlement_bundle_v1(&request)
+            .wrap_err("submit finalization")?;
+        let (outcome, height) = wait_receipt(cfg, final_manifest.bundle_id)?;
+        Ok((request, outcome, height))
+    })();
+    let (request, outcome, height) = abort_on_error(finalization, "finalization", abort)?;
     println!("settled after {:?}", started.elapsed());
     print_result(&final_manifest, governed, &request.transaction.hash().to_string(), outcome, height);
     check_outcome(outcome, options.expect)?;
@@ -485,6 +481,19 @@ pub(crate) fn abort_bundle(cfg: &Config, client: &iroha::client::Client, manifes
     let (outcome, _) = wait_receipt(cfg, manifest.bundle_id)?;
     ensure!(outcome == "aborted", "abort ended as {outcome}");
     Ok(())
+}
+
+/// Runs `abort` when `result` failed, so a failed stage never leaves pool reservations held until expiry.
+/// The stage's own error is returned; a failed abort is only reported.
+fn abort_on_error<T>(result: Result<T>, stage: &str, abort: impl FnOnce() -> Result<()>) -> Result<T> {
+    if let Err(error) = &result {
+        eprintln!("{stage} failed, aborting the bundle to release pool reservations: {error:#}");
+        match abort() {
+            Ok(()) => println!("bundle aborted"),
+            Err(abort) => eprintln!("abort failed (pools stay reserved until expiry): {abort:#}"),
+        }
+    }
+    result
 }
 
 /// One machine-readable line for callers (Lensa): public identifiers only, no amounts or
@@ -1385,5 +1394,45 @@ mod continuation_tests {
     fn continuation_leg_proves_and_verifies() {
         super::prove_continuation_selftest(Path::new(concat!(env!("CARGO_MANIFEST_DIR"), "/fixtures/peers.json")))
             .expect("gate G1a: a received note is spendable in the same pool");
+    }
+}
+
+#[cfg(test)]
+mod abort_tests {
+    use std::cell::Cell;
+
+    use super::*;
+
+    #[test]
+    fn a_failed_stage_aborts_once_and_keeps_its_error() {
+        let aborts = Cell::new(0);
+        let result: Result<()> = abort_on_error(Err(eyre!("commit votes")), "commit", || {
+            aborts.set(aborts.get() + 1);
+            Ok(())
+        });
+        assert_eq!(aborts.get(), 1);
+        assert_eq!(result.unwrap_err().to_string(), "commit votes");
+    }
+
+    #[test]
+    fn a_failed_abort_does_not_hide_the_stage_error() {
+        let aborts = Cell::new(0);
+        let result: Result<()> = abort_on_error(Err(eyre!("submit finalization")), "finalize", || {
+            aborts.set(aborts.get() + 1);
+            Err(eyre!("abort ended as finalized"))
+        });
+        assert_eq!(aborts.get(), 1);
+        assert_eq!(result.unwrap_err().to_string(), "submit finalization");
+    }
+
+    #[test]
+    fn a_good_stage_does_not_abort() {
+        let aborts = Cell::new(0);
+        let result = abort_on_error(Ok(7), "commit", || {
+            aborts.set(aborts.get() + 1);
+            Ok(())
+        });
+        assert_eq!(aborts.get(), 0);
+        assert_eq!(result.unwrap(), 7);
     }
 }
