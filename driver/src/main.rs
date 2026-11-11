@@ -23,6 +23,7 @@ mod aps;
 mod auditor;
 mod config;
 mod history;
+mod mint_finality;
 mod http;
 mod pools;
 mod tree;
@@ -70,6 +71,18 @@ fn main() -> Result<()> {
                 .write_all(format!("{}{}", hex::encode(keys.spend), hex::encode(keys.view)).as_bytes())?;
             println!("{name} note keys written to {}", path.display());
             Ok(())
+        }
+        ["keys", "mint-finality", dir, name, peer] => {
+            println!("{}", mint_finality::mint_finality(Path::new(dir), name, peer, 0)?);
+            Ok(())
+        }
+        ["keys", "mint-finality", dir, name, peer, epoch] => {
+            println!("{}", mint_finality::mint_finality(Path::new(dir), name, peer, epoch.parse()?)?);
+            Ok(())
+        }
+        ["keys", "mint-finality-roster", out, triples @ ..] => {
+            let triples = triples.iter().map(Path::new).collect::<Vec<_>>();
+            mint_finality::roster(Path::new(out), &triples)
         }
         ["keys", "show", dir, name] => {
             let seed = read_seed(&Path::new(dir).join(format!("{name}.seed")))?;
