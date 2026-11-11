@@ -115,6 +115,13 @@ impl PoolFile {
         Ok(())
     }
 
+    /// Read-modify-write for a run that held its copy for minutes: another run may have added a bundle meanwhile.
+    pub fn update(path: &Path, change: impl FnOnce(&mut Self)) -> Result<()> {
+        let mut pools = Self::load(path)?;
+        change(&mut pools);
+        pools.save(path)
+    }
+
     pub fn get(&self, asset: Asset) -> &PoolRecord {
         match asset {
             Asset::Rd => &self.rd,
@@ -521,5 +528,33 @@ mod tests {
         std::fs::write(&file, "not a receipt").unwrap();
         assert!(read_cached(&file).unwrap().is_none());
         std::fs::remove_dir_all(cache).unwrap();
+    }
+
+    fn record() -> PoolRecord {
+        PoolRecord { pool_id: String::new(), route: String::new(), policy: String::new(), governance: String::new(), origin: vec![], bundles: vec![] }
+    }
+
+    /// Lensa runs several driver containers on one pools.json; each finishing bundle must keep the others' entries.
+    #[test]
+    fn concurrent_updates_keep_every_bundle() {
+        let dir = temp_dir();
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("pools.json");
+        PoolFile { rd: record(), dfabi: record() }.save(&path).unwrap();
+        let writers: Vec<_> = (0..4)
+            .map(|t| {
+                let path = path.clone();
+                std::thread::spawn(move || {
+                    for i in 0..50 {
+                        PoolFile::update(&path, |p| p.rd.bundles.push(BundleRef { id: format!("{t}-{i}"), height: 0 })).unwrap();
+                    }
+                })
+            })
+            .collect();
+        for writer in writers {
+            writer.join().unwrap();
+        }
+        assert_eq!(PoolFile::load(&path).unwrap().rd.bundles.len(), 200);
+        std::fs::remove_dir_all(dir).unwrap();
     }
 }
