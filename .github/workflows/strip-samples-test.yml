@@ -1,0 +1,16 @@
+name: strip-samples-test
+# Fixture test of build/strip-samples.sh (ANALYST R15 end step). Docker on the hosted runner; no registry login, no push, read-only token.
+on:
+  pull_request:
+    paths: ['build/**', '.github/workflows/strip-samples-test.yml']
+permissions:
+  contents: read
+jobs:
+  fixture:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          persist-credentials: false
+      - run: build/test-strip-samples.sh

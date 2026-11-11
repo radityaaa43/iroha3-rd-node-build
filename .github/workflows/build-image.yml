@@ -57,6 +57,11 @@ jobs:
           # Resource trace every 2 minutes, so a starved runner leaves evidence.
           ( while sleep 120; do echo "::group::resources $(date -u +%H:%M)"; free -m | sed -n 2,3p; df -h / | tail -1; echo "::endgroup::"; done ) &
           build/build-image.sh "$RUNNER_TEMP/iroha" "$IMAGE"
+      - name: Strip upstream sample files (ANALYST R15, flatten to one layer)
+        run: |
+          build/test-strip-samples.sh
+          build/strip-samples.sh "$IMAGE" "$IMAGE"
+          docker run --rm --entrypoint sh "$IMAGE" -c '! test -e /config/client.toml && ! test -e /opt/iroha/configs/soranexus/taira'
       - name: Smoke
         run: |
           docker run --rm --entrypoint iroha3d "$IMAGE" --version
