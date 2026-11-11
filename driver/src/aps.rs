@@ -1119,8 +1119,22 @@ fn note_opening(active: bool, value: u128) -> PrivateSettlementAuditNoteOpeningV
 }
 
 #[allow(clippy::too_many_arguments)]
-/// `prepare_leg` with the recipient's output given as public values only: (spending authority, x25519 view
-/// public key). The payer then needs none of the recipient's secrets (`notes.recipient` is ignored).
+pub(crate) fn prepare_leg(
+    ordinal: usize,
+    leg: &Leg,
+    governed: &Governed,
+    spend: Spend,
+    notes: &LegNotes,
+    manifest: &AtomicPrivateSettlementV1,
+    authority_digest: Hash,
+    sponsor_key: &KeyPair,
+    reimbursement_salt: [u8; 32],
+) -> Result<AtomicPrivateSettlementPreparedLegV1> {
+    prepare_leg_to(ordinal, leg, governed, spend, notes, None, manifest, authority_digest, sponsor_key, reimbursement_salt)
+}
+
+/// `prepare_leg` with the recipient's output optionally given as public values only: (spending authority,
+/// x25519 view public key). The payer then needs none of the recipient's secrets (`notes.recipient` is ignored).
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn prepare_leg_to(
     ordinal: usize,
@@ -1129,21 +1143,6 @@ pub(crate) fn prepare_leg_to(
     spend: Spend,
     notes: &LegNotes,
     recipient_public: Option<([u8; 32], [u8; 32])>,
-    manifest: &AtomicPrivateSettlementV1,
-    authority_digest: Hash,
-    sponsor_key: &KeyPair,
-    reimbursement_salt: [u8; 32],
-) -> Result<AtomicPrivateSettlementPreparedLegV1> {
-    let _ = recipient_public;
-    prepare_leg(ordinal, leg, governed, spend, notes, manifest, authority_digest, sponsor_key, reimbursement_salt)
-}
-
-pub(crate) fn prepare_leg(
-    ordinal: usize,
-    leg: &Leg,
-    governed: &Governed,
-    spend: Spend,
-    notes: &LegNotes,
     manifest: &AtomicPrivateSettlementV1,
     authority_digest: Hash,
     sponsor_key: &KeyPair,
@@ -1276,8 +1275,14 @@ pub(crate) fn prepare_leg(
     for (opening, secret) in plaintext.inputs.iter_mut().zip(input_secrets) {
         opening.spending_authority = derive_note_authority_v1(&secret)?;
     }
-    for (output, secret) in plaintext.outputs.iter_mut().zip(output_secrets) {
-        output.note.spending_authority = derive_note_authority_v1(&secret)?;
+    for (index, (output, secret)) in plaintext.outputs.iter_mut().zip(output_secrets).enumerate() {
+        output.note.spending_authority = match recipient_public {
+            Some((authority, _)) if index == 0 => authority,
+            _ => derive_note_authority_v1(&secret)?,
+        };
+    }
+    if let Some((_, view_key)) = recipient_public {
+        plaintext.outputs[0].recipient_view_key = view_key;
     }
     prepare_atomic_private_settlement_input_openings_v1(manifest, &statement, &mut plaintext.inputs)?;
     ensure!(
