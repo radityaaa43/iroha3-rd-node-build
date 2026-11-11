@@ -1,3 +1,70 @@
+//! Mutual-TLS HTTP client for the driver's calls to ANOTHER party's gateway (iroha3 PLAN S13 transport A; ANALYST Q4(c): no plain
+//! HTTP across namespaces or clusters, principle 6: a party reaches another party only through its gateway).
+//!
+//! The driver presents its own client certificate (`iroha3-client-cert`, signed by the org's role CA) and trusts ONLY the target
+//! party's own server root (`<server_ca_dir>/<party>-server-ca.pem`, party taken from the gateway host
+//! `gateway.rd-iroha3-<party>.svc[.cluster.local]`): the system roots are switched off, so there is no fallback and a gateway
+//! signed by any other root is refused. A URL whose host is not a gateway host is refused, so a CA file name cannot be forged.
+
+use std::{net::SocketAddr, path::PathBuf, time::Duration};
+
+use eyre::{Result, WrapErr, ensure, eyre};
+
+use crate::config::TlsConfig;
+
+/// `https://gateway.rd-iroha3-<party>.svc[.cluster.local][:port][/path]` -> `<party>`.
+pub fn party_of_url(url: &str) -> Result<String> {
+    let rest = url.strip_prefix("https://").ok_or_else(|| eyre!("not an https URL: {url:?}"))?;
+    let host = rest.split(['/', ':']).next().unwrap_or("");
+    let inner = host.strip_prefix("gateway.rd-iroha3-").ok_or_else(|| eyre!("{url:?} is not a gateway host (gateway.rd-iroha3-<party>.svc)"))?;
+    let party = inner
+        .strip_suffix(".svc.cluster.local")
+        .or_else(|| inner.strip_suffix(".svc"))
+        .ok_or_else(|| eyre!("{url:?} is not a gateway host (gateway.rd-iroha3-<party>.svc)"))?;
+    ensure!(
+        !party.is_empty() && !party.starts_with('-') && party.bytes().all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-'),
+        "{url:?}: bad party name {party:?}"
+    );
+    Ok(party.to_owned())
+}
+
+/// The pinned server root of `party`.
+pub fn ca_path(tls: &TlsConfig, party: &str) -> PathBuf {
+    tls.server_ca_dir.join(format!("{party}-server-ca.pem"))
+}
+
+/// One request over mutual TLS; `url` is the full https URL. Returns (status, body).
+pub fn request(tls: &TlsConfig, url: &str, method: &str, body: &str, connect: Duration, read: Duration) -> Result<(u16, String)> {
+    let party = party_of_url(url)?;
+    let ca_file = ca_path(tls, &party);
+    let ca = reqwest::Certificate::from_pem(&std::fs::read(&ca_file).wrap_err_with(|| format!("read pinned server CA {}", ca_file.display()))?)
+        .wrap_err("pinned server CA")?;
+    let mut pem = std::fs::read(&tls.client_cert).wrap_err_with(|| format!("read client cert {}", tls.client_cert.display()))?;
+    pem.push(b'\n');
+    pem.extend(std::fs::read(&tls.client_key).wrap_err_with(|| format!("read client key {}", tls.client_key.display()))?);
+    let identity = reqwest::Identity::from_pem(&pem).wrap_err("client identity (cert + key)")?;
+    let mut builder = reqwest::blocking::Client::builder()
+        .use_rustls_tls()
+        .tls_built_in_root_certs(false)
+        .add_root_certificate(ca)
+        .identity(identity)
+        .connect_timeout(connect)
+        .timeout(read);
+    for (host, address) in &tls.resolve {
+        let address: SocketAddr = address.parse().wrap_err_with(|| format!("[tls.resolve] {host} = {address:?} is not ip:port"))?;
+        builder = builder.resolve(host, address);
+    }
+    let client = builder.build().wrap_err("build TLS client")?;
+    let method = reqwest::Method::from_bytes(method.as_bytes()).wrap_err("HTTP method")?;
+    let mut request = client.request(method, url).header("Content-Type", "application/json");
+    if !body.is_empty() {
+        request = request.body(body.to_owned());
+    }
+    let response = request.send().wrap_err_with(|| format!("TLS request to {url}"))?;
+    let status = response.status().as_u16();
+    Ok((status, response.text().wrap_err("read response body")?))
+}
+
 #[cfg(test)]
 mod tests {
     use std::{

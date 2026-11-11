@@ -17,6 +17,17 @@ pub fn request(addr: &str, method: &str, path: &str, body: &str) -> Result<(u16,
     request_with(addr, method, path, body, None, Duration::from_secs(600))
 }
 
+/// One request to an auditor/gateway target: `https://gateway...` goes over mutual TLS (needs `[tls]`), a plain `host:port` over
+/// the in-namespace HTTP/1.0 path (iroha3 S13: plain HTTP stays inside ONE namespace).
+pub fn send(tls: Option<&crate::config::TlsConfig>, target: &str, method: &str, path: &str, body: &str, connect: Option<Duration>, read: Duration) -> Result<(u16, String)> {
+    if target.starts_with("https://") {
+        let tls = tls.ok_or_else(|| eyre!("{target} needs a [tls] section in the config (client cert, key, server CA dir)"))?;
+        let url = format!("{}{}", target.trim_end_matches('/'), path);
+        return crate::tls_http::request(tls, &url, method, body, connect.unwrap_or(Duration::from_secs(10)), read);
+    }
+    request_with(target, method, path, body, connect, read)
+}
+
 /// `request` with an optional connect timeout and an explicit read (response) timeout.
 pub fn request_with(addr: &str, method: &str, path: &str, body: &str, connect: Option<Duration>, read: Duration) -> Result<(u16, String)> {
     let mut stream = match connect {

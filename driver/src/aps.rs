@@ -657,11 +657,11 @@ pub(crate) fn wait_receipt(cfg: &Config, bundle_id: Hash) -> Result<(&'static st
 }
 
 pub(crate) fn auditor_call<T: for<'de> Deserialize<'de>>(cfg: &Config, method: &str, path: &str, body: &str) -> Result<T> {
-    auditor_call_at(&cfg.auditor_url, method, path, body)
+    auditor_call_at(cfg.tls.as_ref(), &cfg.auditor_url, method, path, body)
 }
 
-pub(crate) fn auditor_call_at<T: for<'de> Deserialize<'de>>(url: &str, method: &str, path: &str, body: &str) -> Result<T> {
-    let (status, response) = crate::http::request(url, method, path, body).wrap_err_with(|| format!("call auditor {url}"))?;
+pub(crate) fn auditor_call_at<T: for<'de> Deserialize<'de>>(tls: Option<&crate::config::TlsConfig>, url: &str, method: &str, path: &str, body: &str) -> Result<T> {
+    let (status, response) = crate::http::send(tls, url, method, path, body, None, Duration::from_secs(600)).wrap_err_with(|| format!("call auditor {url}"))?;
     ensure!(status == 200, "auditor {url} {path} returned {status}: {response}");
     Ok(serde_json::from_str(&response)?)
 }
@@ -674,7 +674,7 @@ pub(crate) fn auditors_from_config(cfg: &Config) -> Result<(Vec<(PublicKey, Priv
         .auditor_urls
         .iter()
         .map(|url| {
-            let keys: Keys = auditor_call_at(url, "GET", "/keys", "")?;
+            let keys: Keys = auditor_call_at(cfg.tls.as_ref(), url, "GET", "/keys", "")?;
             Ok((keys.signing.parse::<PublicKey>()?, dec::<PrivateSettlementHybridPublicKeyV1>(&keys.encryption)?))
         })
         .collect::<Result<Vec<_>>>()?;
@@ -693,11 +693,12 @@ fn approve_k_of_n(cfg: &Config, request: &str) -> Result<ApproveResponse> {
     let policy = cfg.audit_policy()?;
     let urls = Arc::new(policy.auditor_urls.clone());
     let body = Arc::new(request.to_owned());
+    let tls = Arc::new(cfg.tls.clone());
     let ask: Arc<dyn Fn(usize) -> Answer + Send + Sync> = {
         let urls = urls.clone();
         Arc::new(move |index| {
             let url = &urls[index];
-            let result = crate::http::request_with(url, "POST", "/approve", &body, Some(AUDITOR_CONNECT), AUDITOR_RESPONSE).and_then(|(status, response)| {
+            let result = crate::http::send(tls.as_ref().as_ref(), url, "POST", "/approve", &body, Some(AUDITOR_CONNECT), AUDITOR_RESPONSE).and_then(|(status, response)| {
                 ensure!(status == 200, "auditor {url} /approve returned {status}: {response}");
                 Ok(serde_json::from_str::<ApproveResponse>(&response)?)
             });
