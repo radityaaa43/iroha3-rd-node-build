@@ -479,6 +479,9 @@ pub(crate) fn abort_bundle(cfg: &Config, client: &iroha::client::Client, manifes
     )?;
     client.submit_private_settlement_bundle_v1(&request).wrap_err("submit abort")?;
     let (outcome, _) = wait_receipt(cfg, manifest.bundle_id)?;
+    if outcome == "finalized" {
+        return Err(eyre::Report::new(FinalizedSeen("abort ended as finalized".into())));
+    }
     ensure!(outcome == "aborted", "abort ended as {outcome}");
     Ok(())
 }
@@ -497,8 +500,14 @@ impl std::error::Error for FinalizedSeen {}
 
 /// Why a receipt poll has no single terminal answer (yet), or Ok while it should keep polling.
 fn receipt_error(kinds: &[&str], expired: bool) -> Result<()> {
-    ensure!(!kinds.contains(&"finalized") || !kinds.contains(&"aborted"), "nodes disagree: {kinds:?}");
-    ensure!(!expired, "no terminal receipt on all nodes: {kinds:?}");
+    let finalized = kinds.contains(&"finalized");
+    if finalized && kinds.contains(&"aborted") {
+        return Err(eyre::Report::new(FinalizedSeen(format!("nodes disagree: {kinds:?}"))));
+    }
+    if expired {
+        let message = format!("no terminal receipt on all nodes: {kinds:?}");
+        return Err(if finalized { eyre::Report::new(FinalizedSeen(message)) } else { eyre!(message) });
+    }
     Ok(())
 }
 
@@ -506,10 +515,17 @@ fn receipt_error(kinds: &[&str], expired: bool) -> Result<()> {
 /// The stage's own error is returned; a failed abort is only reported.
 fn abort_on_error<T>(result: Result<T>, stage: &str, abort: impl FnOnce() -> Result<()>) -> Result<T> {
     if let Err(error) = &result {
-        eprintln!("{stage} failed, aborting the bundle to release pool reservations: {error:#}");
-        match abort() {
-            Ok(()) => println!("bundle aborted"),
-            Err(abort) => eprintln!("abort failed (pools stay reserved until expiry): {abort:#}"),
+        if error.downcast_ref::<FinalizedSeen>().is_some() {
+            eprintln!("{stage} failed after a node finalized the bundle, not aborting: {error:#}");
+        } else {
+            eprintln!("{stage} failed, aborting the bundle to release pool reservations: {error:#}");
+            match abort() {
+                Ok(()) => println!("bundle aborted"),
+                Err(abort) if abort.downcast_ref::<FinalizedSeen>().is_some() => {
+                    eprintln!("the bundle had finalized, nothing to release: {abort:#}");
+                }
+                Err(abort) => eprintln!("abort failed (pools stay reserved until expiry): {abort:#}"),
+            }
         }
     }
     result
@@ -583,7 +599,9 @@ pub(crate) fn wait_receipt(cfg: &Config, bundle_id: Hash) -> Result<(&'static st
             let kind = match client.client().private_settlement_bundle_receipt_v1(bundle_id) {
                 Ok(PrivateSettlementBundleReceiptResponseV1::Pending { .. }) => "pending",
                 Ok(PrivateSettlementBundleReceiptResponseV1::Finalized(receipt)) => {
-                    ensure!(!receipt.legs.is_empty(), "{party}: empty finalized receipt");
+                    if receipt.legs.is_empty() {
+                        return Err(eyre::Report::new(FinalizedSeen(format!("{party}: empty finalized receipt"))));
+                    }
                     height = receipt.finalized_height;
                     "finalized"
                 }
