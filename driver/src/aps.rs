@@ -14,6 +14,7 @@
 use std::{
     cell::Cell,
     path::Path,
+    sync::Arc,
     thread,
     time::{Duration, Instant},
 };
@@ -680,32 +681,45 @@ pub(crate) fn auditors_from_config(cfg: &Config) -> Result<(Vec<(PublicKey, Priv
     Ok((auditors, policy.min_approvals))
 }
 
-/// Ask the auditors to approve one leg until the policy's `min_approvals` are in (approved) or can no longer be reached
-/// (rejected). An unreachable auditor counts as no approval, so BI offline does not stop a 2-of-3 policy.
+/// Product timeouts of the audit decision (ANALYST Q-D): connect 3 s and response 60 s per auditor, 90 s overall.
+const AUDITOR_CONNECT: Duration = Duration::from_secs(3);
+const AUDITOR_RESPONSE: Duration = Duration::from_secs(60);
+const AUDIT_DECISION: Duration = Duration::from_secs(90);
+
+/// Ask ALL auditors in parallel to approve one leg, then decide (b2, client policy): any explicit Reject aborts, else k
+/// approvals proceed, else abort "insufficient approvals". An unreachable or slow auditor is no approval and never blocks.
 fn approve_k_of_n(cfg: &Config, request: &str) -> Result<ApproveResponse> {
-    use crate::approval::{Answer, Verdict, decide};
+    use crate::approval::{Answer, Verdict, gather, reason};
     let policy = cfg.audit_policy()?;
-    let mut answers = vec![Answer::Pending; policy.auditor_urls.len()];
-    let mut reasons = Vec::new();
-    for (index, url) in policy.auditor_urls.iter().enumerate() {
-        match auditor_call_at::<ApproveResponse>(url, "POST", "/approve", request) {
-            Ok(response) if response.approved => answers[index] = Answer::Approved,
-            Ok(response) => {
-                answers[index] = Answer::Rejected;
-                reasons.push(format!("{url}: {}", response.reason));
+    let urls = Arc::new(policy.auditor_urls.clone());
+    let body = Arc::new(request.to_owned());
+    let ask: Arc<dyn Fn(usize) -> Answer + Send + Sync> = {
+        let urls = urls.clone();
+        Arc::new(move |index| {
+            let url = &urls[index];
+            let result = crate::http::request_with(url, "POST", "/approve", &body, Some(AUDITOR_CONNECT), AUDITOR_RESPONSE).and_then(|(status, response)| {
+                ensure!(status == 200, "auditor {url} /approve returned {status}: {response}");
+                Ok(serde_json::from_str::<ApproveResponse>(&response)?)
+            });
+            match result {
+                Ok(response) if response.approved => Answer::Approved,
+                Ok(response) => {
+                    eprintln!("auditor {url} REJECTED: {}", response.reason);
+                    Answer::Rejected
+                }
+                Err(error) => {
+                    eprintln!("auditor {url} unavailable: {error:#}");
+                    Answer::Unavailable
+                }
             }
-            Err(error) => {
-                answers[index] = Answer::Unavailable;
-                reasons.push(format!("{url}: {error:#}"));
-            }
-        }
-        match decide(policy.min_approvals, &answers) {
-            Verdict::Approved => return Ok(ApproveResponse { approved: true, reason: String::new() }),
-            Verdict::Rejected => return Ok(ApproveResponse { approved: false, reason: reasons.join("; ") }),
-            Verdict::Wait => {}
-        }
-    }
-    Ok(ApproveResponse { approved: false, reason: format!("approvals incomplete: {}", reasons.join("; ")) })
+        })
+    };
+    let (verdict, answers) = gather(policy.min_approvals, urls.len(), AUDIT_DECISION, ask);
+    eprintln!("audit decision {verdict:?} (k = {}): {} = {answers:?}", policy.min_approvals, urls.join(","));
+    Ok(match verdict {
+        Verdict::Approved => ApproveResponse { approved: true, reason: String::new() },
+        other => ApproveResponse { approved: false, reason: reason(other).to_owned() },
+    })
 }
 
 /// Committee for a route: all four validators sorted by PeerId, with their Torii URLs in

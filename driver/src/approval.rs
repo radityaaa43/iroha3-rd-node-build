@@ -1,8 +1,17 @@
-//! k-of-n decision over the auditors' answers (iroha3 PLAN S11/S12, ANALYST: 2-of-3 with BI and orgs A and B).
+//! k-of-n decision over the auditors' answers (iroha3 PLAN S11/S12; ANALYST Q-D = (b2), client policy, DELTA 10a).
 //!
-//! The driver asks each auditor to `/approve` a leg. The chain accepts the leg once the policy's `min_approvals` approvals are
-//! in, so the driver stops asking as soon as that is certain either way: k approvals = go; fewer than k can still come = abort.
-//! An auditor that is offline, or rejects, simply does not count as an approval.
+//! (b2) is client policy; the chain rule is k-of-n approvals (iroha@071e281e private_settlement.rs:3958): the chain commits a leg
+//! once `min_approvals` approvals are in and knows nothing about rejects. The driver therefore asks ALL auditors in PARALLEL and
+//! decides only after every answer is in or the deadline passed: any explicit Reject aborts (BI's included, never outvoted); else
+//! k approvals proceed; an auditor that is offline or too slow counts as no approval and never blocks (R2), so BI offline with A
+//! and B approving proceeds. A colluding pair of transacting auditors can override; detected by the reconcile control (condition 2).
+//! Late answers are logged, not counted.
+
+use std::{
+    sync::{Arc, mpsc},
+    thread,
+    time::{Duration, Instant},
+};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Answer {
@@ -14,24 +23,76 @@ pub enum Answer {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Verdict {
+    /// k approvals, nothing rejected, nothing pending.
     Approved,
+    /// At least one auditor rejected explicitly.
     Rejected,
+    /// No Reject, but fewer than k approvals can be reached.
+    Insufficient,
+    /// Not decidable yet: an answer is still pending.
     Wait,
 }
 
 pub fn decide(k: usize, answers: &[Answer]) -> Verdict {
     if k == 0 {
+        return Verdict::Insufficient;
+    }
+    if answers.contains(&Answer::Rejected) {
         return Verdict::Rejected;
     }
     let approved = answers.iter().filter(|a| **a == Answer::Approved).count();
     let pending = answers.iter().filter(|a| **a == Answer::Pending).count();
-    if approved >= k {
-        Verdict::Approved
-    } else if approved + pending < k {
-        Verdict::Rejected
-    } else {
+    if approved + pending < k {
+        Verdict::Insufficient
+    } else if pending > 0 {
         Verdict::Wait
+    } else {
+        Verdict::Approved
     }
+}
+
+/// The abort reason the driver reports.
+pub fn reason(verdict: Verdict) -> &'static str {
+    match verdict {
+        Verdict::Rejected => "rejected",
+        Verdict::Insufficient => "insufficient approvals",
+        Verdict::Approved | Verdict::Wait => "",
+    }
+}
+
+/// Ask `n` auditors in parallel (`ask(i)` blocks for auditor `i`) and decide. Returns as soon as the verdict is certain (a
+/// Reject, or k unreachable) or all answered; at `deadline` every unanswered auditor counts as Unavailable. Late answers are
+/// logged by their thread and ignored.
+pub fn gather(k: usize, n: usize, deadline: Duration, ask: Arc<dyn Fn(usize) -> Answer + Send + Sync>) -> (Verdict, Vec<Answer>) {
+    let (tx, rx) = mpsc::channel();
+    for i in 0..n {
+        let (tx, ask) = (tx.clone(), ask.clone());
+        thread::spawn(move || {
+            let answer = ask(i);
+            if tx.send((i, answer)).is_err() {
+                eprintln!("auditor {i} answered {answer:?} after the decision: ignored");
+            }
+        });
+    }
+    drop(tx);
+    let mut answers = vec![Answer::Pending; n];
+    let end = Instant::now() + deadline;
+    loop {
+        let verdict = decide(k, &answers);
+        if verdict != Verdict::Wait {
+            return (verdict, answers);
+        }
+        match rx.recv_timeout(end.saturating_duration_since(Instant::now())) {
+            Ok((i, answer)) => answers[i] = answer,
+            Err(_) => break,
+        }
+    }
+    for answer in &mut answers {
+        if *answer == Answer::Pending {
+            *answer = Answer::Unavailable;
+        }
+    }
+    (decide(k, &answers), answers)
 }
 
 #[cfg(test)]
