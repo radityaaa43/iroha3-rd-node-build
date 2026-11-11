@@ -326,9 +326,34 @@ impl Auditor {
     }
 }
 
+/// What GET /records returns: the fields Lensa's adapter reads (iroha3-aps.ts AuditRecord). The stored
+/// record also holds the memo and the full plaintext; those stay on disk.
+#[derive(Serialize)]
+struct RecordView<'a> {
+    bundle_id: &'a str,
+    leg: u8,
+    verdict: &'a str,
+    payer: &'a str,
+    recipient: &'a str,
+    asset: &'a str,
+    amount: &'a str,
+}
+
 /// Body of both GET /records routes.
 fn records_json(records: &[Record]) -> Result<String> {
-    Ok(serde_json::to_string(records)?)
+    let views = records
+        .iter()
+        .map(|r| RecordView {
+            bundle_id: &r.bundle_id,
+            leg: r.leg,
+            verdict: &r.verdict,
+            payer: &r.payer,
+            recipient: &r.recipient,
+            asset: &r.asset,
+            amount: &r.amount,
+        })
+        .collect::<Vec<_>>();
+    Ok(serde_json::to_string(&views)?)
 }
 
 /// Every leg this auditor decided (BI's history across all bundles), by bundle then leg.
