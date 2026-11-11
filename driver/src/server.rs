@@ -1,7 +1,7 @@
 //! Per-bank driver server mode (iroha3 PLAN S17, ARCHITECTURE-iroha3 row 10a, docs/server-mode.md).
 //!
 //! A thin HTTP wrapper over the two D-native commands of `dvp_native.rs`, running in ONE bank's namespace with that bank's own
-//! client.toml (own key, own Torii). It exposes exactly: `GET /healthz`, `POST /settle-grant`, `POST /dvp-native`, and `POST /mint` (403 unless the config sets `mint_enabled`: BI only). Request bodies
+//! client.toml (own key, own Torii). It exposes exactly: `GET /healthz`, `POST /settle-grant`, `POST /dvp-native`, `POST /mint` (403 unless the config sets `mint_enabled`: BI only) and `GET /tx/{hash}` (a signed query with the own key). Request bodies
 //! carry public terms only; nothing secret is read from a request, written to a response or logged.
 
 use std::sync::Mutex;
@@ -13,6 +13,7 @@ use crate::{
     config::Config,
     dvp_native, http,
     mint::{self, MintPolicy, MintTerms},
+    tx_detail,
 };
 
 /// Public terms of one D-native DvP, in the calling bank's own give/take view (see `dvp_native.rs`).
@@ -34,6 +35,8 @@ pub trait Submitter {
     /// `Some` only on the BI driver (config `mint_enabled`); `None` = every `/mint` is refused with 403.
     fn mint_policy(&self) -> Result<Option<MintPolicy>>;
     fn mint(&self, terms: &MintTerms) -> Result<String>;
+    /// Signed transaction-details query with the own key (`tx_detail::fetch`); `hash` is already validated.
+    fn tx(&self, hash: &str) -> Result<String>;
 }
 
 /// Answer one request: `(HTTP status, JSON body)`. Pure apart from the injected submitter.
@@ -76,6 +79,14 @@ pub fn route(method: &str, path: &str, body: &str, submitter: &dyn Submitter) ->
             }
         },
         (_, "/mint") => error(405, "method not allowed".to_owned()),
+        ("GET", p) if p.starts_with("/tx/") => match tx_detail::check_hash(&p["/tx/".len()..]) {
+            Err(e) => error(400, format!("{e:#}")),
+            Ok(hash) => match submitter.tx(&hash) {
+                Ok(body) => (200, body),
+                Err(e) => error(502, format!("{e:#}")),
+            },
+        },
+        (_, p) if p.starts_with("/tx/") => error(405, "method not allowed".to_owned()),
         _ => error(404, "not found".to_owned()),
     }
 }
@@ -104,6 +115,11 @@ impl Submitter for Real {
     fn mint(&self, terms: &MintTerms) -> Result<String> {
         let cfg = self.cfg.lock().unwrap_or_else(|p| p.into_inner());
         mint::mint(&cfg, terms)
+    }
+
+    fn tx(&self, hash: &str) -> Result<String> {
+        let cfg = self.cfg.lock().unwrap_or_else(|p| p.into_inner());
+        tx_detail::fetch(&cfg, hash)
     }
 }
 
