@@ -1670,3 +1670,44 @@ mod recheck_tests {
         assert_eq!((aborts, rechecks), (0, 0));
     }
 }
+
+#[cfg(test)]
+mod govern_policy_tests {
+    use super::*;
+
+    fn hybrid() -> PrivateSettlementHybridPublicKeyV1 {
+        let mut rng = iroha_crypto::rng_from_seed_slice(&rnd());
+        PrivateSettlementHybridPublicKeyV1::from_hybrid(iroha_crypto::HybridKeyPair::generate(&mut rng).unwrap().public())
+    }
+
+    fn route() -> PrivateSettlementRouteV1 {
+        PrivateSettlementRouteV1 { dataspace_id: DataSpaceId::new(1), lane_id: LaneId::new(1), lane_incarnation: Hash::new(b"policy-test") }
+    }
+
+    fn auditors(n: u8) -> Vec<(PublicKey, PrivateSettlementHybridPublicKeyV1)> {
+        (0..n).map(|i| (fixture_key(0x30 + i).public_key().clone(), hybrid())).collect()
+    }
+
+    const RD: &str = "7onbjg2gRXveoAAUFsohCZyGW98t";
+
+    #[test]
+    fn a_two_of_three_policy_carries_all_three_auditors_and_k_two() {
+        let governed = govern_with(route(), RD.parse().unwrap(), 100, Some(200), &auditors(3), 2).unwrap();
+        assert_eq!(governed.policy.body.min_approvals, 2);
+        assert_eq!(governed.policy.body.auditors.len(), 3);
+    }
+
+    #[test]
+    fn k_zero_k_above_n_and_no_auditor_are_refused() {
+        assert!(govern_with(route(), RD.parse().unwrap(), 100, Some(200), &auditors(3), 0).is_err());
+        assert!(govern_with(route(), RD.parse().unwrap(), 100, Some(200), &auditors(3), 4).is_err());
+        assert!(govern_with(route(), RD.parse().unwrap(), 100, Some(200), &[], 1).is_err());
+    }
+
+    #[test]
+    fn the_single_auditor_entry_point_keeps_the_one_of_one_policy() {
+        let (key, encryption) = auditors(1).remove(0);
+        let governed = govern_until(route(), RD.parse().unwrap(), 100, None, &key, &encryption).unwrap();
+        assert_eq!((governed.policy.body.min_approvals, governed.policy.body.auditors.len()), (1, 1));
+    }
+}
