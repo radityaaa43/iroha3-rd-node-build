@@ -18,8 +18,18 @@ fn plain(label: &str, value: &str, allowed: impl Fn(char) -> bool) -> Result<()>
 
 /// client.toml text for the key of `seed`. Inputs are validated against a strict character set (no TOML injection).
 pub fn render(seed: &[u8; 32], torii: &str, chain: &str, network_id_file: &str, domain: &str) -> Result<String> {
-    let _ = (seed, torii, chain, network_id_file, domain);
-    bail!("render: not implemented")
+    let torii_url = Url::parse(torii).map_err(|e| eyre!("torii url {torii:?}: {e}"))?;
+    ensure!(matches!(torii_url.scheme(), "http" | "https"), "torii url must be http or https");
+    plain("torii url", torii, |c| c.is_ascii_alphanumeric() || ":/.-_".contains(c))?;
+    plain("chain", chain, |c| c.is_ascii_hexdigit() || c == '-')?;
+    plain("network id file", network_id_file, |c| c.is_ascii_alphanumeric() || "/._-".contains(c))?;
+    plain("domain", domain, |c| c.is_ascii_alphanumeric() || "._-".contains(c))?;
+    let pair = signing_key(seed);
+    let private = ExposedPrivateKey(pair.private_key().clone());
+    Ok(format!(
+        "chain = \"{chain}\"\nnetwork_id_file = \"{network_id_file}\"\ntorii_url = \"{torii}\"\n\n[transaction]\ntime_to_live_ms = 600000\nstatus_timeout_ms = 300000\nnonce = false\n\n[account]\ndomain = \"{domain}\"\nprivate_key = \"{private}\"\npublic_key = \"{}\"\n",
+        pair.public_key()
+    ))
 }
 
 /// Read `<dir>/<name>.seed`, write `<dir>/client.toml` (mode 0600, never overwritten). Returns the path; nothing secret is printed.
