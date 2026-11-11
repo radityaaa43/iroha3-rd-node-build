@@ -16,6 +16,7 @@ Request body (JSON, public terms only): `{"counterparty"|"to": "<ed0120.. public
 ## Conditions (ARCHITECTURE-iroha3 10a, kept verbatim in the implementation)
 1. Runs only in that bank's namespace `rd-iroha3-<party>`; one Deployment, 1 replica, requests 50m/64Mi.
 2. Mounts only `<party>.seed` + `<party>.note` of that bank (Secret `<party>-keys`, created by the bank with its own kubeconfig) and the public network files; NEVER the auditor key (`bi-auditor-key`), never another bank's keys.
+   Precision (lead decision 2026-11-12, option a): the server signs with `Config.client_toml`, the bank's OWN client.toml, which is a second form of the same ed25519 key as `<party>.seed`. Secret `<party>-keys` therefore carries three files: `<party>.seed`, `<party>.note` and `client.toml`, all projected read-only at mode 0400. The bank derives `client.toml` in its own custody with `rd-dfabi keys client-toml <dir> <name> --torii <url> --chain <id> --network-id-file <path>` (reads `<dir>/<name>.seed`, writes `<dir>/client.toml` at 0600, never overwrites, never prints the key). Same namespace, same custody rule; still never the auditor key or another bank's key.
 3. Exposes only the two commands above: no new chain logic, no generic "run any command", no config upload.
 4. Reachable only through that bank's gateway (envoy + opa, mTLS) via a NetworkPolicy that admits the gateway pods of the same namespace on the server port and nothing else (default-deny stays).
 5. Lensa calls it as a relay with public terms; it holds no key and no kubeconfig.

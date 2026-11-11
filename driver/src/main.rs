@@ -17,6 +17,8 @@
 //!   rd-dfabi dvp-native <config> --counterparty <public-key> --give <asset>:<n> --take <asset>:<n> --intent <64-hex>
 //!            submit the DvpIsi (two legs, AllOrNothing, settlement id dvp_<intent>) from the config's OWN account;
 //!            prints tx_hash and status. The counterparty must have run settle-grant with the mirrored terms first.
+//!   rd-dfabi keys client-toml <dir> <name> --torii <url> --chain <id> --network-id-file <path> [--domain D]
+//!            derive <dir>/client.toml (0600, never overwritten) from <dir>/<name>.seed; the key is never printed
 //!   rd-dfabi server <config> --listen <addr>   per-bank HTTP mode (docs/server-mode.md): GET /healthz, POST /settle-grant, POST /dvp-native
 //!   rd-dfabi abort-bundle <config> --bundle <hex>  release the pool reservations of a stuck bundle
 //!   rd-dfabi pool-history <config> --asset rd|dfabi  rebuilt pool head (gate G3)
@@ -28,6 +30,7 @@
 
 mod aps;
 mod auditor;
+mod client_toml;
 mod config;
 mod dvp_native;
 mod history;
@@ -92,6 +95,13 @@ fn main() -> Result<()> {
         ["keys", "mint-finality-roster", out, triples @ ..] => {
             let triples = triples.iter().map(Path::new).collect::<Vec<_>>();
             mint_finality::roster(Path::new(out), &triples)
+        }
+        ["keys", "client-toml", dir, name, rest @ ..] => {
+            let flags = flags(rest)?;
+            let domain = flags.0.get("domain").copied().unwrap_or("wonderland.universal");
+            let path = client_toml::write(Path::new(dir), name, flags.get("torii")?, flags.get("chain")?, flags.get("network-id-file")?, domain)?;
+            println!("{name} client.toml written to {}", path.display());
+            Ok(())
         }
         ["keys", "show", dir, name] => {
             let seed = read_seed(&Path::new(dir).join(format!("{name}.seed")))?;
