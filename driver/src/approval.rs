@@ -36,48 +36,99 @@ pub fn decide(k: usize, answers: &[Answer]) -> Verdict {
 
 #[cfg(test)]
 mod tests {
+    use std::{
+        sync::Arc,
+        time::{Duration, Instant},
+    };
+
     use super::Answer::{Approved as A, Pending as P, Rejected as R, Unavailable as U};
     use super::*;
 
     #[test]
-    fn k_approvals_decide_as_soon_as_they_are_in() {
-        assert_eq!(decide(2, &[A, A, P]), Verdict::Approved);
-        assert_eq!(decide(2, &[A, P, A]), Verdict::Approved);
-        assert_eq!(decide(1, &[A]), Verdict::Approved);
-        assert_eq!(decide(3, &[A, A, A]), Verdict::Approved);
-    }
-
-    #[test]
-    fn an_auditor_that_is_offline_does_not_stop_k_of_n() {
-        // BI offline, orgs A and B approve: 2-of-3 commits (the ANALYST RED proof, unit level).
-        assert_eq!(decide(2, &[U, A, A]), Verdict::Approved);
-        // A rejecting auditor does not stop it either while k others approve.
-        assert_eq!(decide(2, &[R, A, A]), Verdict::Approved);
-    }
-
-    #[test]
-    fn fewer_than_k_approvals_never_approve() {
-        // Only one approval of 2-of-3 is NOT enough, whatever the others do.
-        assert_eq!(decide(2, &[A, U, U]), Verdict::Rejected);
-        assert_eq!(decide(2, &[A, R, U]), Verdict::Rejected);
-        assert_eq!(decide(2, &[R, R, A]), Verdict::Rejected);
+    fn any_explicit_reject_aborts_even_when_k_others_approve() {
+        // Governance (b2): an auditor's Reject (BI's included) is never outvoted.
+        assert_eq!(decide(2, &[R, A, A]), Verdict::Rejected);
+        assert_eq!(decide(2, &[A, R, A]), Verdict::Rejected);
+        assert_eq!(decide(2, &[R, P, P]), Verdict::Rejected);
         assert_eq!(decide(1, &[R]), Verdict::Rejected);
-        assert_eq!(decide(1, &[U]), Verdict::Rejected);
     }
 
     #[test]
-    fn it_waits_only_while_k_is_still_reachable() {
-        assert_eq!(decide(2, &[A, P, P]), Verdict::Wait);
+    fn an_auditor_that_is_offline_never_blocks_k_of_n() {
+        // BI offline, orgs A and B approve: 2-of-3 proceeds (R2).
+        assert_eq!(decide(2, &[U, A, A]), Verdict::Approved);
+        assert_eq!(decide(2, &[A, U, A]), Verdict::Approved);
+        assert_eq!(decide(3, &[A, A, A]), Verdict::Approved);
+        assert_eq!(decide(1, &[A]), Verdict::Approved);
+    }
+
+    #[test]
+    fn it_waits_for_every_answer_before_it_approves() {
+        // b1 (stop at k approvals) is rejected: a pending auditor may still reject.
+        assert_eq!(decide(2, &[A, A, P]), Verdict::Wait);
+        assert_eq!(decide(2, &[P, A, U]), Verdict::Wait);
         assert_eq!(decide(2, &[P, P, P]), Verdict::Wait);
-        assert_eq!(decide(2, &[R, P, P]), Verdict::Wait);
-        // k can no longer be reached: stop waiting
-        assert_eq!(decide(2, &[R, R, P]), Verdict::Rejected);
-        assert_eq!(decide(3, &[A, A, R]), Verdict::Rejected);
     }
 
     #[test]
-    fn k_of_zero_never_approves() {
-        assert_eq!(decide(0, &[A, A]), Verdict::Rejected);
-        assert_eq!(decide(2, &[]), Verdict::Rejected);
+    fn too_few_approvals_with_nothing_pending_is_insufficient() {
+        assert_eq!(decide(2, &[A, U, U]), Verdict::Insufficient);
+        assert_eq!(decide(2, &[U, U, U]), Verdict::Insufficient);
+        assert_eq!(decide(1, &[U]), Verdict::Insufficient);
+        // k can no longer be reached even if every pending approves
+        assert_eq!(decide(3, &[A, U, P]), Verdict::Insufficient);
+    }
+
+    #[test]
+    fn k_of_zero_or_no_auditor_never_approves() {
+        assert_eq!(decide(0, &[A, A]), Verdict::Insufficient);
+        assert_eq!(decide(2, &[]), Verdict::Insufficient);
+    }
+
+    #[test]
+    fn the_abort_reasons_are_rejected_and_insufficient_approvals() {
+        assert_eq!(reason(Verdict::Rejected), "rejected");
+        assert_eq!(reason(Verdict::Insufficient), "insufficient approvals");
+    }
+
+    fn ask(script: Vec<(Duration, Answer)>) -> Arc<dyn Fn(usize) -> Answer + Send + Sync> {
+        Arc::new(move |i| {
+            std::thread::sleep(script[i].0);
+            script[i].1
+        })
+    }
+
+    const FAST: Duration = Duration::from_millis(5);
+    const SLOW: Duration = Duration::from_secs(3);
+
+    #[test]
+    fn gather_asks_all_auditors_in_parallel_and_decides_after_the_last_answer() {
+        let started = Instant::now();
+        let (verdict, answers) = gather(2, 3, Duration::from_secs(2), ask(vec![(Duration::from_millis(300), A); 3]));
+        assert_eq!((verdict, answers), (Verdict::Approved, vec![A, A, A]));
+        assert!(started.elapsed() < Duration::from_millis(800), "three 300 ms calls must overlap, not add up");
+    }
+
+    #[test]
+    fn gather_stops_at_once_on_a_reject_without_waiting_for_a_slow_auditor() {
+        let started = Instant::now();
+        let (verdict, answers) = gather(2, 3, Duration::from_secs(10), ask(vec![(FAST, R), (FAST, A), (SLOW, A)]));
+        assert_eq!(verdict, Verdict::Rejected);
+        assert_eq!(answers[0], R);
+        assert!(started.elapsed() < Duration::from_secs(2));
+    }
+
+    #[test]
+    fn gather_counts_an_auditor_past_the_deadline_as_unavailable_and_still_proceeds_on_k() {
+        let started = Instant::now();
+        let (verdict, answers) = gather(2, 3, Duration::from_millis(300), ask(vec![(SLOW, A), (FAST, A), (FAST, A)]));
+        assert_eq!((verdict, answers), (Verdict::Approved, vec![U, A, A]));
+        assert!(started.elapsed() >= Duration::from_millis(300) && started.elapsed() < Duration::from_secs(2));
+    }
+
+    #[test]
+    fn gather_with_too_few_answers_by_the_deadline_is_insufficient() {
+        let (verdict, answers) = gather(2, 3, Duration::from_millis(300), ask(vec![(SLOW, A), (SLOW, A), (FAST, A)]));
+        assert_eq!((verdict, answers), (Verdict::Insufficient, vec![U, U, A]));
     }
 }
