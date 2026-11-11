@@ -180,16 +180,15 @@ fn finalized_receipt(client: &Client, cache: &Path, id: &str) -> Result<Option<P
 }
 
 fn read_cached(file: &Path) -> Result<Option<PrivateSettlementReceiptV1>> {
-    match std::fs::read_to_string(file) {
-        Ok(text) => Ok(Some(dec(text.trim())?)),
-        Err(_) => Ok(None),
-    }
+    // A missing or damaged file is a miss: the caller refetches and rewrites it.
+    Ok(std::fs::read_to_string(file).ok().and_then(|text| dec(text.trim()).ok()))
 }
 
-/// Write via a temp file and rename, so a reader never sees half a file.
+/// Write via a temp file and rename, so a reader never sees half a file. The temp name is random:
+/// every driver container is PID 1, so a pid would not tell two containers apart.
 fn store_cached(cache: &Path, file: &Path, text: &str) -> Result<()> {
     std::fs::create_dir_all(cache)?;
-    let tmp = file.with_extension("tmp");
+    let tmp = file.with_extension(format!("{:016x}.tmp", rand::random::<u64>()));
     std::fs::write(&tmp, text)?;
     std::fs::rename(tmp, file)?;
     Ok(())
