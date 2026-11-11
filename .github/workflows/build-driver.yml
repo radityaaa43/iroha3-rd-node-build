@@ -1,9 +1,7 @@
 name: build-driver
+# Manual only (iroha3 PLAN S17): an image is published when someone dispatches it, never as a side effect of a merge.
 on:
   workflow_dispatch:
-  push:
-    branches: [main]
-    paths: ['driver/**', '.github/workflows/build-driver.yml']
 permissions:
   contents: read
   packages: write
@@ -25,7 +23,7 @@ jobs:
       MEM: 14g
       MEM_SWAP: 30g
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
         with:
           persist-credentials: false
       - name: Free disk and add swap
@@ -45,7 +43,7 @@ jobs:
       # the driver's manifest; source edits reuse the cached dependency artifacts.
       # restore + explicit save (always): a failing driver compile still keeps the ~1 h of
       # upstream dependency artifacts, so the fix-up run starts warm.
-      - uses: actions/cache/restore@v4
+      - uses: actions/cache/restore@1bd1e32a3bdc45362d1e726936510720a7c30a57 # v4.2.0
         with:
           path: |
             ${{ env.WORK }}/cargo-home
@@ -58,7 +56,7 @@ jobs:
         run: |
           ( while sleep 120; do echo "::group::resources $(date -u +%H:%M)"; free -m | sed -n 2,3p; df -h / | tail -1; echo "::endgroup::"; done ) &
           driver/build.sh test
-      - uses: actions/cache/save@v4
+      - uses: actions/cache/save@1bd1e32a3bdc45362d1e726936510720a7c30a57 # v4.2.0
         if: always()
         with:
           path: |
@@ -67,11 +65,23 @@ jobs:
           key: driver-071e281e-${{ hashFiles('driver/Cargo.toml') }}-${{ github.sha }}
       - name: Build
         run: driver/build.sh build
-      - name: Image
+      - name: Image (local, for the smoke and the content check)
         run: |
           tag=$(git rev-parse --short=8 HEAD)
           echo "TAG=$tag" >> "$GITHUB_ENV"
           docker build -t "$IMAGE:$tag" driver
+      # No key material in the image: only the driver binary, the CA bundle and the system files. Fails on any key-like file name.
+      - name: Image content check (no key material)
+        run: |
+          cid=$(docker create "$IMAGE:$TAG")
+          docker export "$cid" | tar -t > "$RUNNER_TEMP/image-files.txt"
+          docker rm "$cid" >/dev/null
+          echo "files in image: $(wc -l < "$RUNNER_TEMP/image-files.txt")"
+          if grep -Ei '(\.seed|\.note|\.hybrid|\.pem|\.key|private[_.-]?key|id_rsa|id_ed25519|\.p12|\.pfx|kubeconfig|client\.toml|peer\.toml)$' "$RUNNER_TEMP/image-files.txt" \
+             | grep -v '^usr/share/ca-certificates/\|^etc/ssl/\|^usr/lib/ssl/'; then
+            echo "::error::key-like file found in the image"; exit 1
+          fi
+          grep -q '^usr/local/bin/rd-dfabi$' "$RUNNER_TEMP/image-files.txt"
       # Offline: no keys, no network. Proves one leg and prints peak RSS (sizes the Job).
       - name: Smoke
         run: |
@@ -81,12 +91,30 @@ jobs:
           mkdir -m 777 "$RUNNER_TEMP/k"
           docker run --rm --network none -v "$RUNNER_TEMP/k:/k" "$IMAGE:$TAG" keys new /k smoke
           docker run --rm --network none -v "$RUNNER_TEMP/k:/k" "$IMAGE:$TAG" keys new-hybrid /k smoke
-      - uses: docker/login-action@v3
+      - uses: docker/login-action@9780b0c442fbb1117ed29e0efdff1e18412f7567 # v3.3.0
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
-      - name: Push
+      - uses: docker/setup-buildx-action@c47758b77c9736f4b2ef4073d4d51994fabfe349 # v3.7.1
+      # Push with SBOM and max provenance attestations (OCI attestations next to the image). The layers are the ones built above
+      # (same context and base digest), so this step is a repack plus push.
+      - name: Push (SBOM + provenance)
+        id: push
+        uses: docker/build-push-action@48aba3b46d1b1fec4febb7c5d0c644b249a11355 # v6.10.0
+        with:
+          context: driver
+          push: true
+          tags: ${{ env.IMAGE }}:${{ env.TAG }}
+          sbom: true
+          provenance: mode=max
+      - name: Digest (pin by digest, never by tag)
         run: |
-          docker push "$IMAGE:$TAG"
-          echo "pushed $IMAGE:$TAG" >> "$GITHUB_STEP_SUMMARY"
+          {
+            echo "pushed ${IMAGE}:${TAG}"
+            echo ""
+            echo "pull by digest: \`${IMAGE}@${{ steps.push.outputs.digest }}\`"
+            echo ""
+            echo "Visibility: the package inherits the repository visibility until the owner changes it in GitHub (Packages > Package settings); it must be PRIVATE before any non-public use (user-only)."
+          } >> "$GITHUB_STEP_SUMMARY"
+          echo "digest=${{ steps.push.outputs.digest }}"
