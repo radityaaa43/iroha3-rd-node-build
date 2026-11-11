@@ -152,3 +152,65 @@ pub fn read_seed(path: &Path) -> Result<[u8; 32]> {
 pub fn signing_key(seed: &[u8; 32]) -> KeyPair {
     KeyPair::from_seed(seed.to_vec(), Algorithm::Ed25519)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn config(extra: &str) -> Config {
+        let text = format!(
+            r#"
+chain = "c"
+network_id_file = "/n"
+account_domain = "d"
+peers_json = "/p.json"
+key_dir = "/k"
+fee_asset = "f"
+auditor_url = "a:1"
+{extra}
+[torii]
+bi = "http://bi:8080"
+bank-a = "http://bank-a:8080"
+bank-b = "http://bank-b:8080"
+bank-c = "http://bank-c:8080"
+[assets]
+rd = "r"
+dfabi = "d"
+[lanes]
+rd = 1
+dfabi = 2
+"#
+        );
+        toml::from_str(&text).unwrap()
+    }
+
+    #[test]
+    fn the_acting_party_defaults_to_bi_so_existing_configs_keep_their_behaviour() {
+        let cfg = config("");
+        assert_eq!(cfg.party, "bi");
+        assert_eq!(cfg.acting_torii().unwrap().as_str(), "http://bi:8080/");
+    }
+
+    #[test]
+    fn sponsor_is_acting_party() {
+        for party in ["bi", "bank-a", "bank-b", "bank-c"] {
+            let cfg = config(&format!("party = \"{party}\""));
+            assert_eq!(cfg.party, party);
+            assert_eq!(cfg.acting_torii().unwrap().as_str(), format!("http://{party}:8080/"), "{party} submits to its OWN Torii");
+        }
+    }
+
+    #[test]
+    fn an_acting_party_without_a_torii_entry_is_an_error() {
+        let cfg = config("party = \"bank-z\"");
+        assert!(cfg.acting_torii().is_err());
+    }
+
+    /// No command may name BI's Torii for the sponsor again: the sponsor of a command is the acting party (iroha3 PLAN S10).
+    #[test]
+    fn no_command_hardcodes_the_bi_sponsor() {
+        for (file, text) in [("aps.rs", include_str!("aps.rs")), ("pools.rs", include_str!("pools.rs"))] {
+            assert!(!text.contains("sponsor(\"bi\")"), "{file} still calls cfg.sponsor(\"bi\")");
+        }
+    }
+}
