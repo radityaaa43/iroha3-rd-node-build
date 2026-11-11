@@ -205,7 +205,7 @@ pub fn run_dvp(cfg: &Config, legs: Vec<Leg>, options: &Options) -> Result<()> {
             "leg {ordinal}: payer note leaves no change; fund at least 1 more (rejected before proving)"
         );
     }
-    let (sponsor, sponsor_key) = cfg.sponsor("bi")?;
+    let (sponsor, sponsor_key) = cfg.acting_sponsor()?;
     let sponsor_id = AccountId::new(sponsor_key.public_key().clone());
     let network_id = *sponsor.client().network_id();
     let fee = bounded_fee(cfg)?;
@@ -439,7 +439,7 @@ pub(crate) fn settle(
             },
             // One idempotent GET of the same tx on a fresh client (a new connection pool).
             || {
-                let (fresh, _) = cfg.sponsor("bi")?;
+                let (fresh, _) = cfg.acting_sponsor()?;
                 Ok(matches!(fresh.client().get_transaction_status(hash)?, Some(TxConfirmationStatus::Applied)))
             },
         )?;

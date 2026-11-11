@@ -271,7 +271,7 @@ fn route(client: &Client, lane: u32) -> Result<PrivateSettlementRouteV1> {
 /// One-time: activate the RD and DFABI pools, each holding a BI reserve note.
 pub fn pool_init(cfg: &Config, rd_reserve: u128, dfabi_reserve: u128) -> Result<()> {
     ensure!(!cfg.pools_file.exists(), "{} exists: pools are initialized once", cfg.pools_file.display());
-    let (sponsor, _) = cfg.sponsor("bi")?;
+    let (sponsor, _) = cfg.acting_sponsor()?;
     let caps = sponsor.client().get_privacy_capabilities()?;
     ensure!(
         caps.protocols.iter().any(|row| row.protocol_id == PrivacyProtocolIdV1::IrohaIvmPrivateNoteStarkV1 && row.activation.is_some()),
@@ -344,7 +344,7 @@ pub fn dvp(cfg: &Config, buyer: &str, seller: &str, rd: u128, dfabi: u128, optio
 fn run_bundle(cfg: &Config, legs: [LegSpec; 2], options: &Options, kind: &str) -> Result<()> {
     ensure!(legs[0].asset == Asset::Rd && legs[1].asset == Asset::Dfabi, "legs must be [rd, dfabi]");
     let pools = PoolFile::load(&cfg.pools_file)?;
-    let (sponsor, sponsor_key) = cfg.sponsor("bi")?;
+    let (sponsor, sponsor_key) = cfg.acting_sponsor()?;
     let mut spends = Vec::new();
     let mut governed = Vec::new();
     for (ordinal, leg) in legs.iter().enumerate() {
@@ -489,7 +489,7 @@ fn item_json(asset: Asset, bundle: &BundleRef, received: u128, paid: u128) -> Op
 /// Debug aid for gate G3: rebuild one pool and print its head (no amounts).
 pub fn pool_history(cfg: &Config, asset: Asset) -> Result<()> {
     let pools = PoolFile::load(&cfg.pools_file)?;
-    let (client, _) = cfg.sponsor("bi")?;
+    let (client, _) = cfg.acting_sponsor()?;
     let history = pools.get(asset).history(&client, &receipt_cache(cfg))?;
     println!(
         "pool_history asset={} epoch={} leaves={} root={}",
@@ -504,7 +504,7 @@ pub fn pool_history(cfg: &Config, asset: Asset) -> Result<()> {
 
 /// Abort a stuck bundle (prepared but never registered) to release the pool reservations.
 pub fn abort_bundle(cfg: &Config, bundle: &str) -> Result<()> {
-    let (sponsor, _) = cfg.sponsor("bi")?;
+    let (sponsor, _) = cfg.acting_sponsor()?;
     let status = sponsor.client().private_settlement_bundle_status_v1(Hash::prehashed(hex32(bundle)?))?;
     let manifest = status.manifest.ok_or_else(|| eyre!("the node retains no manifest for this bundle"))?;
     crate::aps::abort_bundle(cfg, sponsor.client(), &manifest)?;
