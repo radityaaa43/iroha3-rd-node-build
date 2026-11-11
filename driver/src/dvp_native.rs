@@ -13,7 +13,7 @@
 
 use std::str::FromStr;
 
-use eyre::{Result, WrapErr, bail, ensure};
+use eyre::{Result, WrapErr, ensure, eyre};
 use iroha::{
     blocking::Client,
     client::AccountTransactionDraft,
@@ -41,45 +41,62 @@ pub struct Side {
 
 impl Side {
     pub fn parse(text: &str) -> Result<Self> {
-        let _ = text;
-        bail!("not implemented")
+        // The asset literal is base58 and holds no ':', so the last ':' separates the amount.
+        let (asset, amount) = text.rsplit_once(':').ok_or_else(|| eyre!("expected <asset>:<amount>, got {text:?}"))?;
+        // Digits only: `u128::from_str` would also take a leading '+'.
+        ensure!(!amount.is_empty() && amount.bytes().all(|b| b.is_ascii_digit()), "amount {amount:?} is not a plain integer");
+        let amount: u128 = amount.parse().wrap_err("amount does not fit u128")?;
+        ensure!(amount > 0, "amount must be greater than zero");
+        let asset = AssetDefinitionId::from_str(asset).map_err(|e| eyre!("asset {asset:?}: {e}"))?;
+        Ok(Self { asset, amount })
     }
 }
 
 /// 32-byte intent id, 64 hex characters.
 pub fn parse_intent(text: &str) -> Result<[u8; 32]> {
-    let _ = text;
-    bail!("not implemented")
+    let bytes = hex::decode(text).wrap_err("intent is not hex")?;
+    bytes.try_into().map_err(|_| eyre!("intent must be exactly 32 bytes (64 hex characters)"))
 }
 
 /// Counterparty account from its public key (`ed0120...`): an account id is the key itself.
 pub fn parse_account(text: &str) -> Result<AccountId> {
-    let _ = text;
-    bail!("not implemented")
+    let key = PublicKey::from_str(text).map_err(|e| eyre!("account public key {text:?}: {e}"))?;
+    Ok(AccountId::new(key))
 }
 
 /// The DvP exactly as `submitter` signs it: `give` leaves the submitter (delivery leg), `take` arrives at it (payment leg).
 pub fn build_dvp(submitter: &AccountId, counterparty: &AccountId, give: &Side, take: &Side, intent: &[u8; 32]) -> Result<DvpIsi> {
-    let _ = (submitter, counterparty, give, take, intent);
-    bail!("not implemented")
+    ensure!(submitter != counterparty, "counterparty must differ from the submitting account");
+    ensure!(give.asset != take.asset, "the two legs must use different assets");
+    let settlement_id = SettlementId::from_str(&format!("dvp_{}", hex::encode(intent))).map_err(|e| eyre!("settlement id: {e}"))?;
+    Ok(DvpIsi::new(
+        settlement_id,
+        SettlementLeg::new(give.asset.clone(), give.amount, submitter.clone(), counterparty.clone()),
+        SettlementLeg::new(take.asset.clone(), take.amount, counterparty.clone(), submitter.clone()),
+        SettlementPlan::new(SettlementExecutionOrder::DeliveryThenPayment, SettlementAtomicity::AllOrNothing),
+    ))
 }
 
 /// The consent `grantor` gives to `to` (the future submitter), in the grantor's own give/take terms.
 pub fn build_consent(grantor: &AccountId, to: &AccountId, give: &Side, take: &Side, intent: &[u8; 32]) -> Result<CanExecuteSettlement> {
-    let _ = (grantor, to, give, take, intent);
-    bail!("not implemented")
+    // The grantee submits, so what the grantor gives is the grantee's take (payment leg, debited from the grantor).
+    let dvp = build_dvp(to, grantor, take, give, intent)?;
+    Ok(CanExecuteSettlement {
+        debited_asset: AssetId::new(dvp.payment_leg.asset_definition_id.clone(), grantor.clone()),
+        settlement_id: dvp.settlement_id.clone(),
+        intent_hash: dvp.intent_hash(),
+    })
 }
 
 /// `Grant<CanExecuteSettlement>` from `grantor` to `to`.
 pub fn build_grant(grantor: &AccountId, to: &AccountId, give: &Side, take: &Side, intent: &[u8; 32]) -> Result<InstructionBox> {
-    let _ = (grantor, to, give, take, intent);
-    bail!("not implemented")
+    Ok(Grant::account_permission(build_consent(grantor, to, give, take, intent)?, to.clone()).into())
 }
 
 /// Client of the config's OWN account (its client.toml: own key, own Torii) and that account id.
 fn own_client(cfg: &Config) -> Result<(Client, AccountId)> {
     let config = iroha::config::Config::load_file(&cfg.client_toml)
-        .map_err(|e| eyre::eyre!("load {}: {e:?}", cfg.client_toml.display()))?;
+        .map_err(|e| eyre!("load {}: {e:?}", cfg.client_toml.display()))?;
     let own = AccountId::new(config.key_pair.public_key().clone());
     Ok((Client::new(config)?, own))
 }
