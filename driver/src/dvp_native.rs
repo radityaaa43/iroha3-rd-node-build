@@ -43,13 +43,18 @@ impl Side {
     pub fn parse(text: &str) -> Result<Self> {
         // The asset literal is base58 and holds no ':', so the last ':' separates the amount.
         let (asset, amount) = text.rsplit_once(':').ok_or_else(|| eyre!("expected <asset>:<amount>, got {text:?}"))?;
-        // Digits only: `u128::from_str` would also take a leading '+'.
-        ensure!(!amount.is_empty() && amount.bytes().all(|b| b.is_ascii_digit()), "amount {amount:?} is not a plain integer");
-        let amount: u128 = amount.parse().wrap_err("amount does not fit u128")?;
-        ensure!(amount > 0, "amount must be greater than zero");
+        let amount = parse_amount(amount)?;
         let asset = AssetDefinitionId::from_str(asset).map_err(|e| eyre!("asset {asset:?}: {e}"))?;
         Ok(Self { asset, amount })
     }
+}
+
+/// A non-zero plain integer (digits only: `u128::from_str` would also take a leading '+').
+pub fn parse_amount(amount: &str) -> Result<u128> {
+    ensure!(!amount.is_empty() && amount.bytes().all(|b| b.is_ascii_digit()), "amount {amount:?} is not a plain integer");
+    let amount: u128 = amount.parse().wrap_err("amount does not fit u128")?;
+    ensure!(amount > 0, "amount must be greater than zero");
+    Ok(amount)
 }
 
 /// 32-byte intent id, 64 hex characters.
@@ -103,7 +108,7 @@ pub fn check_terms(counterparty: &str, give: &str, take: &str, intent: &str) -> 
 }
 
 /// Client of the config's OWN account (its client.toml: own key, own Torii) and that account id.
-fn own_client(cfg: &Config) -> Result<(Client, AccountId)> {
+pub(crate) fn own_client(cfg: &Config) -> Result<(Client, AccountId)> {
     let config = iroha::config::Config::load_file(&cfg.client_toml)
         .map_err(|e| eyre!("load {}: {e:?}", cfg.client_toml.display()))?;
     let own = AccountId::new(config.key_pair.public_key().clone());
@@ -111,7 +116,7 @@ fn own_client(cfg: &Config) -> Result<(Client, AccountId)> {
 }
 
 /// Sign with the own key, pay the bounded fee like every other command, wait for `Applied`; return the transaction hash.
-fn submit(cfg: &Config, client: &Client, instruction: InstructionBox) -> Result<String> {
+pub(crate) fn submit(cfg: &Config, client: &Client, instruction: InstructionBox) -> Result<String> {
     let account = client.account_client();
     let transaction = account
         .prepare_transaction(AccountTransactionDraft::new(vec![instruction], bounded_fee(cfg)?, Metadata::default()))

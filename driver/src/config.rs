@@ -38,6 +38,9 @@ pub struct Config {
     pub lanes: Lanes,
     #[serde(default)]
     pub auditor: AuditorConfig,
+    /// Only the BI driver sets this (S18, K6): enables `mint` / `POST /mint` for RD and DFABI. Absent = refused.
+    #[serde(default)]
+    pub mint_enabled: bool,
 }
 
 #[derive(Debug, Deserialize)]

@@ -1,7 +1,7 @@
 //! Per-bank driver server mode (iroha3 PLAN S17, ARCHITECTURE-iroha3 row 10a, docs/server-mode.md).
 //!
 //! A thin HTTP wrapper over the two D-native commands of `dvp_native.rs`, running in ONE bank's namespace with that bank's own
-//! client.toml (own key, own Torii). It exposes exactly: `GET /healthz`, `POST /settle-grant`, `POST /dvp-native`. Request bodies
+//! client.toml (own key, own Torii). It exposes exactly: `GET /healthz`, `POST /settle-grant`, `POST /dvp-native`, and `POST /mint` (403 unless the config sets `mint_enabled`: BI only). Request bodies
 //! carry public terms only; nothing secret is read from a request, written to a response or logged.
 
 use std::sync::Mutex;
@@ -9,7 +9,11 @@ use std::sync::Mutex;
 use eyre::Result;
 use serde::Deserialize;
 
-use crate::{config::Config, dvp_native, http};
+use crate::{
+    config::Config,
+    dvp_native, http,
+    mint::{self, MintPolicy, MintTerms},
+};
 
 /// Public terms of one D-native DvP, in the calling bank's own give/take view (see `dvp_native.rs`).
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
@@ -27,6 +31,9 @@ pub struct Terms {
 pub trait Submitter {
     fn grant(&self, terms: &Terms) -> Result<String>;
     fn dvp(&self, terms: &Terms) -> Result<String>;
+    /// `Some` only on the BI driver (config `mint_enabled`); `None` = every `/mint` is refused with 403.
+    fn mint_policy(&self) -> Result<Option<MintPolicy>>;
+    fn mint(&self, terms: &MintTerms) -> Result<String>;
 }
 
 /// Answer one request: `(HTTP status, JSON body)`. Pure apart from the injected submitter.
@@ -51,6 +58,24 @@ pub fn route(method: &str, path: &str, body: &str, submitter: &dyn Submitter) ->
             }
         }
         (_, "/settle-grant" | "/dvp-native") => error(405, "method not allowed".to_owned()),
+        ("POST", "/mint") => match submitter.mint_policy() {
+            Err(e) => error(502, format!("{e:#}")),
+            Ok(None) => error(403, "mint is not enabled on this driver".to_owned()),
+            Ok(Some(policy)) => {
+                let terms: MintTerms = match serde_json::from_str(body) {
+                    Ok(terms) => terms,
+                    Err(e) => return error(400, format!("bad request body: {e}")),
+                };
+                if let Err(e) = mint::check_mint(&terms, &policy) {
+                    return error(400, format!("{e:#}"));
+                }
+                match submitter.mint(&terms) {
+                    Ok(hash) => reply(200, serde_json::json!({ "tx_hash": hash, "status": "Applied" })),
+                    Err(e) => error(502, format!("{e:#}")),
+                }
+            }
+        },
+        (_, "/mint") => error(405, "method not allowed".to_owned()),
         _ => error(404, "not found".to_owned()),
     }
 }
@@ -69,6 +94,16 @@ impl Submitter for Real {
     fn dvp(&self, terms: &Terms) -> Result<String> {
         let cfg = self.cfg.lock().unwrap_or_else(|p| p.into_inner());
         dvp_native::dvp_native(&cfg, &terms.counterparty, &terms.give, &terms.take, &terms.intent)
+    }
+
+    fn mint_policy(&self) -> Result<Option<MintPolicy>> {
+        let cfg = self.cfg.lock().unwrap_or_else(|p| p.into_inner());
+        mint::policy_of(&cfg)
+    }
+
+    fn mint(&self, terms: &MintTerms) -> Result<String> {
+        let cfg = self.cfg.lock().unwrap_or_else(|p| p.into_inner());
+        mint::mint(&cfg, terms)
     }
 }
 
@@ -94,6 +129,9 @@ mod tests {
     #[derive(Default)]
     struct Fake {
         calls: RefCell<Vec<(&'static str, Terms)>>,
+        mints: RefCell<Vec<MintTerms>>,
+        /// `Some` = this is a BI driver with mint enabled.
+        policy: Option<MintPolicy>,
         fail: bool,
     }
 
@@ -107,6 +145,23 @@ mod tests {
             self.calls.borrow_mut().push(("dvp", terms.clone()));
             if self.fail { Err(eyre::eyre!("chain refused")) } else { Ok("txh-dvp".to_owned()) }
         }
+
+        fn mint_policy(&self) -> Result<Option<MintPolicy>> {
+            Ok(self.policy.clone())
+        }
+
+        fn mint(&self, terms: &MintTerms) -> Result<String> {
+            self.mints.borrow_mut().push(terms.clone());
+            if self.fail { Err(eyre::eyre!("chain refused")) } else { Ok("txh-mint".to_owned()) }
+        }
+    }
+
+    fn bi() -> Fake {
+        Fake { policy: Some(MintPolicy { allowed: vec![(asset(1).parse().unwrap(), 1000)] }), ..Fake::default() }
+    }
+
+    fn mint_body(amount: &str) -> String {
+        format!(r#"{{"to":"{}","asset":"{}","amount":"{amount}"}}"#, account(), asset(1))
     }
 
     fn asset(n: u8) -> String {
@@ -205,5 +260,64 @@ mod tests {
             assert!(!response.contains(".seed") && !response.contains(".note") && !response.contains("client.toml"), "{response}");
             assert!(!response.contains(&"ab".repeat(32)), "the intent must not be echoed: {response}");
         }
+    }
+
+    #[test]
+    fn mint_is_403_on_a_driver_without_mint_enabled_and_never_reaches_the_chain() {
+        let bank = Fake::default();
+        for request in [mint_body("5"), String::new(), "garbage".to_owned()] {
+            let (status, response) = route("POST", "/mint", &request, &bank);
+            assert_eq!(status, 403, "{request:?}");
+            assert!(json(&response)["error"].is_string());
+        }
+        assert!(bank.mints.borrow().is_empty() && bank.calls.borrow().is_empty());
+    }
+
+    #[test]
+    fn mint_is_405_on_a_wrong_method_and_healthz_still_works_on_bi() {
+        let bi = bi();
+        assert_eq!(route("GET", "/mint", "", &bi).0, 405);
+        assert_eq!(route("GET", "/healthz", "", &bi).0, 200);
+        assert!(bi.mints.borrow().is_empty());
+    }
+
+    #[test]
+    fn mint_bad_bodies_and_terms_are_400_and_never_submit() {
+        let bi = bi();
+        let unknown = mint_body("5").replace('}', r#","from":"x"}"#);
+        let ok = mint_body("5");
+        let cases = [
+            String::new(),
+            "not json".to_owned(),
+            "{}".to_owned(),
+            unknown,
+            mint_body("0"),
+            mint_body("1001"),
+            mint_body("abc"),
+            ok.replace(&asset(1), &asset(9)),
+            ok.replace(&account(), "not-a-key"),
+        ];
+        for bad in cases {
+            let (status, response) = route("POST", "/mint", &bad, &bi);
+            assert_eq!(status, 400, "{bad:?}");
+            assert!(json(&response)["error"].is_string());
+        }
+        assert!(bi.mints.borrow().is_empty());
+    }
+
+    #[test]
+    fn a_valid_mint_is_submitted_once_with_exactly_the_given_terms() {
+        let bi = bi();
+        let (status, response) = route("POST", "/mint", &mint_body("250"), &bi);
+        assert_eq!((status, json(&response)), (200, serde_json::json!({"tx_hash": "txh-mint", "status": "Applied"})));
+        assert_eq!(*bi.mints.borrow(), vec![MintTerms { to: account(), asset: asset(1), amount: "250".to_owned() }]);
+    }
+
+    #[test]
+    fn a_mint_chain_refusal_is_502_with_only_an_error_field() {
+        let bi = Fake { fail: true, ..bi() };
+        let (status, response) = route("POST", "/mint", &mint_body("5"), &bi);
+        assert_eq!(status, 502);
+        assert_eq!(json(&response), serde_json::json!({"error": "chain refused"}));
     }
 }
