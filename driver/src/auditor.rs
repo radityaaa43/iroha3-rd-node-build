@@ -153,12 +153,12 @@ struct Auditor {
 }
 
 pub fn run(cfg: Config) -> Result<()> {
-    let signing = signing_key(&cfg.seed("bi-auditor")?);
-    let hybrid = read_hybrid(&cfg.key_dir.join("bi-auditor.hybrid"))?;
+    let signing = signing_key(&cfg.seed(cfg.auditor_key_name()?)?);
+    let hybrid = read_hybrid(&cfg.auditor_hybrid_path())?;
     std::fs::create_dir_all(&cfg.auditor.store_dir)?;
     let auditor = Auditor {
         rules: Rules::from_config(&cfg)?,
-        client: cfg.client_with_key("bi", &signing)?,
+        client: cfg.client_with_key(&cfg.party, &signing)?,
         signing,
         hybrid,
         cfg,

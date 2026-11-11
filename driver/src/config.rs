@@ -86,6 +86,10 @@ pub struct AuditorConfig {
     pub max_dfabi: u128,
     /// Wallet public keys (`ed0120...`) accepted as payer or recipient.
     pub parties: Vec<String>,
+    /// Name of this auditor's key files in `key_dir`: `<name>.seed` and `<name>.hybrid` (iroha3 S12: each org auditor holds its
+    /// OWN keys in its own namespace). Default `bi-auditor`, the single BI auditor of today.
+    #[serde(default = "default_key_name")]
+    pub key_name: String,
 }
 
 impl Default for AuditorConfig {
@@ -96,8 +100,13 @@ impl Default for AuditorConfig {
             max_rd: 1_000_000,
             max_dfabi: 10_000,
             parties: Vec::new(),
+            key_name: default_key_name(),
         }
     }
+}
+
+fn default_key_name() -> String {
+    "bi-auditor".into()
 }
 
 fn default_party() -> String {
@@ -133,6 +142,21 @@ impl Config {
         let distinct: std::collections::BTreeSet<_> = urls.iter().collect();
         eyre::ensure!(distinct.len() == urls.len(), "[audit] auditor_urls has a duplicate");
         Ok(AuditPolicy { min_approvals: k, auditor_urls: urls })
+    }
+
+    /// The auditor's key name: one plain file-name component, so it cannot point outside `key_dir`.
+    pub fn auditor_key_name(&self) -> Result<&str> {
+        let name = self.auditor.key_name.as_str();
+        eyre::ensure!(
+            !name.is_empty() && !name.starts_with('.') && name.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_'),
+            "auditor key_name {name:?} must be letters, digits, - or _"
+        );
+        Ok(name)
+    }
+
+    /// `<key_dir>/<key_name>.hybrid`.
+    pub fn auditor_hybrid_path(&self) -> PathBuf {
+        self.key_dir.join(format!("{}.hybrid", self.auditor.key_name))
     }
 
     /// Torii of the acting party (`party`).
