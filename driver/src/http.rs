@@ -146,4 +146,13 @@ mod tests {
         server.join().unwrap();
         assert!(response.ends_with("GET /records/ab []"), "{response}");
     }
+
+    #[test]
+    fn an_https_target_without_a_tls_section_is_refused_and_a_plain_target_does_not_need_one() {
+        let err = send(None, "https://gateway.rd-iroha3-bi.svc.cluster.local:8443", "GET", "/keys", "", None, Duration::from_secs(1)).unwrap_err();
+        assert!(format!("{err:#}").contains("[tls]"), "{err:#}");
+        // a plain host:port still takes the old path (nothing listens: connection refused, not a TLS error)
+        let err = send(None, "127.0.0.1:1", "GET", "/healthz", "", Some(Duration::from_millis(300)), Duration::from_secs(1)).unwrap_err();
+        assert!(!format!("{err:#}").contains("[tls]"));
+    }
 }

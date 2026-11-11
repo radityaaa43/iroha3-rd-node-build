@@ -40,6 +40,7 @@ mod mint_finality;
 mod server;
 mod http;
 mod pools;
+mod tls_http;
 mod tree;
 mod tx_detail;
 mod wallet;

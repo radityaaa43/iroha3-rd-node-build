@@ -8,6 +8,7 @@ edition = "2024"
 publish = false
 
 [dependencies]
+reqwest = { workspace = true, features = ["blocking", "rustls-tls-manual-roots"] }
 iroha = { workspace = true }
 iroha_core = { workspace = true, features = ["node", "simd"] }
 iroha_crypto = { workspace = true, default-features = false, features = ["node-crypto"] }
