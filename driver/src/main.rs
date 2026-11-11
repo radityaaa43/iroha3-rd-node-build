@@ -34,6 +34,7 @@ mod client_toml;
 mod config;
 mod dvp_native;
 mod history;
+mod mint;
 mod mint_finality;
 mod server;
 mod http;
