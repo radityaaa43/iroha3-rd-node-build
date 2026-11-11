@@ -1,7 +1,7 @@
 //! Per-bank driver server mode (iroha3 PLAN S17, ARCHITECTURE-iroha3 row 10a, docs/server-mode.md).
 //!
 //! A thin HTTP wrapper over the two D-native commands of `dvp_native.rs`, running in ONE bank's namespace with that bank's own
-//! client.toml (own key, own Torii). It exposes exactly: `GET /healthz`, `POST /settle-grant`, `POST /dvp-native`, and `POST /mint` (403 unless the config sets `mint_enabled`: BI only). Request bodies
+//! client.toml (own key, own Torii). It exposes exactly: `GET /healthz`, `POST /settle-grant`, `POST /dvp-native`, `POST /mint` (403 unless the config sets `mint_enabled`: BI only) and `GET /tx/{hash}` (a signed query with the own key). Request bodies
 //! carry public terms only; nothing secret is read from a request, written to a response or logged.
 
 use std::sync::Mutex;
@@ -13,6 +13,7 @@ use crate::{
     config::Config,
     dvp_native, http,
     mint::{self, MintPolicy, MintTerms},
+    tx_detail,
 };
 
 /// Public terms of one D-native DvP, in the calling bank's own give/take view (see `dvp_native.rs`).
@@ -34,6 +35,8 @@ pub trait Submitter {
     /// `Some` only on the BI driver (config `mint_enabled`); `None` = every `/mint` is refused with 403.
     fn mint_policy(&self) -> Result<Option<MintPolicy>>;
     fn mint(&self, terms: &MintTerms) -> Result<String>;
+    /// Signed transaction-details query with the own key (`tx_detail::fetch`); `hash` is already validated.
+    fn tx(&self, hash: &str) -> Result<String>;
 }
 
 /// Answer one request: `(HTTP status, JSON body)`. Pure apart from the injected submitter.
@@ -76,6 +79,14 @@ pub fn route(method: &str, path: &str, body: &str, submitter: &dyn Submitter) ->
             }
         },
         (_, "/mint") => error(405, "method not allowed".to_owned()),
+        ("GET", p) if p.starts_with("/tx/") => match tx_detail::check_hash(&p["/tx/".len()..]) {
+            Err(e) => error(400, format!("{e:#}")),
+            Ok(hash) => match submitter.tx(&hash) {
+                Ok(body) => (200, body),
+                Err(e) => error(502, format!("{e:#}")),
+            },
+        },
+        (_, p) if p.starts_with("/tx/") => error(405, "method not allowed".to_owned()),
         _ => error(404, "not found".to_owned()),
     }
 }
@@ -105,6 +116,11 @@ impl Submitter for Real {
         let cfg = self.cfg.lock().unwrap_or_else(|p| p.into_inner());
         mint::mint(&cfg, terms)
     }
+
+    fn tx(&self, hash: &str) -> Result<String> {
+        let cfg = self.cfg.lock().unwrap_or_else(|p| p.into_inner());
+        tx_detail::fetch(&cfg, hash)
+    }
 }
 
 /// `rd-dfabi server <config> --listen <addr>`.
@@ -130,6 +146,9 @@ mod tests {
     struct Fake {
         calls: RefCell<Vec<(&'static str, Terms)>>,
         mints: RefCell<Vec<MintTerms>>,
+        txs: RefCell<Vec<String>>,
+        /// `Some(message)` = the upstream refuses a transaction-details query with this message.
+        tx_refusal: Option<String>,
         /// `Some` = this is a BI driver with mint enabled.
         policy: Option<MintPolicy>,
         fail: bool,
@@ -153,6 +172,14 @@ mod tests {
         fn mint(&self, terms: &MintTerms) -> Result<String> {
             self.mints.borrow_mut().push(terms.clone());
             if self.fail { Err(eyre::eyre!("chain refused")) } else { Ok("txh-mint".to_owned()) }
+        }
+
+        fn tx(&self, hash: &str) -> Result<String> {
+            self.txs.borrow_mut().push(hash.to_owned());
+            match &self.tx_refusal {
+                Some(message) => Err(eyre::eyre!("{message}")),
+                None => Ok(format!(r#"{{"hash":"{hash}","transaction":{{"result":"Ok"}}}}"#)),
+            }
         }
     }
 
@@ -319,5 +346,48 @@ mod tests {
         let (status, response) = route("POST", "/mint", &mint_body("5"), &bi);
         assert_eq!(status, 502);
         assert_eq!(json(&response), serde_json::json!({"error": "chain refused"}));
+    }
+
+    #[test]
+    fn tx_detail_is_a_get_of_a_valid_hash_and_returns_exactly_what_the_query_returned() {
+        let fake = Fake::default();
+        let hash = "ab".repeat(32);
+        let (status, response) = route("GET", &format!("/tx/{hash}"), "", &fake);
+        assert_eq!((status, json(&response)), (200, serde_json::json!({"hash": hash, "transaction": {"result": "Ok"}})));
+        assert_eq!(*fake.txs.borrow(), vec![hash.clone()]);
+        // an upper-case hash is lowered before the query
+        let (status, _) = route("GET", &format!("/tx/{}", hash.to_uppercase()), "", &fake);
+        assert_eq!(status, 200);
+        assert_eq!(fake.txs.borrow()[1], hash);
+    }
+
+    #[test]
+    fn tx_detail_bad_hashes_are_400_and_never_query() {
+        let fake = Fake::default();
+        for bad in ["/tx/", "/tx/abcd", "/tx/zz", &format!("/tx/{}", "ab".repeat(33)), &format!("/tx/../{}", "ab".repeat(30)), &format!("/tx/{}?x=1", "ab".repeat(32))] {
+            let (status, response) = route("GET", bad, "", &fake);
+            assert_eq!(status, 400, "{bad}");
+            assert!(json(&response)["error"].is_string());
+        }
+        assert!(fake.txs.borrow().is_empty());
+    }
+
+    #[test]
+    fn tx_detail_other_methods_are_405_and_never_query() {
+        let fake = Fake::default();
+        let path = format!("/tx/{}", "ab".repeat(32));
+        for method in ["POST", "PUT", "DELETE"] {
+            assert_eq!(route(method, &path, "{}", &fake).0, 405, "{method}");
+        }
+        assert!(fake.txs.borrow().is_empty());
+    }
+
+    #[test]
+    fn an_upstream_permission_error_is_passed_through_not_turned_into_a_filtered_success() {
+        let message = "query_validation_failed: account is not permitted to read this transaction";
+        let fake = Fake { tx_refusal: Some(message.to_owned()), ..Fake::default() };
+        let (status, response) = route("GET", &format!("/tx/{}", "ab".repeat(32)), "", &fake);
+        assert_eq!(status, 502);
+        assert_eq!(json(&response), serde_json::json!({"error": message}));
     }
 }

@@ -40,6 +40,7 @@ mod server;
 mod http;
 mod pools;
 mod tree;
+mod tx_detail;
 mod wallet;
 
 use std::{collections::BTreeMap, io::Write, os::unix::fs::OpenOptionsExt, path::Path};
