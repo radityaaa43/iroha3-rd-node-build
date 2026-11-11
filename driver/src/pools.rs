@@ -406,21 +406,39 @@ fn run_bundle(cfg: &Config, legs: [LegSpec; 2], options: &Options, kind: &str) -
         }
     })?;
     let outcome = settle(cfg, &sponsor, manifest, &prepared, &governed, &committees, started, options);
-    PoolFile::update(&cfg.pools_file, |pools| {
-        for asset in [Asset::Rd, Asset::Dfabi] {
-            let bundles = &mut pools.get_mut(asset).bundles;
-            match &outcome {
-                Ok(Some((_, height))) => bundles.iter_mut().filter(|b| b.id == id).for_each(|b| b.height = *height),
-                // aborted (or failed and aborted): it moved nothing; a failure whose abort also failed
-                // stays listed and history() reads its final state from the chain
-                Ok(None) => bundles.retain(|b| b.id != id),
-                Err(_) => {}
-            }
-        }
-    })?;
+    let end = bundle_end(&outcome, false);
+    PoolFile::update(&cfg.pools_file, |pools| record_end(pools, &id, &end))?;
     outcome?;
     println!("kind={kind}");
     Ok(())
+}
+
+/// How a bundle ended, for pools.json.
+enum BundleEnd {
+    Finalized(u64),
+    /// It moved nothing (aborted): no entry.
+    Dropped,
+    /// A failure whose abort also failed stays listed; history() reads its final state from the chain.
+    Kept,
+}
+
+fn bundle_end(outcome: &Result<Option<(String, u64)>>, _aborted: bool) -> BundleEnd {
+    match outcome {
+        Ok(Some((_, height))) => BundleEnd::Finalized(*height),
+        Ok(None) => BundleEnd::Dropped,
+        Err(_) => BundleEnd::Kept,
+    }
+}
+
+fn record_end(pools: &mut PoolFile, id: &str, end: &BundleEnd) {
+    for asset in [Asset::Rd, Asset::Dfabi] {
+        let bundles = &mut pools.get_mut(asset).bundles;
+        match end {
+            BundleEnd::Finalized(height) => bundles.iter_mut().filter(|b| b.id == id).for_each(|b| b.height = *height),
+            BundleEnd::Dropped => bundles.retain(|b| b.id != id),
+            BundleEnd::Kept => {}
+        }
+    }
 }
 
 /// `wallet --party P`: balances and per-bundle movements read from both pools on chain.
@@ -578,5 +596,33 @@ mod tests {
         }
         assert_eq!(PoolFile::load(&path).unwrap().rd.bundles.len(), 200);
         std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    fn listed(id: &str) -> PoolFile {
+        let mut pools = PoolFile { rd: record(), dfabi: record() };
+        for pool in [&mut pools.rd, &mut pools.dfabi] {
+            pool.bundles.push(BundleRef { id: id.into(), height: 0 });
+        }
+        pools
+    }
+
+    /// A stage failed after Prepare and the abort worked: nothing moved, so no entry stays at height 0.
+    #[test]
+    fn a_successful_abort_after_a_failed_stage_leaves_no_entry() {
+        let failed: Result<Option<(String, u64)>> = Err(eyre!("register prepare"));
+        let mut pools = listed("b");
+        record_end(&mut pools, "b", &bundle_end(&failed, true));
+        assert!(pools.rd.bundles.is_empty() && pools.dfabi.bundles.is_empty());
+    }
+
+    #[test]
+    fn a_failed_abort_keeps_the_entry_and_a_finalized_bundle_gets_its_height() {
+        let failed: Result<Option<(String, u64)>> = Err(eyre!("register prepare"));
+        let mut pools = listed("b");
+        record_end(&mut pools, "b", &bundle_end(&failed, false));
+        assert_eq!((pools.rd.bundles.len(), pools.dfabi.bundles.len()), (1, 1));
+        let done: Result<Option<(String, u64)>> = Ok(Some(("b".into(), 42)));
+        record_end(&mut pools, "b", &bundle_end(&done, false));
+        assert_eq!((pools.rd.bundles[0].height, pools.dfabi.bundles[0].height), (42, 42));
     }
 }

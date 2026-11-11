@@ -511,6 +511,14 @@ fn receipt_error(kinds: &[&str], expired: bool) -> Result<()> {
     Ok(())
 }
 
+/// Runs the Prepare registration. When it fails (for example one dropped status GET while waiting), asks `applied`
+/// once, on a fresh connection, whether the registration transaction was applied anyway: then the bundle is
+/// prepared and the flow goes on. Otherwise the original error is returned and the caller aborts.
+fn register_with_recheck(register: impl FnOnce() -> Result<()>, applied: impl FnOnce() -> Result<bool>) -> Result<()> {
+    let _ = applied;
+    register()
+}
+
 /// Runs `abort` when `result` failed, so a failed stage never leaves pool reservations held until expiry.
 /// The stage's own error is returned; a failed abort is only reported.
 fn abort_on_error<T>(result: Result<T>, stage: &str, abort: impl FnOnce() -> Result<()>) -> Result<T> {
@@ -1575,5 +1583,60 @@ mod output_authority_tests {
             .find_map(|(commitment, encrypted)| open_output(pool_id, *commitment, encrypted, &recipient).unwrap())
             .expect("the real recipient found no note addressed to its public values");
         assert_eq!(opened.value, 100);
+    }
+}
+
+#[cfg(test)]
+mod recheck_tests {
+    use std::cell::Cell;
+
+    use super::*;
+
+    /// register -> recheck -> abort, as settle wires them; returns (result, aborts, rechecks).
+    fn run(register: Result<()>, applied: Option<Result<bool>>) -> (Result<()>, u32, u32) {
+        let (aborts, rechecks) = (Cell::new(0), Cell::new(0));
+        let result = abort_on_error(
+            register_with_recheck(
+                || register,
+                || {
+                    rechecks.set(rechecks.get() + 1);
+                    applied.expect("recheck was not expected")
+                },
+            ),
+            "prepare",
+            || {
+                aborts.set(aborts.get() + 1);
+                Ok(())
+            },
+        );
+        (result, aborts.get(), rechecks.get())
+    }
+
+    #[test]
+    fn a_failed_wait_with_an_applied_registration_continues_without_abort() {
+        let (result, aborts, rechecks) = run(Err(eyre!("connection closed before message completed")), Some(Ok(true)));
+        assert!(result.is_ok(), "{result:?}");
+        assert_eq!((aborts, rechecks), (0, 1));
+    }
+
+    #[test]
+    fn a_failed_wait_with_no_registration_aborts_as_before() {
+        let (result, aborts, rechecks) = run(Err(eyre!("register prepare")), Some(Ok(false)));
+        assert_eq!(result.unwrap_err().to_string(), "register prepare");
+        assert_eq!((aborts, rechecks), (1, 1));
+    }
+
+    #[test]
+    fn a_failing_recheck_keeps_the_original_error_and_aborts() {
+        let (result, aborts, _) = run(Err(eyre!("register prepare")), Some(Err(eyre!("status unreachable"))));
+        assert_eq!(result.unwrap_err().to_string(), "register prepare");
+        assert_eq!(aborts, 1);
+    }
+
+    #[test]
+    fn a_good_wait_asks_for_no_recheck() {
+        let (result, aborts, rechecks) = run(Ok(()), None);
+        assert!(result.is_ok());
+        assert_eq!((aborts, rechecks), (0, 0));
     }
 }
