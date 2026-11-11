@@ -290,4 +290,30 @@ dfabi = 2
             assert!(config(bad).audit_policy().is_err(), "{bad:?} must be refused");
         }
     }
+
+    #[test]
+    fn the_auditor_identity_defaults_to_bi_auditor() {
+        let cfg = config("");
+        assert_eq!(cfg.auditor.key_name, "bi-auditor");
+        assert_eq!(cfg.auditor_hybrid_path(), std::path::PathBuf::from("/k/bi-auditor.hybrid"));
+    }
+
+    #[test]
+    fn an_org_auditor_names_its_own_key_files_and_acts_as_its_own_party() {
+        let cfg = config(
+            "party = \"bank-a\"\n[auditor]\nkey_name = \"bank-a-auditor\"\nlisten = \"0.0.0.0:8090\"\nstore_dir = \"/audit-store\"\nmax_rd = 1\nmax_dfabi = 1\nparties = []\n",
+        );
+        assert_eq!(cfg.auditor.key_name, "bank-a-auditor");
+        assert_eq!(cfg.auditor_hybrid_path(), std::path::PathBuf::from("/k/bank-a-auditor.hybrid"));
+        assert_eq!(cfg.acting_torii().unwrap().as_str(), "http://bank-a:8080/");
+    }
+
+    #[test]
+    fn an_auditor_key_name_may_not_leave_the_key_dir() {
+        for bad in ["../x", "a/b", "", ".hidden"] {
+            let cfg = config(&format!("[auditor]\nkey_name = \"{bad}\"\nlisten = \"x\"\nstore_dir = \"/s\"\nmax_rd = 1\nmax_dfabi = 1\nparties = []\n"));
+            assert!(cfg.auditor_key_name().is_err(), "{bad:?} must be refused");
+        }
+        assert_eq!(config("").auditor_key_name().unwrap(), "bi-auditor");
+    }
 }
