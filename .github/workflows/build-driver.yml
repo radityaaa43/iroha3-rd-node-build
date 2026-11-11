@@ -108,6 +108,10 @@ jobs:
           tags: ${{ env.IMAGE }}:${{ env.TAG }}
           sbom: true
           provenance: mode=max
+      - name: Package visibility (ANALYST R15, no new public packages, fail closed before any digest is published)
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: ci/check-package-visibility.sh iroha3-rd-driver
       - name: Digest (pin by digest, never by tag)
         run: |
           {

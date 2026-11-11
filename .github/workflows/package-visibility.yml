@@ -1,0 +1,23 @@
+name: package-visibility
+# Read-only (ANALYST R15): the check script's own test, then the recorded visibility of both iroha3 GHCR packages.
+# Changing visibility is user-only; a change shows up here as drift until ci/package-visibility.expected records it.
+on:
+  pull_request:
+    paths: ['ci/**', '.github/workflows/package-visibility.yml', '.github/workflows/build-*.yml']
+  workflow_dispatch:
+permissions:
+  contents: read
+  packages: read
+jobs:
+  visibility:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          persist-credentials: false
+      - run: ci/test-package-visibility.sh
+      - name: Recorded visibility of the iroha3 packages
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: ci/check-package-visibility.sh iroha3-rd-node iroha3-rd-driver

@@ -64,3 +64,7 @@ jobs:
           docker run --rm --entrypoint kagami "$IMAGE" --help > /dev/null
       - name: Push
         run: docker push "$IMAGE"
+      - name: Package visibility (ANALYST R15, no new public packages)
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: ci/check-package-visibility.sh iroha3-rd-node
