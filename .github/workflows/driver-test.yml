@@ -1,0 +1,46 @@
+name: driver-test
+# Test-only check for pull requests. No build, image, login or push; read-only token.
+# The push path stays in build-driver.yml (packages: write).
+on:
+  pull_request:
+    paths: ['driver/**', '.github/workflows/driver-test.yml']
+permissions:
+  contents: read
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 345
+    env:
+      WORK: /home/runner/work/cargo-work
+      JOBS: 1
+      CPUS: 4
+      MEM: 14g
+      MEM_SWAP: 30g
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          persist-credentials: false
+      - name: Free disk and add swap
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache \
+            /usr/local/share/boost /usr/share/swift /usr/local/.ghcup /usr/local/share/powershell
+          docker system prune -af
+          sudo swapoff -a || true
+          if sudo fallocate -l 16G /swapfile.build && sudo chmod 600 /swapfile.build \
+             && sudo mkswap /swapfile.build && sudo swapon /swapfile.build; then
+            echo "swap ok"
+          else
+            echo "::warning::swap setup failed"
+          fi
+          free -g; df -h /
+      # Restore only (no save): PR runs read main's dependency cache and never write one.
+      - uses: actions/cache/restore@1bd1e32a3bdc45362d1e726936510720a7c30a57 # v4.2.0
+        with:
+          path: |
+            ${{ env.WORK }}/cargo-home
+            ${{ env.WORK }}/target
+          key: driver-071e281e-${{ hashFiles('driver/Cargo.toml') }}-${{ github.sha }}
+          restore-keys: |
+            driver-071e281e-${{ hashFiles('driver/Cargo.toml') }}-
+            driver-071e281e-
+      - run: driver/build.sh test
