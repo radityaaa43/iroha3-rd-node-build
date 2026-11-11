@@ -23,6 +23,7 @@ mod aps;
 mod auditor;
 mod config;
 mod history;
+mod mint_finality;
 mod http;
 mod pools;
 mod tree;
