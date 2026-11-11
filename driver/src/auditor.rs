@@ -169,7 +169,7 @@ pub fn run(cfg: Config) -> Result<()> {
         let result = match (method, path) {
             ("GET", "/healthz") => Ok("{}".to_owned()),
             ("GET", "/keys") => auditor.keys(),
-            ("GET", "/records") => list_records(&auditor.cfg.auditor.store_dir).and_then(|r| Ok(serde_json::to_string(&r)?)),
+            ("GET", "/records") => list_records(&auditor.cfg.auditor.store_dir).and_then(|r| records_json(&r)),
             ("GET", p) if p.starts_with("/records/") => auditor.records(&p["/records/".len()..]),
             ("POST", "/approve") => serde_json::from_str(body)
                 .map_err(Into::into)
@@ -204,7 +204,7 @@ impl Auditor {
             }
         }
         records.sort_by_key(|record| record.leg);
-        Ok(serde_json::to_string(&records)?)
+        records_json(&records)
     }
 
     fn keys(&self) -> Result<String> {
@@ -326,6 +326,36 @@ impl Auditor {
     }
 }
 
+/// What GET /records returns: the fields Lensa's adapter reads (iroha3-aps.ts AuditRecord). The stored
+/// record also holds the memo and the full plaintext; those stay on disk.
+#[derive(Serialize)]
+struct RecordView<'a> {
+    bundle_id: &'a str,
+    leg: u8,
+    verdict: &'a str,
+    payer: &'a str,
+    recipient: &'a str,
+    asset: &'a str,
+    amount: &'a str,
+}
+
+/// Body of both GET /records routes.
+fn records_json(records: &[Record]) -> Result<String> {
+    let views = records
+        .iter()
+        .map(|r| RecordView {
+            bundle_id: &r.bundle_id,
+            leg: r.leg,
+            verdict: &r.verdict,
+            payer: &r.payer,
+            recipient: &r.recipient,
+            asset: &r.asset,
+            amount: &r.amount,
+        })
+        .collect::<Vec<_>>();
+    Ok(serde_json::to_string(&views)?)
+}
+
 /// Every leg this auditor decided (BI's history across all bundles), by bundle then leg.
 /// Callers order bundles by height from the public pool index.
 fn list_records(store_dir: &Path) -> Result<Vec<Record>> {
@@ -412,6 +442,20 @@ mod tests {
         assert_eq!(got, [("aa".into(), 0), ("aa".into(), 1), ("bb".into(), 0), ("bb".into(), 1)]);
         assert!(list_records(&dir.join("missing")).unwrap().is_empty());
         std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// The HTTP routes are reachable inside the cluster: they carry only what the Lensa adapter reads
+    /// (iroha3-aps.ts AuditRecord), not the memo or the full plaintext.
+    #[test]
+    fn records_json_has_only_the_fields_the_adapter_reads() {
+        let record = Record {
+            bundle_id: "b".into(), leg: 0, verdict: "approved".into(), payer: "p".into(), recipient: "r".into(),
+            asset: "a".into(), amount: "1".into(), memo_hex: "aa".into(), plaintext_norito_hex: "bb".into(),
+        };
+        let json: serde_json::Value = serde_json::from_str(&records_json(&[record]).unwrap()).unwrap();
+        let mut keys = json[0].as_object().unwrap().keys().cloned().collect::<Vec<_>>();
+        keys.sort();
+        assert_eq!(keys, ["amount", "asset", "bundle_id", "leg", "payer", "recipient", "verdict"]);
     }
 
     #[test]
