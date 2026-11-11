@@ -17,6 +17,17 @@ pub fn request(addr: &str, method: &str, path: &str, body: &str) -> Result<(u16,
     request_with(addr, method, path, body, None, Duration::from_secs(600))
 }
 
+/// One request to an auditor/gateway target: `https://gateway...` goes over mutual TLS (needs `[tls]`), a plain `host:port` over
+/// the in-namespace HTTP/1.0 path (iroha3 S13: plain HTTP stays inside ONE namespace).
+pub fn send(tls: Option<&crate::config::TlsConfig>, target: &str, method: &str, path: &str, body: &str, connect: Option<Duration>, read: Duration) -> Result<(u16, String)> {
+    if target.starts_with("https://") {
+        let tls = tls.ok_or_else(|| eyre!("{target} needs a [tls] section in the config (client cert, key, server CA dir)"))?;
+        let url = format!("{}{}", target.trim_end_matches('/'), path);
+        return crate::tls_http::request(tls, &url, method, body, connect.unwrap_or(Duration::from_secs(10)), read);
+    }
+    request_with(target, method, path, body, connect, read)
+}
+
 /// `request` with an optional connect timeout and an explicit read (response) timeout.
 pub fn request_with(addr: &str, method: &str, path: &str, body: &str, connect: Option<Duration>, read: Duration) -> Result<(u16, String)> {
     let mut stream = match connect {
@@ -145,5 +156,14 @@ mod tests {
         BufReader::new(&client).read_to_string(&mut response).unwrap();
         server.join().unwrap();
         assert!(response.ends_with("GET /records/ab []"), "{response}");
+    }
+
+    #[test]
+    fn an_https_target_without_a_tls_section_is_refused_and_a_plain_target_does_not_need_one() {
+        let err = send(None, "https://gateway.rd-iroha3-bi.svc.cluster.local:8443", "GET", "/keys", "", None, Duration::from_secs(1)).unwrap_err();
+        assert!(format!("{err:#}").contains("[tls]"), "{err:#}");
+        // a plain host:port still takes the old path (nothing listens: connection refused, not a TLS error)
+        let err = send(None, "127.0.0.1:1", "GET", "/healthz", "", Some(Duration::from_millis(300)), Duration::from_secs(1)).unwrap_err();
+        assert!(!format!("{err:#}").contains("[tls]"));
     }
 }

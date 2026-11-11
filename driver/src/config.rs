@@ -45,9 +45,25 @@ pub struct Config {
     /// k-of-n audit policy (iroha3 PLAN S11). Absent = one auditor (`auditor_url`), one approval, the old behaviour.
     #[serde(default)]
     pub audit: Option<AuditSection>,
+    /// Mutual TLS for `https://` auditor URLs (other parties' gateways).
+    #[serde(default)]
+    pub tls: Option<TlsConfig>,
     /// Only the BI driver sets this (S18, K6): enables `mint` / `POST /mint` for RD and DFABI. Absent = refused.
     #[serde(default)]
     pub mint_enabled: bool,
+}
+
+/// `[tls]`: mutual TLS to other parties' gateways (iroha3 S13 transport A). Only used for `https://` auditor URLs.
+#[derive(Clone, Debug, Deserialize)]
+pub struct TlsConfig {
+    /// This party's client certificate and key (Secret `iroha3-client-cert`).
+    pub client_cert: PathBuf,
+    pub client_key: PathBuf,
+    /// Directory with `<party>-server-ca.pem`, the pinned server root of each gateway.
+    pub server_ca_dir: PathBuf,
+    /// Optional DNS override `host -> ip:port` (the external LB of a gateway on the other cluster; tests).
+    #[serde(default)]
+    pub resolve: BTreeMap<String, String>,
 }
 
 /// `[audit]`: the auditors that must approve and how many.
