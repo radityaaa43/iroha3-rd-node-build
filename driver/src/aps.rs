@@ -479,7 +479,35 @@ pub(crate) fn abort_bundle(cfg: &Config, client: &iroha::client::Client, manifes
     )?;
     client.submit_private_settlement_bundle_v1(&request).wrap_err("submit abort")?;
     let (outcome, _) = wait_receipt(cfg, manifest.bundle_id)?;
+    if outcome == "finalized" {
+        return Err(eyre::Report::new(FinalizedSeen("abort ended as finalized".into())));
+    }
     ensure!(outcome == "aborted", "abort ended as {outcome}");
+    Ok(())
+}
+
+/// A receipt poll failed after some node had already finalized the bundle: it can no longer be aborted.
+#[derive(Debug)]
+struct FinalizedSeen(String);
+
+impl std::fmt::Display for FinalizedSeen {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for FinalizedSeen {}
+
+/// Why a receipt poll has no single terminal answer (yet), or Ok while it should keep polling.
+fn receipt_error(kinds: &[&str], expired: bool) -> Result<()> {
+    let finalized = kinds.contains(&"finalized");
+    if finalized && kinds.contains(&"aborted") {
+        return Err(eyre::Report::new(FinalizedSeen(format!("nodes disagree: {kinds:?}"))));
+    }
+    if expired {
+        let message = format!("no terminal receipt on all nodes: {kinds:?}");
+        return Err(if finalized { eyre::Report::new(FinalizedSeen(message)) } else { eyre!(message) });
+    }
     Ok(())
 }
 
@@ -487,10 +515,17 @@ pub(crate) fn abort_bundle(cfg: &Config, client: &iroha::client::Client, manifes
 /// The stage's own error is returned; a failed abort is only reported.
 fn abort_on_error<T>(result: Result<T>, stage: &str, abort: impl FnOnce() -> Result<()>) -> Result<T> {
     if let Err(error) = &result {
-        eprintln!("{stage} failed, aborting the bundle to release pool reservations: {error:#}");
-        match abort() {
-            Ok(()) => println!("bundle aborted"),
-            Err(abort) => eprintln!("abort failed (pools stay reserved until expiry): {abort:#}"),
+        if error.downcast_ref::<FinalizedSeen>().is_some() {
+            eprintln!("{stage} failed after a node finalized the bundle, not aborting: {error:#}");
+        } else {
+            eprintln!("{stage} failed, aborting the bundle to release pool reservations: {error:#}");
+            match abort() {
+                Ok(()) => println!("bundle aborted"),
+                Err(abort) if abort.downcast_ref::<FinalizedSeen>().is_some() => {
+                    eprintln!("the bundle had finalized, nothing to release: {abort:#}");
+                }
+                Err(abort) => eprintln!("abort failed (pools stay reserved until expiry): {abort:#}"),
+            }
         }
     }
     result
@@ -564,7 +599,9 @@ pub(crate) fn wait_receipt(cfg: &Config, bundle_id: Hash) -> Result<(&'static st
             let kind = match client.client().private_settlement_bundle_receipt_v1(bundle_id) {
                 Ok(PrivateSettlementBundleReceiptResponseV1::Pending { .. }) => "pending",
                 Ok(PrivateSettlementBundleReceiptResponseV1::Finalized(receipt)) => {
-                    ensure!(!receipt.legs.is_empty(), "{party}: empty finalized receipt");
+                    if receipt.legs.is_empty() {
+                        return Err(eyre::Report::new(FinalizedSeen(format!("{party}: empty finalized receipt"))));
+                    }
                     height = receipt.finalized_height;
                     "finalized"
                 }
@@ -579,11 +616,7 @@ pub(crate) fn wait_receipt(cfg: &Config, bundle_id: Hash) -> Result<(&'static st
         if kinds.iter().all(|kind| *kind != "pending" && *kind == kinds[0]) {
             return Ok((kinds[0], height));
         }
-        ensure!(
-            !kinds.contains(&"finalized") || !kinds.contains(&"aborted"),
-            "nodes disagree: {kinds:?}"
-        );
-        ensure!(Instant::now() < deadline, "no terminal receipt on all nodes: {kinds:?}");
+        receipt_error(&kinds, Instant::now() >= deadline)?;
         thread::sleep(POLL_INTERVAL);
     }
 }
@@ -1434,5 +1467,25 @@ mod abort_tests {
         });
         assert_eq!(aborts.get(), 0);
         assert_eq!(result.unwrap(), 7);
+    }
+
+    #[test]
+    fn a_finalized_bundle_is_not_aborted() {
+        let aborts = Cell::new(0);
+        let result: Result<()> = abort_on_error(Err(eyre::Report::new(FinalizedSeen("nodes disagree".into()))), "finalization", || {
+            aborts.set(aborts.get() + 1);
+            Ok(())
+        });
+        assert_eq!(aborts.get(), 0);
+        assert_eq!(result.unwrap_err().to_string(), "nodes disagree");
+    }
+
+    #[test]
+    fn receipt_errors_say_whether_a_node_finalized() {
+        let seen = |kinds: &[&str], expired| receipt_error(kinds, expired).unwrap_err().downcast_ref::<FinalizedSeen>().is_some();
+        assert!(seen(&["finalized", "aborted"], false), "disagree");
+        assert!(seen(&["finalized", "pending"], true), "timeout with a finalized node");
+        assert!(!seen(&["pending", "pending"], true), "timeout, nothing finalized");
+        assert!(receipt_error(&["finalized", "pending"], false).is_ok(), "keep polling");
     }
 }
