@@ -29,6 +29,7 @@
 //! ds-dfabi. Each payer's origin note (funding) is issued when its leg's pool is activated.
 
 mod approval;
+mod balance;
 mod aps;
 mod auditor;
 mod client_toml;
