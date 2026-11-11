@@ -431,30 +431,26 @@ pub(crate) fn settle(
             .wrap_err("register prepare")?;
         Ok(barrier)
     })();
-    let barrier = match prepared_phase {
-        Ok(barrier) => barrier,
-        Err(error) => {
-            eprintln!("prepare failed, aborting the bundle to release pool reservations: {error:#}");
-            match abort_bundle(cfg, client, &final_manifest) {
-                Ok(()) => println!("bundle aborted"),
-                Err(abort) => eprintln!("abort failed (pools stay reserved until expiry): {abort:#}"),
-            }
-            return Err(error);
-        }
-    };
+    let abort = || abort_bundle(cfg, client, &final_manifest);
+    let barrier = abort_on_error(prepared_phase, "prepare", abort)?;
     println!("prepare registered");
-    let commits = client
-        .recover_or_commit_private_settlement_bundle_v1(&endpoints, &barrier)
-        .wrap_err("commit votes")?;
-    let request = client.build_private_settlement_finalization_request_v1(
-        &barrier,
-        &commits,
-        max_carrier_bytes(),
-    )?;
-    client
-        .submit_private_settlement_bundle_v1(&request)
-        .wrap_err("submit finalization")?;
-    let (outcome, height) = wait_receipt(cfg, final_manifest.bundle_id)?;
+    // Past this point the pools are reserved too: any failure before a terminal receipt aborts the bundle.
+    let finalization = (|| -> Result<_> {
+        let commits = client
+            .recover_or_commit_private_settlement_bundle_v1(&endpoints, &barrier)
+            .wrap_err("commit votes")?;
+        let request = client.build_private_settlement_finalization_request_v1(
+            &barrier,
+            &commits,
+            max_carrier_bytes(),
+        )?;
+        client
+            .submit_private_settlement_bundle_v1(&request)
+            .wrap_err("submit finalization")?;
+        let (outcome, height) = wait_receipt(cfg, final_manifest.bundle_id)?;
+        Ok((request, outcome, height))
+    })();
+    let (request, outcome, height) = abort_on_error(finalization, "finalization", abort)?;
     println!("settled after {:?}", started.elapsed());
     print_result(&final_manifest, governed, &request.transaction.hash().to_string(), outcome, height);
     check_outcome(outcome, options.expect)?;
@@ -489,7 +485,14 @@ pub(crate) fn abort_bundle(cfg: &Config, client: &iroha::client::Client, manifes
 
 /// Runs `abort` when `result` failed, so a failed stage never leaves pool reservations held until expiry.
 /// The stage's own error is returned; a failed abort is only reported.
-fn abort_on_error<T>(result: Result<T>, _stage: &str, _abort: impl FnOnce() -> Result<()>) -> Result<T> {
+fn abort_on_error<T>(result: Result<T>, stage: &str, abort: impl FnOnce() -> Result<()>) -> Result<T> {
+    if let Err(error) = &result {
+        eprintln!("{stage} failed, aborting the bundle to release pool reservations: {error:#}");
+        match abort() {
+            Ok(()) => println!("bundle aborted"),
+            Err(abort) => eprintln!("abort failed (pools stay reserved until expiry): {abort:#}"),
+        }
+    }
     result
 }
 
