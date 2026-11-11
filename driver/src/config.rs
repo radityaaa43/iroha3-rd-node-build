@@ -86,6 +86,10 @@ pub struct AuditorConfig {
     pub max_dfabi: u128,
     /// Wallet public keys (`ed0120...`) accepted as payer or recipient.
     pub parties: Vec<String>,
+    /// Name of this auditor's key files in `key_dir`: `<name>.seed` and `<name>.hybrid` (iroha3 S12: each org auditor holds its
+    /// OWN keys in its own namespace). Default `bi-auditor`, the single BI auditor of today.
+    #[serde(default = "default_key_name")]
+    pub key_name: String,
 }
 
 impl Default for AuditorConfig {
@@ -96,8 +100,13 @@ impl Default for AuditorConfig {
             max_rd: 1_000_000,
             max_dfabi: 10_000,
             parties: Vec::new(),
+            key_name: default_key_name(),
         }
     }
+}
+
+fn default_key_name() -> String {
+    "bi-auditor".into()
 }
 
 fn default_party() -> String {
@@ -133,6 +142,21 @@ impl Config {
         let distinct: std::collections::BTreeSet<_> = urls.iter().collect();
         eyre::ensure!(distinct.len() == urls.len(), "[audit] auditor_urls has a duplicate");
         Ok(AuditPolicy { min_approvals: k, auditor_urls: urls })
+    }
+
+    /// The auditor's key name: one plain file-name component, so it cannot point outside `key_dir`.
+    pub fn auditor_key_name(&self) -> Result<&str> {
+        let name = self.auditor.key_name.as_str();
+        eyre::ensure!(
+            !name.is_empty() && !name.starts_with('.') && name.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_'),
+            "auditor key_name {name:?} must be letters, digits, - or _"
+        );
+        Ok(name)
+    }
+
+    /// `<key_dir>/<key_name>.hybrid`.
+    pub fn auditor_hybrid_path(&self) -> PathBuf {
+        self.key_dir.join(format!("{}.hybrid", self.auditor.key_name))
     }
 
     /// Torii of the acting party (`party`).
@@ -289,5 +313,31 @@ dfabi = 2
         ] {
             assert!(config(bad).audit_policy().is_err(), "{bad:?} must be refused");
         }
+    }
+
+    #[test]
+    fn the_auditor_identity_defaults_to_bi_auditor() {
+        let cfg = config("");
+        assert_eq!(cfg.auditor.key_name, "bi-auditor");
+        assert_eq!(cfg.auditor_hybrid_path(), std::path::PathBuf::from("/k/bi-auditor.hybrid"));
+    }
+
+    #[test]
+    fn an_org_auditor_names_its_own_key_files_and_acts_as_its_own_party() {
+        let cfg = config(
+            "party = \"bank-a\"\n[auditor]\nkey_name = \"bank-a-auditor\"\nlisten = \"0.0.0.0:8090\"\nstore_dir = \"/audit-store\"\nmax_rd = 1\nmax_dfabi = 1\nparties = []\n",
+        );
+        assert_eq!(cfg.auditor.key_name, "bank-a-auditor");
+        assert_eq!(cfg.auditor_hybrid_path(), std::path::PathBuf::from("/k/bank-a-auditor.hybrid"));
+        assert_eq!(cfg.acting_torii().unwrap().as_str(), "http://bank-a:8080/");
+    }
+
+    #[test]
+    fn an_auditor_key_name_may_not_leave_the_key_dir() {
+        for bad in ["../x", "a/b", "", ".hidden"] {
+            let cfg = config(&format!("[auditor]\nkey_name = \"{bad}\"\nlisten = \"x\"\nstore_dir = \"/s\"\nmax_rd = 1\nmax_dfabi = 1\nparties = []\n"));
+            assert!(cfg.auditor_key_name().is_err(), "{bad:?} must be refused");
+        }
+        assert_eq!(config("").auditor_key_name().unwrap(), "bi-auditor");
     }
 }
