@@ -36,7 +36,7 @@ fn load_or_create_seed(path: &Path) -> Result<Zeroizing<[u8; 32]>> {
         Ok(mut file) => {
             let mut seed = Zeroizing::new([0u8; 32]);
             while seed.iter().all(|b| *b == 0) {
-                *seed = rand::random();
+                rand::fill(&mut seed[..]); // in place: no un-zeroized temporary array on the stack
             }
             file.write_all(&*seed)?;
             Ok(seed)
