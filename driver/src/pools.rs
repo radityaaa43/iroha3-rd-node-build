@@ -459,7 +459,7 @@ fn item_json(asset: Asset, bundle: &BundleRef, received: u128, paid: u128) -> Op
     (amount > 0).then(|| {
         serde_json::json!({
             "bundle_id": bundle.id, "height": bundle.height, "asset": asset.name(),
-            "direction": direction, "amount": amount.to_string(),
+            "direction": direction, "amount": amount.to_string(), "fee": fee.to_string(),
         })
     })
 }
