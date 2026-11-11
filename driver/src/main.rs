@@ -11,6 +11,12 @@
 //!   rd-dfabi pay <config> --asset rd|dfabi --from P --to Q --amount N  private payment in the shared pools
 //!   rd-dfabi dvp-shared <config> --buyer P --seller P --rd N --dfabi N   DvP in the shared pools
 //!   rd-dfabi wallet <config> --party P   balances and movements from the chain (wallet_json=)
+//!   rd-dfabi settle-grant <config> --to <public-key> --give <asset>:<n> --take <asset>:<n> --intent <64-hex>
+//!            D-native DvP (iroha3 S17): grant CanExecuteSettlement from the config's OWN account (its client.toml key)
+//!            to <public-key>, bound to the exact DvP (own --give leaves me, --take arrives at me)
+//!   rd-dfabi dvp-native <config> --counterparty <public-key> --give <asset>:<n> --take <asset>:<n> --intent <64-hex>
+//!            submit the DvpIsi (two legs, AllOrNothing, settlement id dvp_<intent>) from the config's OWN account;
+//!            prints tx_hash and status. The counterparty must have run settle-grant with the mirrored terms first.
 //!   rd-dfabi abort-bundle <config> --bundle <hex>  release the pool reservations of a stuck bundle
 //!   rd-dfabi pool-history <config> --asset rd|dfabi  rebuilt pool head (gate G3)
 //!   rd-dfabi dvp <config> --buyer P --seller P --rd N --dfabi N
@@ -22,6 +28,7 @@
 mod aps;
 mod auditor;
 mod config;
+mod dvp_native;
 mod history;
 mod mint_finality;
 mod http;
@@ -119,6 +126,14 @@ fn main() -> Result<()> {
                 flags.number("dfabi")?,
                 &Options { expect: Expect::Finalized, replay: false },
             )
+        }
+        ["settle-grant", config, rest @ ..] => {
+            let flags = flags(rest)?;
+            dvp_native::settle_grant(&Config::load(Path::new(config))?, flags.get("to")?, flags.get("give")?, flags.get("take")?, flags.get("intent")?)
+        }
+        ["dvp-native", config, rest @ ..] => {
+            let flags = flags(rest)?;
+            dvp_native::dvp_native(&Config::load(Path::new(config))?, flags.get("counterparty")?, flags.get("give")?, flags.get("take")?, flags.get("intent")?)
         }
         ["abort-bundle", config, "--bundle", bundle] => pools::abort_bundle(&Config::load(Path::new(config))?, bundle),
         ["wallet", config, "--party", party] => pools::wallet(&Config::load(Path::new(config))?, party),
