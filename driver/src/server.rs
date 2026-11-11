@@ -31,8 +31,28 @@ pub trait Submitter {
 
 /// Answer one request: `(HTTP status, JSON body)`. Pure apart from the injected submitter.
 pub fn route(method: &str, path: &str, body: &str, submitter: &dyn Submitter) -> (u16, String) {
-    let _ = (method, path, body, submitter);
-    (500, r#"{"error":"not implemented"}"#.to_owned())
+    let reply = |status: u16, value: serde_json::Value| (status, value.to_string());
+    let error = |status: u16, message: String| reply(status, serde_json::json!({ "error": message }));
+    match (method, path) {
+        ("GET", "/healthz") => reply(200, serde_json::json!({})),
+        (_, "/healthz") => error(405, "method not allowed".to_owned()),
+        ("POST", "/settle-grant" | "/dvp-native") => {
+            let terms: Terms = match serde_json::from_str(body) {
+                Ok(terms) => terms,
+                Err(e) => return error(400, format!("bad request body: {e}")),
+            };
+            if let Err(e) = dvp_native::check_terms(&terms.counterparty, &terms.give, &terms.take, &terms.intent) {
+                return error(400, format!("{e:#}"));
+            }
+            let result = if path == "/settle-grant" { submitter.grant(&terms) } else { submitter.dvp(&terms) };
+            match result {
+                Ok(hash) => reply(200, serde_json::json!({ "tx_hash": hash, "status": "Applied" })),
+                Err(e) => error(502, format!("{e:#}")),
+            }
+        }
+        (_, "/settle-grant" | "/dvp-native") => error(405, "method not allowed".to_owned()),
+        _ => error(404, "not found".to_owned()),
+    }
 }
 
 struct Real {
