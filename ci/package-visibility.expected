@@ -1,0 +1,5 @@
+# Recorded GHCR package visibility (ANALYST R15). A package not listed here MUST be private: no new public packages.
+# The two below are public today (read 2026-11-12 with `gh api /users/radityaaa43/packages/container/<name> -q .visibility`).
+# Changing visibility is user-only; after the user's flip, update this file in the same PR that records it.
+iroha3-rd-node public
+iroha3-rd-driver public
