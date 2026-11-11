@@ -7,7 +7,12 @@
 //! The seed is raw 32 bytes (the format a launcher hands the node, irohad/src/taira_runtime_signer.rs:434-442), mode 0600,
 //! never printed.
 
-use std::{io::Write, os::unix::fs::OpenOptionsExt, path::Path, str::FromStr};
+use std::{
+    io::{Read, Write},
+    os::unix::fs::{OpenOptionsExt, PermissionsExt},
+    path::Path,
+    str::FromStr,
+};
 
 use eyre::{Result, bail, eyre};
 use iroha::data_model::isi::kagemusha_v1::{
@@ -21,23 +26,74 @@ use iroha_crypto::{Algorithm, PublicKey};
 use iroha_model_base::peer::PeerId;
 use zeroize::Zeroizing;
 
+fn seed_path(dir: &Path, name: &str) -> std::path::PathBuf {
+    dir.join(format!("{name}.mint-finality.seed"))
+}
+
+/// Existing seed (exactly 32 raw bytes, mode 0600, non-zero) or a new one made with `create_new`: never overwritten.
+fn load_or_create_seed(path: &Path) -> Result<Zeroizing<[u8; 32]>> {
+    match std::fs::OpenOptions::new().write(true).create_new(true).mode(0o600).open(path) {
+        Ok(mut file) => {
+            let mut seed = Zeroizing::new([0u8; 32]);
+            while seed.iter().all(|b| *b == 0) {
+                *seed = rand::random();
+            }
+            file.write_all(&*seed)?;
+            Ok(seed)
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+            let meta = std::fs::metadata(path)?;
+            if meta.len() != 32 || meta.permissions().mode() & 0o777 != 0o600 {
+                bail!("{} must be exactly 32 raw bytes with mode 600", path.display());
+            }
+            let mut seed = Zeroizing::new([0u8; 32]);
+            std::fs::File::open(path)?.read_exact(&mut *seed)?;
+            if seed.iter().all(|b| *b == 0) {
+                bail!("{} holds an all-zero seed", path.display());
+            }
+            Ok(seed)
+        }
+        Err(error) => Err(error.into()),
+    }
+}
+
 /// Create `<dir>/<name>.mint-finality.seed` if absent (32 random non-zero bytes, mode 0600), derive the public triple
 /// for `peer` (a BLS public key) at `epoch`, and return it as JSON. Never returns or prints the seed.
 pub fn mint_finality(dir: &Path, name: &str, peer: &str, epoch: u64) -> Result<String> {
-    let _ = (dir, name, peer, epoch, KAGEMUSHA_CHAIN_VERSION_V1);
-    bail!("mint_finality: not implemented")
+    let key = PublicKey::from_str(peer).map_err(|error| eyre!("peer public key: {error}"))?;
+    if key.algorithm() != Algorithm::BlsNormal {
+        bail!("the peer key must be a BLS (bls_normal) public key, got {}", key.algorithm());
+    }
+    let seed = load_or_create_seed(&seed_path(dir, name))?;
+    let keys = derive_kagemusha_mint_finality_validator_keys_v1(&seed, epoch, PeerId::new(key))
+        .map_err(|error| eyre!("derive mint-finality keys: {error}"))?;
+    Ok(norito::json::to_json_pretty(&keys)?)
 }
 
 /// Build the parameters file from the public triples of all peers: sorted by PeerId, epoch 0, no next epoch, validated.
 pub fn roster(out: &Path, triples: &[&Path]) -> Result<()> {
-    let _ = (out, triples);
-    bail!("roster: not implemented")
+    let mut validators = triples
+        .iter()
+        .map(|path| {
+            let bytes = std::fs::read(path).map_err(|error| eyre!("read {}: {error}", path.display()))?;
+            norito::json::from_slice::<KagemushaMintFinalityValidatorKeysV1>(&bytes)
+                .map_err(|error| eyre!("{} is not a public triple: {error}", path.display()))
+        })
+        .collect::<Result<Vec<_>>>()?;
+    validators.sort_by(|a, b| a.validator.cmp(&b.validator));
+    let parameters = KagemushaMintFinalityGenesisParametersV1 {
+        epoch_roster: KagemushaMintFinalityEpochRosterTemplateV1 { version: KAGEMUSHA_CHAIN_VERSION_V1, epoch: 0, validators },
+        next_epoch_roster: None,
+    };
+    parameters.validate().map_err(|error| eyre!("invalid mint-finality roster: {error}"))?;
+    validate_kagemusha_mint_finality_genesis_parameter_keys_v1(&parameters)
+        .map_err(|error| eyre!("invalid mint-finality curve keys: {error}"))?;
+    std::fs::write(out, norito::json::to_json_pretty(&parameters)?)?;
+    Ok(())
 }
 
 #[cfg(test)]
 mod tests {
-    use std::os::unix::fs::PermissionsExt;
-
     use iroha_crypto::KeyPair;
 
     use super::*;
