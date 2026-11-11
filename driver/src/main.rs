@@ -17,6 +17,7 @@
 //!   rd-dfabi dvp-native <config> --counterparty <public-key> --give <asset>:<n> --take <asset>:<n> --intent <64-hex>
 //!            submit the DvpIsi (two legs, AllOrNothing, settlement id dvp_<intent>) from the config's OWN account;
 //!            prints tx_hash and status. The counterparty must have run settle-grant with the mirrored terms first.
+//!   rd-dfabi server <config> --listen <addr>   per-bank HTTP mode (docs/server-mode.md): GET /healthz, POST /settle-grant, POST /dvp-native
 //!   rd-dfabi abort-bundle <config> --bundle <hex>  release the pool reservations of a stuck bundle
 //!   rd-dfabi pool-history <config> --asset rd|dfabi  rebuilt pool head (gate G3)
 //!   rd-dfabi dvp <config> --buyer P --seller P --rd N --dfabi N
@@ -31,6 +32,7 @@ mod config;
 mod dvp_native;
 mod history;
 mod mint_finality;
+mod server;
 mod http;
 mod pools;
 mod tree;
@@ -129,12 +131,17 @@ fn main() -> Result<()> {
         }
         ["settle-grant", config, rest @ ..] => {
             let flags = flags(rest)?;
-            dvp_native::settle_grant(&Config::load(Path::new(config))?, flags.get("to")?, flags.get("give")?, flags.get("take")?, flags.get("intent")?)
+            let hash = dvp_native::settle_grant(&Config::load(Path::new(config))?, flags.get("to")?, flags.get("give")?, flags.get("take")?, flags.get("intent")?)?;
+            println!("tx_hash={hash} status=Applied");
+            Ok(())
         }
         ["dvp-native", config, rest @ ..] => {
             let flags = flags(rest)?;
-            dvp_native::dvp_native(&Config::load(Path::new(config))?, flags.get("counterparty")?, flags.get("give")?, flags.get("take")?, flags.get("intent")?)
+            let hash = dvp_native::dvp_native(&Config::load(Path::new(config))?, flags.get("counterparty")?, flags.get("give")?, flags.get("take")?, flags.get("intent")?)?;
+            println!("tx_hash={hash} status=Applied");
+            Ok(())
         }
+        ["server", config, "--listen", addr] => server::run(Config::load(Path::new(config))?, addr),
         ["abort-bundle", config, "--bundle", bundle] => pools::abort_bundle(&Config::load(Path::new(config))?, bundle),
         ["wallet", config, "--party", party] => pools::wallet(&Config::load(Path::new(config))?, party),
         _ => bail!("usage: see the header of apps/rd-dfabi/src/main.rs"),
