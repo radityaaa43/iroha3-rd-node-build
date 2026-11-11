@@ -443,24 +443,25 @@ pub fn wallet(cfg: &Config, party: &str) -> Result<()> {
                 .map(|n| n.opening.value)
                 .sum();
             let paid: u128 = spent.iter().filter(|(_, by)| *by == bundle.id).map(|(n, _)| n.opening.value).sum();
-            // The payer of the RD leg (leg 0) also reimbursed the sponsor 1.
-            let fee = if asset == Asset::Rd && paid > 0 { SPONSOR_REIMBURSEMENT } else { 0 };
-            let (direction, amount) = if paid > received {
-                ("out", paid - received - fee)
-            } else {
-                ("in", received - paid)
-            };
-            if amount > 0 {
-                items.push(serde_json::json!({
-                    "bundle_id": bundle.id, "height": bundle.height, "asset": asset.name(),
-                    "direction": direction, "amount": amount.to_string(),
-                }));
-            }
+            items.extend(item_json(asset, bundle, received, paid));
         }
     }
     items.sort_by_key(|i| std::cmp::Reverse(i["height"].as_u64()));
     println!("wallet_json={}", serde_json::json!({ "party": party, "balances": balances, "items": items }));
     Ok(())
+}
+
+/// One wallet row for a bundle, or None when nothing visible moved. The payer of the RD leg (leg 0) also
+/// reimbursed the sponsor 1 RD: `amount` is the leg without it.
+fn item_json(asset: Asset, bundle: &BundleRef, received: u128, paid: u128) -> Option<serde_json::Value> {
+    let fee = if asset == Asset::Rd && paid > 0 { SPONSOR_REIMBURSEMENT } else { 0 };
+    let (direction, amount) = if paid > received { ("out", paid - received - fee) } else { ("in", received - paid) };
+    (amount > 0).then(|| {
+        serde_json::json!({
+            "bundle_id": bundle.id, "height": bundle.height, "asset": asset.name(),
+            "direction": direction, "amount": amount.to_string(),
+        })
+    })
 }
 
 /// Debug aid for gate G3: rebuild one pool and print its head (no amounts).
@@ -537,6 +538,22 @@ mod tests {
 
     fn record() -> PoolRecord {
         PoolRecord { pool_id: String::new(), route: String::new(), policy: String::new(), governance: String::new(), origin: vec![], bundles: vec![] }
+    }
+
+    #[test]
+    fn wallet_item_carries_sponsor_fee() {
+        let bundle = BundleRef { id: "b".into(), height: 7 };
+        // RD payer: spent a note of 2000, got 999 change back, paid 1000 + 1 reimbursement.
+        let rd_out = item_json(Asset::Rd, &bundle, 999, 2000).unwrap();
+        assert_eq!((rd_out["direction"].as_str(), rd_out["amount"].as_str(), rd_out["fee"].as_str()), (Some("out"), Some("1000"), Some("1")));
+        // RD recipient pays no fee.
+        let rd_in = item_json(Asset::Rd, &bundle, 1000, 0).unwrap();
+        assert_eq!((rd_in["direction"].as_str(), rd_in["fee"].as_str()), (Some("in"), Some("0")));
+        // Only leg 0 (RD) carries the reimbursement.
+        let dfabi_out = item_json(Asset::Dfabi, &bundle, 49, 50).unwrap();
+        assert_eq!((dfabi_out["amount"].as_str(), dfabi_out["fee"].as_str()), (Some("1"), Some("0")));
+        // BI's companion RD leg (BI -> BI 1): only the fee left, so no row.
+        assert!(item_json(Asset::Rd, &bundle, 1999, 2000).is_none());
     }
 
     /// Lensa runs several driver containers on one pools.json; each finishing bundle must keep the others' entries.
