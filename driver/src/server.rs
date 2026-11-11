@@ -14,6 +14,7 @@ use crate::{
     dvp_native, http,
     mint::{self, MintPolicy, MintTerms},
     tx_detail,
+    balance,
 };
 
 /// Public terms of one D-native DvP, in the calling bank's own give/take view (see `dvp_native.rs`).
@@ -37,6 +38,8 @@ pub trait Submitter {
     fn mint(&self, terms: &MintTerms) -> Result<String>;
     /// Signed transaction-details query with the own key (`tx_detail::fetch`); `hash` is already validated.
     fn tx(&self, hash: &str) -> Result<String>;
+    /// Signed query of the own account's balance of ONE asset (`balance::fetch`); `asset` is already validated.
+    fn balance(&self, asset: &str) -> Result<String>;
 }
 
 /// Answer one request: `(HTTP status, JSON body)`. Pure apart from the injected submitter.
@@ -87,6 +90,14 @@ pub fn route(method: &str, path: &str, body: &str, submitter: &dyn Submitter) ->
             },
         },
         (_, p) if p.starts_with("/tx/") => error(405, "method not allowed".to_owned()),
+        ("GET", p) if p == "/balance" || p.starts_with("/balance?") => match balance::asset_param(p).and_then(|a| balance::check_asset(&a).map(|_| a)) {
+            Err(e) => error(400, format!("{e:#}")),
+            Ok(asset) => match submitter.balance(&asset) {
+                Ok(body) => (200, body),
+                Err(e) => error(502, format!("{e:#}")),
+            },
+        },
+        (_, p) if p == "/balance" || p.starts_with("/balance?") => error(405, "method not allowed".to_owned()),
         _ => error(404, "not found".to_owned()),
     }
 }
@@ -120,6 +131,11 @@ impl Submitter for Real {
     fn tx(&self, hash: &str) -> Result<String> {
         let cfg = self.cfg.lock().unwrap_or_else(|p| p.into_inner());
         tx_detail::fetch(&cfg, hash)
+    }
+
+    fn balance(&self, asset: &str) -> Result<String> {
+        let cfg = self.cfg.lock().unwrap_or_else(|p| p.into_inner());
+        balance::fetch(&cfg, asset)
     }
 }
 

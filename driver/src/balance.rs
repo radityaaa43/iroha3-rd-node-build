@@ -1,3 +1,53 @@
+//! `GET /balance?asset=<Base58 id>`: the balance of the driver's OWN account for one asset (iroha3 S18 / ANALYST Q16 pattern, same class as
+//! `GET /tx`). ONE signed `FindAssetById` query (iroha@071e281e crates/iroha/src/query.rs `query_single`) with the config's own client.toml
+//! key for its OWN account: the request can name only the asset, never an account; nothing is submitted, no key material is read or
+//! returned, nothing is added to what the query returns, and an upstream refusal (e.g. a restricted dataspace the key may not read) is
+//! returned unchanged as a 502. The keyless Torii routes show NO genesis asset state (empty lists), so this signed read is the way to
+//! see a balance. On the BI driver the same query is BI's own view; a read-all view stays behind BI's gateway OPA (BI-lens caller only).
+
+use std::str::FromStr;
+
+use eyre::{Result, ensure, eyre};
+use iroha::data_model::{
+    account::AccountId,
+    asset::{AssetDefinitionId, AssetId},
+    query::asset::prelude::FindAssetById,
+};
+
+use crate::config::Config;
+
+/// A Base58 asset definition id (no alias, no separator): letters and digits only, and it must parse.
+pub fn check_asset(text: &str) -> Result<AssetDefinitionId> {
+    ensure!(!text.is_empty() && text.bytes().all(|b| b.is_ascii_alphanumeric()), "asset must be a Base58 asset definition id");
+    AssetDefinitionId::from_str(text).map_err(|e| eyre!("asset {text:?}: {e}"))
+}
+
+/// The value of the one allowed query parameter `asset` from a request path like `/balance?asset=<id>`.
+pub fn asset_param(path: &str) -> Result<String> {
+    let (_, query) = path.split_once('?').ok_or_else(|| eyre!("missing ?asset=<Base58 asset id>"))?;
+    let pairs: Vec<&str> = query.split('&').collect();
+    ensure!(pairs.len() == 1, "exactly one query parameter, asset, is allowed");
+    let (key, value) = pairs[0].split_once('=').ok_or_else(|| eyre!("missing ?asset=<Base58 asset id>"))?;
+    ensure!(key == "asset" && !value.is_empty(), "the only query parameter is asset=<Base58 asset id>");
+    Ok(value.to_owned())
+}
+
+/// `{"account": <own account>, "asset": <id>, "balance": <the asset as Torii returned it>}`.
+pub fn wrap(account: &str, asset: &str, asset_json: &str) -> String {
+    format!(r#"{{"account":"{account}","asset":"{asset}","balance":{asset_json}}}"#)
+}
+
+/// Run the signed query with the config's own account and return the JSON body of the 200 answer.
+pub fn fetch(cfg: &Config, asset: &str) -> Result<String> {
+    let definition = check_asset(asset)?;
+    let config = iroha::config::Config::load_file(&cfg.client_toml).map_err(|e| eyre!("load {}: {e:?}", cfg.client_toml.display()))?;
+    let account = AccountId::new(config.key_pair.public_key().clone());
+    let client = iroha::client::Client::builder(config).build()?;
+    let found = client.query_single(FindAssetById::new(AssetId::new(definition, account.clone()))).map_err(|e| eyre!("{e}"))?;
+    let json = norito::json::to_json(&found).map_err(|e| eyre!("encode asset: {e}"))?;
+    Ok(wrap(&account.to_string(), asset, &json))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
