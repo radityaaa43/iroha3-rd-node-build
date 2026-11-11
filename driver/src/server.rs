@@ -130,6 +130,9 @@ mod tests {
     struct Fake {
         calls: RefCell<Vec<(&'static str, Terms)>>,
         mints: RefCell<Vec<MintTerms>>,
+        txs: RefCell<Vec<String>>,
+        /// `Some(message)` = the upstream refuses a transaction-details query with this message.
+        tx_refusal: Option<String>,
         /// `Some` = this is a BI driver with mint enabled.
         policy: Option<MintPolicy>,
         fail: bool,
@@ -153,6 +156,14 @@ mod tests {
         fn mint(&self, terms: &MintTerms) -> Result<String> {
             self.mints.borrow_mut().push(terms.clone());
             if self.fail { Err(eyre::eyre!("chain refused")) } else { Ok("txh-mint".to_owned()) }
+        }
+
+        fn tx(&self, hash: &str) -> Result<String> {
+            self.txs.borrow_mut().push(hash.to_owned());
+            match &self.tx_refusal {
+                Some(message) => Err(eyre::eyre!("{message}")),
+                None => Ok(format!(r#"{{"hash":"{hash}","transaction":{{"result":"Ok"}}}}"#)),
+            }
         }
     }
 
@@ -319,5 +330,48 @@ mod tests {
         let (status, response) = route("POST", "/mint", &mint_body("5"), &bi);
         assert_eq!(status, 502);
         assert_eq!(json(&response), serde_json::json!({"error": "chain refused"}));
+    }
+
+    #[test]
+    fn tx_detail_is_a_get_of_a_valid_hash_and_returns_exactly_what_the_query_returned() {
+        let fake = Fake::default();
+        let hash = "ab".repeat(32);
+        let (status, response) = route("GET", &format!("/tx/{hash}"), "", &fake);
+        assert_eq!((status, json(&response)), (200, serde_json::json!({"hash": hash, "transaction": {"result": "Ok"}})));
+        assert_eq!(*fake.txs.borrow(), vec![hash.clone()]);
+        // an upper-case hash is lowered before the query
+        let (status, _) = route("GET", &format!("/tx/{}", hash.to_uppercase()), "", &fake);
+        assert_eq!(status, 200);
+        assert_eq!(fake.txs.borrow()[1], hash);
+    }
+
+    #[test]
+    fn tx_detail_bad_hashes_are_400_and_never_query() {
+        let fake = Fake::default();
+        for bad in ["/tx/", "/tx/abcd", "/tx/zz", &format!("/tx/{}", "ab".repeat(33)), &format!("/tx/../{}", "ab".repeat(30)), &format!("/tx/{}?x=1", "ab".repeat(32))] {
+            let (status, response) = route("GET", bad, "", &fake);
+            assert_eq!(status, 400, "{bad}");
+            assert!(json(&response)["error"].is_string());
+        }
+        assert!(fake.txs.borrow().is_empty());
+    }
+
+    #[test]
+    fn tx_detail_other_methods_are_405_and_never_query() {
+        let fake = Fake::default();
+        let path = format!("/tx/{}", "ab".repeat(32));
+        for method in ["POST", "PUT", "DELETE"] {
+            assert_eq!(route(method, &path, "{}", &fake).0, 405, "{method}");
+        }
+        assert!(fake.txs.borrow().is_empty());
+    }
+
+    #[test]
+    fn an_upstream_permission_error_is_passed_through_not_turned_into_a_filtered_success() {
+        let message = "query_validation_failed: account is not permitted to read this transaction";
+        let fake = Fake { tx_refusal: Some(message.to_owned()), ..Fake::default() };
+        let (status, response) = route("GET", &format!("/tx/{}", "ab".repeat(32)), "", &fake);
+        assert_eq!(status, 502);
+        assert_eq!(json(&response), serde_json::json!({"error": message}));
     }
 }
