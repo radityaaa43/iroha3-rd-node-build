@@ -93,6 +93,15 @@ pub fn build_grant(grantor: &AccountId, to: &AccountId, give: &Side, take: &Side
     Ok(Grant::account_permission(build_consent(grantor, to, give, take, intent)?, to.clone()).into())
 }
 
+/// Validate the public terms of a request without any key or chain access (the server answers 400 on failure).
+pub fn check_terms(counterparty: &str, give: &str, take: &str, intent: &str) -> Result<()> {
+    parse_account(counterparty)?;
+    let (give, take) = (Side::parse(give)?, Side::parse(take)?);
+    parse_intent(intent)?;
+    ensure!(give.asset != take.asset, "the two legs must use different assets");
+    Ok(())
+}
+
 /// Client of the config's OWN account (its client.toml: own key, own Torii) and that account id.
 fn own_client(cfg: &Config) -> Result<(Client, AccountId)> {
     let config = iroha::config::Config::load_file(&cfg.client_toml)
@@ -101,27 +110,26 @@ fn own_client(cfg: &Config) -> Result<(Client, AccountId)> {
     Ok((Client::new(config)?, own))
 }
 
-/// Sign with the own key, pay the bounded fee like every other command, wait for `Applied`; print hash and status.
-fn submit(cfg: &Config, client: &Client, instruction: InstructionBox) -> Result<()> {
+/// Sign with the own key, pay the bounded fee like every other command, wait for `Applied`; return the transaction hash.
+fn submit(cfg: &Config, client: &Client, instruction: InstructionBox) -> Result<String> {
     let account = client.account_client();
     let transaction = account
         .prepare_transaction(AccountTransactionDraft::new(vec![instruction], bounded_fee(cfg)?, Metadata::default()))
         .and_then(|payload| account.sign_transaction(payload))
         .wrap_err("build transaction")?;
     let hash = client.submit_transaction_and_wait(&transaction).wrap_err("submit transaction")?;
-    println!("tx_hash={hash} status=Applied");
-    Ok(())
+    Ok(hash.to_string())
 }
 
 /// `rd-dfabi settle-grant`: grant `CanExecuteSettlement` from the config's own account to `to`.
-pub fn settle_grant(cfg: &Config, to: &str, give: &str, take: &str, intent: &str) -> Result<()> {
+pub fn settle_grant(cfg: &Config, to: &str, give: &str, take: &str, intent: &str) -> Result<String> {
     let (client, own) = own_client(cfg)?;
     let grant = build_grant(&own, &parse_account(to)?, &Side::parse(give)?, &Side::parse(take)?, &parse_intent(intent)?)?;
     submit(cfg, &client, grant)
 }
 
 /// `rd-dfabi dvp-native`: submit the `DvpIsi` from the config's own account.
-pub fn dvp_native(cfg: &Config, counterparty: &str, give: &str, take: &str, intent: &str) -> Result<()> {
+pub fn dvp_native(cfg: &Config, counterparty: &str, give: &str, take: &str, intent: &str) -> Result<String> {
     let (client, own) = own_client(cfg)?;
     let dvp = build_dvp(&own, &parse_account(counterparty)?, &Side::parse(give)?, &Side::parse(take)?, &parse_intent(intent)?)?;
     submit(cfg, &client, dvp.into())
