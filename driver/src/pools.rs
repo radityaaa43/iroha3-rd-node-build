@@ -250,11 +250,6 @@ fn asset_id(cfg: &Config, asset: Asset) -> &str {
     }
 }
 
-fn auditor_keys(cfg: &Config) -> Result<(PublicKey, PrivateSettlementHybridPublicKeyV1)> {
-    let keys: Keys = auditor_call(cfg, "GET", "/keys", "")?;
-    Ok((keys.signing.parse()?, dec(&keys.encryption)?))
-}
-
 fn route(client: &Client, lane: u32) -> Result<PrivateSettlementRouteV1> {
     let status = client.client().get_lane_lifecycle_status()?;
     status.validate().wrap_err("lane lifecycle status")?;
@@ -277,14 +272,14 @@ pub fn pool_init(cfg: &Config, rd_reserve: u128, dfabi_reserve: u128) -> Result<
         caps.protocols.iter().any(|row| row.protocol_id == PrivacyProtocolIdV1::IrohaIvmPrivateNoteStarkV1 && row.activation.is_some()),
         "IVM private-note capability is not activated"
     );
-    let (auditor_key, auditor_encryption) = auditor_keys(cfg)?;
+    let (auditors, min_approvals) = crate::aps::auditors_from_config(cfg)?;
     let bi = cfg.note_keys("bi")?;
     let fee = bounded_fee(cfg)?;
     let account = sponsor.account_client();
     let mut records = Vec::new();
     for (asset, reserve) in [(Asset::Rd, rd_reserve), (Asset::Dfabi, dfabi_reserve)] {
         let route = route(&sponsor, lane_of(cfg, asset))?;
-        let governed = govern_until(route, asset_id(cfg, asset).parse()?, caps.committed_height, None, &auditor_key, &auditor_encryption)?;
+        let governed = crate::aps::govern_with(route, asset_id(cfg, asset).parse()?, caps.committed_height, None, &auditors, min_approvals)?;
         let funding = funding_with_secret(reserve, bi.spend)?;
         let activation = ActivatePrivateSettlementPoolV1::from_restricted(&governed.governance, funding.activation_commitments().to_vec())?;
         let tx = account

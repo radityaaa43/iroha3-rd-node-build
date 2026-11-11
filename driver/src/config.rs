@@ -42,9 +42,27 @@ pub struct Config {
     pub lanes: Lanes,
     #[serde(default)]
     pub auditor: AuditorConfig,
+    /// k-of-n audit policy (iroha3 PLAN S11). Absent = one auditor (`auditor_url`), one approval, the old behaviour.
+    #[serde(default)]
+    pub audit: Option<AuditSection>,
     /// Only the BI driver sets this (S18, K6): enables `mint` / `POST /mint` for RD and DFABI. Absent = refused.
     #[serde(default)]
     pub mint_enabled: bool,
+}
+
+/// `[audit]`: the auditors that must approve and how many.
+#[derive(Debug, Deserialize)]
+pub struct AuditSection {
+    pub min_approvals: Option<usize>,
+    /// host:port of each auditor (BI, org A, org B), the order of the policy's auditor list.
+    pub auditor_urls: Option<Vec<String>>,
+}
+
+/// The validated policy: 1 <= k <= n, distinct auditors.
+#[derive(Debug, PartialEq, Eq)]
+pub struct AuditPolicy {
+    pub min_approvals: usize,
+    pub auditor_urls: Vec<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -101,6 +119,20 @@ impl Config {
 
     pub fn torii(&self, party: &str) -> Result<&Url> {
         self.torii.get(party).ok_or_else(|| eyre!("no torii for {party}"))
+    }
+
+    /// The audit policy from `[audit]`, or the single `auditor_url` with one approval when the section is absent.
+    pub fn audit_policy(&self) -> Result<AuditPolicy> {
+        let Some(section) = &self.audit else {
+            return Ok(AuditPolicy { min_approvals: 1, auditor_urls: vec![self.auditor_url.clone()] });
+        };
+        let urls = section.auditor_urls.clone().ok_or_else(|| eyre!("[audit] needs auditor_urls"))?;
+        let k = section.min_approvals.ok_or_else(|| eyre!("[audit] needs min_approvals"))?;
+        eyre::ensure!(!urls.is_empty(), "[audit] auditor_urls is empty");
+        eyre::ensure!((1..=urls.len()).contains(&k), "[audit] min_approvals {k} must be between 1 and the {} auditors", urls.len());
+        let distinct: std::collections::BTreeSet<_> = urls.iter().collect();
+        eyre::ensure!(distinct.len() == urls.len(), "[audit] auditor_urls has a duplicate");
+        Ok(AuditPolicy { min_approvals: k, auditor_urls: urls })
     }
 
     /// Torii of the acting party (`party`).

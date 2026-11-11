@@ -244,9 +244,7 @@ pub fn run_dvp(cfg: &Config, legs: Vec<Leg>, options: &Options) -> Result<()> {
         })
         .collect::<Result<Vec<_>>>()?;
 
-    let keys: Keys = auditor_call(cfg, "GET", "/keys", "")?;
-    let auditor_key: PublicKey = keys.signing.parse()?;
-    let auditor_encryption: PrivateSettlementHybridPublicKeyV1 = dec(&keys.encryption)?;
+    let (auditors, min_approvals) = auditors_from_config(cfg)?;
 
     // Pools: policy and governance are active from the height observed now; activation
     // itself commits a few blocks later and becomes the authority context.
@@ -256,7 +254,7 @@ pub fn run_dvp(cfg: &Config, legs: Vec<Leg>, options: &Options) -> Result<()> {
         .iter()
         .zip(&legs)
         .map(|(route, leg)| {
-            govern(*route, leg.asset.clone(), height, expiry_height, &auditor_key, &auditor_encryption)
+            govern_with(*route, leg.asset.clone(), height, Some(expiry_height + 1), &auditors, min_approvals)
         })
         .collect::<Result<Vec<_>>>()?;
     let fundings = legs
@@ -384,10 +382,8 @@ pub(crate) fn settle(
     println!("legs uploaded");
 
     for (ordinal, leg) in governed.iter().enumerate() {
-        let response: ApproveResponse = auditor_call(
+        let response: ApproveResponse = approve_k_of_n(
             cfg,
-            "POST",
-            "/approve",
             &serde_json::to_string(&ApproveRequest {
                 governance: enc(&leg.governance)?,
                 policy: enc(&leg.policy)?,
@@ -660,10 +656,56 @@ pub(crate) fn wait_receipt(cfg: &Config, bundle_id: Hash) -> Result<(&'static st
 }
 
 pub(crate) fn auditor_call<T: for<'de> Deserialize<'de>>(cfg: &Config, method: &str, path: &str, body: &str) -> Result<T> {
-    let (status, response) = crate::http::request(&cfg.auditor_url, method, path, body)
-        .wrap_err("call bi-auditor")?;
-    ensure!(status == 200, "bi-auditor {path} returned {status}: {response}");
+    auditor_call_at(&cfg.auditor_url, method, path, body)
+}
+
+pub(crate) fn auditor_call_at<T: for<'de> Deserialize<'de>>(url: &str, method: &str, path: &str, body: &str) -> Result<T> {
+    let (status, response) = crate::http::request(url, method, path, body).wrap_err_with(|| format!("call auditor {url}"))?;
+    ensure!(status == 200, "auditor {url} {path} returned {status}: {response}");
     Ok(serde_json::from_str(&response)?)
+}
+
+/// The policy's auditors (signing + encryption key, in the config's order) and `min_approvals`, from `[audit]` or the single
+/// `auditor_url` (iroha3 PLAN S11). Every auditor must answer `/keys`: a policy cannot name an auditor whose key is unknown.
+pub(crate) fn auditors_from_config(cfg: &Config) -> Result<(Vec<(PublicKey, PrivateSettlementHybridPublicKeyV1)>, usize)> {
+    let policy = cfg.audit_policy()?;
+    let auditors = policy
+        .auditor_urls
+        .iter()
+        .map(|url| {
+            let keys: Keys = auditor_call_at(url, "GET", "/keys", "")?;
+            Ok((keys.signing.parse::<PublicKey>()?, dec::<PrivateSettlementHybridPublicKeyV1>(&keys.encryption)?))
+        })
+        .collect::<Result<Vec<_>>>()?;
+    Ok((auditors, policy.min_approvals))
+}
+
+/// Ask the auditors to approve one leg until the policy's `min_approvals` are in (approved) or can no longer be reached
+/// (rejected). An unreachable auditor counts as no approval, so BI offline does not stop a 2-of-3 policy.
+fn approve_k_of_n(cfg: &Config, request: &str) -> Result<ApproveResponse> {
+    use crate::approval::{Answer, Verdict, decide};
+    let policy = cfg.audit_policy()?;
+    let mut answers = vec![Answer::Pending; policy.auditor_urls.len()];
+    let mut reasons = Vec::new();
+    for (index, url) in policy.auditor_urls.iter().enumerate() {
+        match auditor_call_at::<ApproveResponse>(url, "POST", "/approve", request) {
+            Ok(response) if response.approved => answers[index] = Answer::Approved,
+            Ok(response) => {
+                answers[index] = Answer::Rejected;
+                reasons.push(format!("{url}: {}", response.reason));
+            }
+            Err(error) => {
+                answers[index] = Answer::Unavailable;
+                reasons.push(format!("{url}: {error:#}"));
+            }
+        }
+        match decide(policy.min_approvals, &answers) {
+            Verdict::Approved => return Ok(ApproveResponse { approved: true, reason: String::new() }),
+            Verdict::Rejected => return Ok(ApproveResponse { approved: false, reason: reasons.join("; ") }),
+            Verdict::Wait => {}
+        }
+    }
+    Ok(ApproveResponse { approved: false, reason: format!("approvals incomplete: {}", reasons.join("; ")) })
 }
 
 /// Committee for a route: all four validators sorted by PeerId, with their Torii URLs in
@@ -906,6 +948,20 @@ pub(crate) fn govern_until(
     auditor_key: &PublicKey,
     auditor_encryption: &PrivateSettlementHybridPublicKeyV1,
 ) -> Result<Governed> {
+    govern_with(route, asset, height, retirement, &[(auditor_key.clone(), auditor_encryption.clone())], 1)
+}
+
+/// k-of-n policy: `auditors` in order, `min_approvals` of them must approve (1 <= k <= n).
+pub(crate) fn govern_with(
+    route: PrivateSettlementRouteV1,
+    asset: AssetDefinitionId,
+    height: u64,
+    retirement: Option<u64>,
+    auditors: &[(PublicKey, PrivateSettlementHybridPublicKeyV1)],
+    min_approvals: usize,
+) -> Result<Governed> {
+    ensure!(!auditors.is_empty(), "an audit policy needs at least one auditor");
+    ensure!((1..=auditors.len()).contains(&min_approvals), "min_approvals {min_approvals} must be between 1 and the {} auditors", auditors.len());
     let policy = PrivateSettlementAuditPolicyV1::new(PrivateSettlementAuditPolicyBodyV1 {
         version: ATOMIC_PRIVATE_SETTLEMENT_VERSION_V1,
         dataspace_id: route.dataspace_id,
@@ -914,12 +970,15 @@ pub(crate) fn govern_until(
         key_epoch: 1,
         activation_height: height,
         retirement_height: retirement,
-        min_approvals: 1,
-        auditors: vec![PrivateSettlementAuditorV1 {
-            auditor_id: AccountId::new(auditor_key.clone()),
-            signing_key: auditor_key.clone(),
-            encryption_key: auditor_encryption.clone(),
-        }],
+        min_approvals: u8::try_from(min_approvals).wrap_err("min_approvals")?,
+        auditors: auditors
+            .iter()
+            .map(|(key, encryption)| PrivateSettlementAuditorV1 {
+                auditor_id: AccountId::new(key.clone()),
+                signing_key: key.clone(),
+                encryption_key: encryption.clone(),
+            })
+            .collect(),
     })?;
     let governance = PrivateSettlementPoolGovernanceV1::from_restricted_mapping(
         route,

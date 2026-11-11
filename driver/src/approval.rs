@@ -1,3 +1,39 @@
+//! k-of-n decision over the auditors' answers (iroha3 PLAN S11/S12, ANALYST: 2-of-3 with BI and orgs A and B).
+//!
+//! The driver asks each auditor to `/approve` a leg. The chain accepts the leg once the policy's `min_approvals` approvals are
+//! in, so the driver stops asking as soon as that is certain either way: k approvals = go; fewer than k can still come = abort.
+//! An auditor that is offline, or rejects, simply does not count as an approval.
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Answer {
+    Approved,
+    Rejected,
+    Unavailable,
+    Pending,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Verdict {
+    Approved,
+    Rejected,
+    Wait,
+}
+
+pub fn decide(k: usize, answers: &[Answer]) -> Verdict {
+    if k == 0 {
+        return Verdict::Rejected;
+    }
+    let approved = answers.iter().filter(|a| **a == Answer::Approved).count();
+    let pending = answers.iter().filter(|a| **a == Answer::Pending).count();
+    if approved >= k {
+        Verdict::Approved
+    } else if approved + pending < k {
+        Verdict::Rejected
+    } else {
+        Verdict::Wait
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::Answer::{Approved as A, Pending as P, Rejected as R, Unavailable as U};
