@@ -10,6 +10,7 @@ A thin HTTP wrapper over two EXISTING driver commands, running as a Deployment i
 | `POST /settle-grant` | `dvp_native::settle_grant` (`driver/src/dvp_native.rs`, #14) | the bank's OWN account grants `CanExecuteSettlement` to the counterparty, bound to the exact DvP intent |
 | `POST /dvp-native` | `dvp_native::dvp_native` | the bank's OWN account submits the `DvpIsi` (AllOrNothing, settlement id `dvp_<intent hex>`) |
 | `GET /healthz` | - | liveness, no body from the chain |
+| `POST /mint` | `mint::mint` (`driver/src/mint.rs`, S18, deviation K6, user word A 2026-11-12) | BI driver ONLY (config `mint_enabled = true`; every other driver answers 403 before reading the body): one native `Mint` of RD or DFABI to an account, signed by the BI client.toml key; body `{"to":"<ed0120..>","asset":"<Base58 id>","amount":"<n>"}`, amount a plain integer up to the auditor per-asset cap (`max_rd`, `max_dfabi`); the chain still requires `CanMintAssetWithDefinition` (BI, genesis S3) |
 
 Request body (JSON, public terms only): `{"counterparty"|"to": "<ed0120.. public key>", "give": "<Base58 asset id>:<n>", "take": "<Base58 asset id>:<n>", "intent": "<64 hex>"}`. Response: `{"tx_hash": "...", "status": "Applied"}` or `{"error": "<message>"}`. Asset ids are the Base58 definition ids (`RD_ID`, `DFABI_ID`); aliases do not parse (`iroha_data_model/src/asset/id.rs:314-344`).
 
