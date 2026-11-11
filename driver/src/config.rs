@@ -42,9 +42,27 @@ pub struct Config {
     pub lanes: Lanes,
     #[serde(default)]
     pub auditor: AuditorConfig,
+    /// k-of-n audit policy (iroha3 PLAN S11). Absent = one auditor (`auditor_url`), one approval, the old behaviour.
+    #[serde(default)]
+    pub audit: Option<AuditSection>,
     /// Only the BI driver sets this (S18, K6): enables `mint` / `POST /mint` for RD and DFABI. Absent = refused.
     #[serde(default)]
     pub mint_enabled: bool,
+}
+
+/// `[audit]`: the auditors that must approve and how many.
+#[derive(Debug, Deserialize)]
+pub struct AuditSection {
+    pub min_approvals: Option<usize>,
+    /// host:port of each auditor (BI, org A, org B), the order of the policy's auditor list.
+    pub auditor_urls: Option<Vec<String>>,
+}
+
+/// The validated policy: 1 <= k <= n, distinct auditors.
+#[derive(Debug, PartialEq, Eq)]
+pub struct AuditPolicy {
+    pub min_approvals: usize,
+    pub auditor_urls: Vec<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -101,6 +119,20 @@ impl Config {
 
     pub fn torii(&self, party: &str) -> Result<&Url> {
         self.torii.get(party).ok_or_else(|| eyre!("no torii for {party}"))
+    }
+
+    /// The audit policy from `[audit]`, or the single `auditor_url` with one approval when the section is absent.
+    pub fn audit_policy(&self) -> Result<AuditPolicy> {
+        let Some(section) = &self.audit else {
+            return Ok(AuditPolicy { min_approvals: 1, auditor_urls: vec![self.auditor_url.clone()] });
+        };
+        let urls = section.auditor_urls.clone().ok_or_else(|| eyre!("[audit] needs auditor_urls"))?;
+        let k = section.min_approvals.ok_or_else(|| eyre!("[audit] needs min_approvals"))?;
+        eyre::ensure!(!urls.is_empty(), "[audit] auditor_urls is empty");
+        eyre::ensure!((1..=urls.len()).contains(&k), "[audit] min_approvals {k} must be between 1 and the {} auditors", urls.len());
+        let distinct: std::collections::BTreeSet<_> = urls.iter().collect();
+        eyre::ensure!(distinct.len() == urls.len(), "[audit] auditor_urls has a duplicate");
+        Ok(AuditPolicy { min_approvals: k, auditor_urls: urls })
     }
 
     /// Torii of the acting party (`party`).
@@ -229,6 +261,33 @@ dfabi = 2
     fn no_command_hardcodes_the_bi_sponsor() {
         for (file, text) in [("aps.rs", include_str!("aps.rs")), ("pools.rs", include_str!("pools.rs"))] {
             assert!(!text.contains("sponsor(\"bi\")"), "{file} still calls cfg.sponsor(\"bi\")");
+        }
+    }
+
+    #[test]
+    fn audit_policy_defaults_to_the_single_auditor_url_with_one_approval() {
+        let policy = config("").audit_policy().unwrap();
+        assert_eq!((policy.min_approvals, policy.auditor_urls), (1, vec!["a:1".to_owned()]));
+    }
+
+    #[test]
+    fn policy_from_config_two_of_three_parses() {
+        let cfg = config("[audit]\nmin_approvals = 2\nauditor_urls = [\"bi:8090\", \"a:8090\", \"b:8090\"]\n");
+        let policy = cfg.audit_policy().unwrap();
+        assert_eq!(policy.min_approvals, 2);
+        assert_eq!(policy.auditor_urls, ["bi:8090", "a:8090", "b:8090"]);
+    }
+
+    #[test]
+    fn policy_from_config_refuses_k_zero_k_above_n_no_auditor_and_duplicates() {
+        for bad in [
+            "[audit]\nmin_approvals = 0\nauditor_urls = [\"bi:8090\"]\n",
+            "[audit]\nmin_approvals = 4\nauditor_urls = [\"bi:8090\", \"a:8090\", \"b:8090\"]\n",
+            "[audit]\nmin_approvals = 1\nauditor_urls = []\n",
+            "[audit]\nmin_approvals = 1\nauditor_urls = [\"bi:8090\", \"bi:8090\"]\n",
+            "[audit]\nmin_approvals = 1\n",
+        ] {
+            assert!(config(bad).audit_policy().is_err(), "{bad:?} must be refused");
         }
     }
 }

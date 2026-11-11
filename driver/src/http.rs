@@ -13,9 +13,22 @@ const MAX_BODY: usize = 1 << 20;
 
 /// Send one request; returns (status, body).
 pub fn request(addr: &str, method: &str, path: &str, body: &str) -> Result<(u16, String)> {
-    let mut stream = TcpStream::connect(addr).wrap_err_with(|| format!("connect {addr}"))?;
     // Approval fetches capsules from 3 of 4 nodes and submits a quorum: allow minutes.
-    stream.set_read_timeout(Some(Duration::from_secs(600)))?;
+    request_with(addr, method, path, body, None, Duration::from_secs(600))
+}
+
+/// `request` with an optional connect timeout and an explicit read (response) timeout.
+pub fn request_with(addr: &str, method: &str, path: &str, body: &str, connect: Option<Duration>, read: Duration) -> Result<(u16, String)> {
+    let mut stream = match connect {
+        None => TcpStream::connect(addr),
+        Some(limit) => {
+            use std::net::ToSocketAddrs;
+            let target = addr.to_socket_addrs().wrap_err_with(|| format!("resolve {addr}"))?.next().ok_or_else(|| eyre!("no address for {addr}"))?;
+            TcpStream::connect_timeout(&target, limit)
+        }
+    }
+    .wrap_err_with(|| format!("connect {addr}"))?;
+    stream.set_read_timeout(Some(read))?;
     write!(
         stream,
         "{method} {path} HTTP/1.0\r\nHost: {addr}\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{body}",
