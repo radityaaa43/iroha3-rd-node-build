@@ -167,19 +167,32 @@ impl PoolRecord {
 /// A finalized receipt is immutable public data: cached on disk once read.
 fn finalized_receipt(client: &Client, cache: &Path, id: &str) -> Result<Option<PrivateSettlementReceiptV1>> {
     let file = cache.join(format!("{id}.norito.hex"));
-    if let Ok(text) = std::fs::read_to_string(&file) {
-        return Ok(Some(dec(text.trim())?));
+    if let Some(receipt) = read_cached(&file)? {
+        return Ok(Some(receipt));
     }
     match client.client().private_settlement_bundle_receipt_v1(Hash::prehashed(hex32(id)?))? {
         PrivateSettlementBundleReceiptResponseV1::Finalized(receipt) => {
-            std::fs::create_dir_all(cache)?;
-            let tmp = file.with_extension("tmp");
-            std::fs::write(&tmp, enc(&receipt)?)?;
-            std::fs::rename(tmp, &file)?;
+            store_cached(cache, &file, &enc(&receipt)?)?;
             Ok(Some(receipt))
         }
         _ => Ok(None),
     }
+}
+
+fn read_cached(file: &Path) -> Result<Option<PrivateSettlementReceiptV1>> {
+    match std::fs::read_to_string(file) {
+        Ok(text) => Ok(Some(dec(text.trim())?)),
+        Err(_) => Ok(None),
+    }
+}
+
+/// Write via a temp file and rename, so a reader never sees half a file.
+fn store_cached(cache: &Path, file: &Path, text: &str) -> Result<()> {
+    std::fs::create_dir_all(cache)?;
+    let tmp = file.with_extension("tmp");
+    std::fs::write(&tmp, text)?;
+    std::fs::rename(tmp, file)?;
+    Ok(())
 }
 
 fn hex32(text: &str) -> Result<[u8; 32]> {
@@ -463,4 +476,51 @@ pub fn abort_bundle(cfg: &Config, bundle: &str) -> Result<()> {
     crate::aps::abort_bundle(cfg, sponsor.client(), &manifest)?;
     println!("aborted bundle={bundle}");
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::{Arc, Barrier};
+
+    use super::*;
+
+    fn temp_dir() -> PathBuf {
+        std::env::temp_dir().join(format!("rd-dfabi-cache-{}", rand::random::<u64>()))
+    }
+
+    /// Lensa runs several driver containers at once; each may cache the same new receipt.
+    #[test]
+    fn two_writers_of_the_same_receipt_both_succeed() {
+        let cache = temp_dir();
+        let text = "ab".repeat(6500);
+        for round in 0..2000 {
+            let file = cache.join(format!("{round}.norito.hex"));
+            let start = Arc::new(Barrier::new(2));
+            let writers: Vec<_> = (0..2)
+                .map(|_| {
+                    let (cache, file, text, start) = (cache.clone(), file.clone(), text.clone(), start.clone());
+                    std::thread::spawn(move || {
+                        start.wait();
+                        store_cached(&cache, &file, &text)
+                    })
+                })
+                .collect();
+            for writer in writers {
+                writer.join().unwrap().unwrap_or_else(|e| panic!("round {round}: {e:#}"));
+            }
+            assert_eq!(std::fs::read_to_string(&file).unwrap(), text);
+        }
+        std::fs::remove_dir_all(cache).unwrap();
+    }
+
+    /// A damaged cache file is a miss (refetched and rewritten), not an error.
+    #[test]
+    fn undecodable_cache_file_is_a_miss() {
+        let cache = temp_dir();
+        std::fs::create_dir_all(&cache).unwrap();
+        let file = cache.join("x.norito.hex");
+        std::fs::write(&file, "not a receipt").unwrap();
+        assert!(read_cached(&file).unwrap().is_none());
+        std::fs::remove_dir_all(cache).unwrap();
+    }
 }
