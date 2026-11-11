@@ -115,6 +115,16 @@ impl PoolFile {
         Ok(())
     }
 
+    /// Read-modify-write for a run that held its copy for minutes: another run may have added a bundle meanwhile.
+    pub fn update(path: &Path, change: impl FnOnce(&mut Self)) -> Result<()> {
+        // A separate lock file: save() renames over pools.json, which would drop a lock held on it.
+        let lock = std::fs::OpenOptions::new().create(true).append(true).open(path.with_extension("json.lock"))?;
+        lock.lock()?;
+        let mut pools = Self::load(path)?;
+        change(&mut pools);
+        pools.save(path)
+    }
+
     pub fn get(&self, asset: Asset) -> &PoolRecord {
         match asset {
             Asset::Rd => &self.rd,
@@ -332,7 +342,7 @@ pub fn dvp(cfg: &Config, buyer: &str, seller: &str, rd: u128, dfabi: u128, optio
 
 fn run_bundle(cfg: &Config, legs: [LegSpec; 2], options: &Options, kind: &str) -> Result<()> {
     ensure!(legs[0].asset == Asset::Rd && legs[1].asset == Asset::Dfabi, "legs must be [rd, dfabi]");
-    let mut pools = PoolFile::load(&cfg.pools_file)?;
+    let pools = PoolFile::load(&cfg.pools_file)?;
     let (sponsor, sponsor_key) = cfg.sponsor("bi")?;
     let mut spends = Vec::new();
     let mut governed = Vec::new();
@@ -390,22 +400,24 @@ fn run_bundle(cfg: &Config, legs: [LegSpec; 2], options: &Options, kind: &str) -
         println!("leg {ordinal} proved after {:?} {}", started.elapsed(), peak_rss());
     }
     let id = hex::encode(manifest.bundle_id.as_ref());
-    for asset in [Asset::Rd, Asset::Dfabi] {
-        pools.get_mut(asset).bundles.push(BundleRef { id: id.clone(), height: 0 });
-    }
-    pools.save(&cfg.pools_file)?;
-    let outcome = settle(cfg, &sponsor, manifest, &prepared, &governed, &committees, started, options);
-    for asset in [Asset::Rd, Asset::Dfabi] {
-        let bundles = &mut pools.get_mut(asset).bundles;
-        match &outcome {
-            Ok(Some((_, height))) => bundles.iter_mut().filter(|b| b.id == id).for_each(|b| b.height = *height),
-            // aborted (or failed and aborted): it moved nothing; a failure whose abort also failed
-            // stays listed and history() reads its final state from the chain
-            Ok(None) => bundles.retain(|b| b.id != id),
-            Err(_) => {}
+    PoolFile::update(&cfg.pools_file, |pools| {
+        for asset in [Asset::Rd, Asset::Dfabi] {
+            pools.get_mut(asset).bundles.push(BundleRef { id: id.clone(), height: 0 });
         }
-    }
-    pools.save(&cfg.pools_file)?;
+    })?;
+    let outcome = settle(cfg, &sponsor, manifest, &prepared, &governed, &committees, started, options);
+    PoolFile::update(&cfg.pools_file, |pools| {
+        for asset in [Asset::Rd, Asset::Dfabi] {
+            let bundles = &mut pools.get_mut(asset).bundles;
+            match &outcome {
+                Ok(Some((_, height))) => bundles.iter_mut().filter(|b| b.id == id).for_each(|b| b.height = *height),
+                // aborted (or failed and aborted): it moved nothing; a failure whose abort also failed
+                // stays listed and history() reads its final state from the chain
+                Ok(None) => bundles.retain(|b| b.id != id),
+                Err(_) => {}
+            }
+        }
+    })?;
     outcome?;
     println!("kind={kind}");
     Ok(())
@@ -521,5 +533,33 @@ mod tests {
         std::fs::write(&file, "not a receipt").unwrap();
         assert!(read_cached(&file).unwrap().is_none());
         std::fs::remove_dir_all(cache).unwrap();
+    }
+
+    fn record() -> PoolRecord {
+        PoolRecord { pool_id: String::new(), route: String::new(), policy: String::new(), governance: String::new(), origin: vec![], bundles: vec![] }
+    }
+
+    /// Lensa runs several driver containers on one pools.json; each finishing bundle must keep the others' entries.
+    #[test]
+    fn concurrent_updates_keep_every_bundle() {
+        let dir = temp_dir();
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("pools.json");
+        PoolFile { rd: record(), dfabi: record() }.save(&path).unwrap();
+        let writers: Vec<_> = (0..4)
+            .map(|t| {
+                let path = path.clone();
+                std::thread::spawn(move || {
+                    for i in 0..50 {
+                        PoolFile::update(&path, |p| p.rd.bundles.push(BundleRef { id: format!("{t}-{i}"), height: 0 })).unwrap();
+                    }
+                })
+            })
+            .collect();
+        for writer in writers {
+            writer.join().unwrap();
+        }
+        assert_eq!(PoolFile::load(&path).unwrap().rd.bundles.len(), 200);
+        std::fs::remove_dir_all(dir).unwrap();
     }
 }
