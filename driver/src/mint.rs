@@ -1,3 +1,76 @@
+//! BI-only mint of the test assets (iroha3 PLAN S18, AFTER deviation K6, user word "A" 2026-11-12; PLAN S13 DECIDED: BI issues
+//! RD / DFABI, Lensa holds no keys).
+//!
+//! `rd-dfabi mint` and `POST /mint` submit ONE native `Mint` of an existing asset definition to an account, signed by the config's
+//! own client.toml. They exist only where the config sets `mint_enabled = true` (the BI driver); every other driver refuses with
+//! 403 / an error before it reads a request. The chain still decides who may mint (`CanMintAssetWithDefinition`, held by the BI
+//! account in the genesis, S3), so a bank driver that is misconfigured cannot mint either. Only RD and DFABI are mintable, each up
+//! to the auditor's per-asset cap per request. No new chain logic, no key in a request or a response.
+
+use std::str::FromStr;
+
+use eyre::{Result, ensure, eyre};
+use iroha::data_model::{
+    account::AccountId,
+    asset::{AssetDefinitionId, AssetId},
+    isi::{InstructionBox, Mint},
+};
+use serde::Deserialize;
+
+use crate::{config::Config, dvp_native};
+
+/// Public terms of one mint: destination public key (`ed0120...`), Base58 asset definition id, plain integer amount.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct MintTerms {
+    pub to: String,
+    pub asset: String,
+    pub amount: String,
+}
+
+/// What this driver may mint: each asset with its per-request cap. Absent (`None` from [`policy_of`]) = mint disabled.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MintPolicy {
+    pub allowed: Vec<(AssetDefinitionId, u128)>,
+}
+
+/// Validate the terms against the policy without any key or chain access (the server answers 400 on failure).
+pub fn check_mint(terms: &MintTerms, policy: &MintPolicy) -> Result<(AccountId, AssetDefinitionId, u128)> {
+    let to = dvp_native::parse_account(&terms.to)?;
+    let amount = dvp_native::parse_amount(&terms.amount)?;
+    let asset = AssetDefinitionId::from_str(&terms.asset).map_err(|e| eyre!("asset {:?}: {e}", terms.asset))?;
+    let cap = policy
+        .allowed
+        .iter()
+        .find(|(allowed, _)| *allowed == asset)
+        .map(|(_, cap)| *cap)
+        .ok_or_else(|| eyre!("asset {:?} is not mintable here", terms.asset))?;
+    ensure!(amount <= cap, "amount {amount} is above the cap {cap} of this asset");
+    Ok((to, asset, amount))
+}
+
+/// The one instruction: mint `amount` of `asset` to `to`.
+pub fn build_mint(to: &AccountId, asset: &AssetDefinitionId, amount: u128) -> InstructionBox {
+    Mint::asset_quantity(amount, AssetId::new(asset.clone(), to.clone())).into()
+}
+
+/// `None` unless the config enables mint; then RD and DFABI up to the auditor caps. A bad asset id in an enabled config is an error.
+pub fn policy_of(cfg: &Config) -> Result<Option<MintPolicy>> {
+    if !cfg.mint_enabled {
+        return Ok(None);
+    }
+    let id = |text: &str| AssetDefinitionId::from_str(text).map_err(|e| eyre!("config asset {text:?}: {e}"));
+    Ok(Some(MintPolicy { allowed: vec![(id(&cfg.assets.rd)?, cfg.auditor.max_rd), (id(&cfg.assets.dfabi)?, cfg.auditor.max_dfabi)] }))
+}
+
+/// `rd-dfabi mint` and `POST /mint`: check, sign with the own key, pay the bounded fee, wait for `Applied`; return the tx hash.
+pub fn mint(cfg: &Config, terms: &MintTerms) -> Result<String> {
+    let policy = policy_of(cfg)?.ok_or_else(|| eyre!("mint is not enabled in this config (mint_enabled)"))?;
+    let (to, asset, amount) = check_mint(terms, &policy)?;
+    let (client, _own) = dvp_native::own_client(cfg)?;
+    dvp_native::submit(cfg, &client, build_mint(&to, &asset, amount))
+}
+
 #[cfg(test)]
 mod tests {
     use iroha::data_model::{
