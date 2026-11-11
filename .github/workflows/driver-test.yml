@@ -43,4 +43,12 @@ jobs:
           restore-keys: |
             driver-071e281e-${{ hashFiles('driver/Cargo.toml') }}-
             driver-071e281e-
-      - run: driver/build.sh test
+      # The restored target/ can be newer than the checkout; cargo fingerprints by mtime and would
+      # skip the rebuild and test stale code.
+      - run: find driver -type f -exec touch {} +
+      - name: Test
+        shell: bash
+        run: |
+          driver/build.sh test 2>&1 | tee "$RUNNER_TEMP/test.log"
+          # Nothing recompiled means the result says nothing about this commit.
+          grep -q 'Compiling rd-dfabi' "$RUNNER_TEMP/test.log"
