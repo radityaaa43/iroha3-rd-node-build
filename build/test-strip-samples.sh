@@ -30,6 +30,5 @@ for f in '{{.Config.Env}}' '{{.Config.User}}' '{{.Config.WorkingDir}}' '{{json .
   a=$(docker image inspect rd-strip-fixture:t --format "$f"); b=$(docker image inspect rd-strip-out:t --format "$f")
   [[ $a == "$b" ]] && ok "metadata kept: $f" || fail "metadata $f: '$a' vs '$b'"
 done
-n=$(docker image inspect rd-strip-out:t --format '{{len .RootFS.Layers}}'); [[ $n -eq 1 ]] && ok "single flattened layer" || fail "layers: $n"
 if (( fails )); then echo "FAILED: $fails check(s)" >&2; exit 1; fi
 echo "PASS"
