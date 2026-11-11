@@ -14,6 +14,7 @@ use crate::{
     dvp_native, http,
     mint::{self, MintPolicy, MintTerms},
     tx_detail,
+    balance,
 };
 
 /// Public terms of one D-native DvP, in the calling bank's own give/take view (see `dvp_native.rs`).
@@ -37,6 +38,8 @@ pub trait Submitter {
     fn mint(&self, terms: &MintTerms) -> Result<String>;
     /// Signed transaction-details query with the own key (`tx_detail::fetch`); `hash` is already validated.
     fn tx(&self, hash: &str) -> Result<String>;
+    /// Signed query of the own account's balance of ONE asset (`balance::fetch`); `asset` is already validated.
+    fn balance(&self, asset: &str) -> Result<String>;
 }
 
 /// Answer one request: `(HTTP status, JSON body)`. Pure apart from the injected submitter.
@@ -87,6 +90,14 @@ pub fn route(method: &str, path: &str, body: &str, submitter: &dyn Submitter) ->
             },
         },
         (_, p) if p.starts_with("/tx/") => error(405, "method not allowed".to_owned()),
+        ("GET", p) if p == "/balance" || p.starts_with("/balance?") => match balance::asset_param(p).and_then(|a| balance::check_asset(&a).map(|_| a)) {
+            Err(e) => error(400, format!("{e:#}")),
+            Ok(asset) => match submitter.balance(&asset) {
+                Ok(body) => (200, body),
+                Err(e) => error(502, format!("{e:#}")),
+            },
+        },
+        (_, p) if p == "/balance" || p.starts_with("/balance?") => error(405, "method not allowed".to_owned()),
         _ => error(404, "not found".to_owned()),
     }
 }
@@ -121,6 +132,11 @@ impl Submitter for Real {
         let cfg = self.cfg.lock().unwrap_or_else(|p| p.into_inner());
         tx_detail::fetch(&cfg, hash)
     }
+
+    fn balance(&self, asset: &str) -> Result<String> {
+        let cfg = self.cfg.lock().unwrap_or_else(|p| p.into_inner());
+        balance::fetch(&cfg, asset)
+    }
 }
 
 /// `rd-dfabi server <config> --listen <addr>`.
@@ -147,6 +163,9 @@ mod tests {
         calls: RefCell<Vec<(&'static str, Terms)>>,
         mints: RefCell<Vec<MintTerms>>,
         txs: RefCell<Vec<String>>,
+        balances: RefCell<Vec<String>>,
+        /// `Some(message)` = the upstream refuses the balance query with this message.
+        balance_refusal: Option<String>,
         /// `Some(message)` = the upstream refuses a transaction-details query with this message.
         tx_refusal: Option<String>,
         /// `Some` = this is a BI driver with mint enabled.
@@ -172,6 +191,14 @@ mod tests {
         fn mint(&self, terms: &MintTerms) -> Result<String> {
             self.mints.borrow_mut().push(terms.clone());
             if self.fail { Err(eyre::eyre!("chain refused")) } else { Ok("txh-mint".to_owned()) }
+        }
+
+        fn balance(&self, asset: &str) -> Result<String> {
+            self.balances.borrow_mut().push(asset.to_owned());
+            match &self.balance_refusal {
+                Some(message) => Err(eyre::eyre!("{message}")),
+                None => Ok(format!(r#"{{"account":"own","asset":"{asset}","balance":{{"value":"5"}}}}"#)),
+            }
         }
 
         fn tx(&self, hash: &str) -> Result<String> {
@@ -387,6 +414,52 @@ mod tests {
         let message = "query_validation_failed: account is not permitted to read this transaction";
         let fake = Fake { tx_refusal: Some(message.to_owned()), ..Fake::default() };
         let (status, response) = route("GET", &format!("/tx/{}", "ab".repeat(32)), "", &fake);
+        assert_eq!(status, 502);
+        assert_eq!(json(&response), serde_json::json!({"error": message}));
+    }
+
+    #[test]
+    fn balance_is_a_get_of_one_valid_asset_and_asks_for_the_own_account_only() {
+        let fake = Fake::default();
+        let (status, response) = route("GET", "/balance?asset=7onbjg2gRXveoAAUFsohCZyGW98t", "", &fake);
+        assert_eq!(status, 200);
+        assert_eq!(json(&response)["asset"], "7onbjg2gRXveoAAUFsohCZyGW98t");
+        // the submitter is only ever given the asset: no request field can name another account
+        assert_eq!(*fake.balances.borrow(), vec!["7onbjg2gRXveoAAUFsohCZyGW98t".to_owned()]);
+    }
+
+    #[test]
+    fn balance_bad_or_extra_parameters_are_400_and_never_query() {
+        let fake = Fake::default();
+        for bad in [
+            "/balance",
+            "/balance?asset=",
+            "/balance?asset=rd%23wonderland.ds-rd",
+            "/balance?account=ed0120aa&asset=7onbjg2gRXveoAAUFsohCZyGW98t",
+            "/balance?asset=7onbjg2gRXveoAAUFsohCZyGW98t&asset=4mBWK1JCwQdHLDPpuVKc56eLsXka",
+            "/balance?asset=../x",
+        ] {
+            let (status, response) = route("GET", bad, "", &fake);
+            assert_eq!(status, 400, "{bad}");
+            assert!(json(&response)["error"].is_string());
+        }
+        assert!(fake.balances.borrow().is_empty());
+    }
+
+    #[test]
+    fn balance_other_methods_are_405_and_never_query() {
+        let fake = Fake::default();
+        for method in ["POST", "PUT", "DELETE"] {
+            assert_eq!(route(method, "/balance?asset=7onbjg2gRXveoAAUFsohCZyGW98t", "{}", &fake).0, 405, "{method}");
+        }
+        assert!(fake.balances.borrow().is_empty());
+    }
+
+    #[test]
+    fn a_balance_upstream_permission_error_is_passed_through_unchanged_as_502() {
+        let message = "query_validation_failed: account is not permitted to read this dataspace";
+        let fake = Fake { balance_refusal: Some(message.to_owned()), ..Fake::default() };
+        let (status, response) = route("GET", "/balance?asset=7onbjg2gRXveoAAUFsohCZyGW98t", "", &fake);
         assert_eq!(status, 502);
         assert_eq!(json(&response), serde_json::json!({"error": message}));
     }
