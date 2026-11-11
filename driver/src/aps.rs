@@ -1119,6 +1119,25 @@ fn note_opening(active: bool, value: u128) -> PrivateSettlementAuditNoteOpeningV
 }
 
 #[allow(clippy::too_many_arguments)]
+/// `prepare_leg` with the recipient's output given as public values only: (spending authority, x25519 view
+/// public key). The payer then needs none of the recipient's secrets (`notes.recipient` is ignored).
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn prepare_leg_to(
+    ordinal: usize,
+    leg: &Leg,
+    governed: &Governed,
+    spend: Spend,
+    notes: &LegNotes,
+    recipient_public: Option<([u8; 32], [u8; 32])>,
+    manifest: &AtomicPrivateSettlementV1,
+    authority_digest: Hash,
+    sponsor_key: &KeyPair,
+    reimbursement_salt: [u8; 32],
+) -> Result<AtomicPrivateSettlementPreparedLegV1> {
+    let _ = recipient_public;
+    prepare_leg(ordinal, leg, governed, spend, notes, manifest, authority_digest, sponsor_key, reimbursement_salt)
+}
+
 pub(crate) fn prepare_leg(
     ordinal: usize,
     leg: &Leg,
@@ -1487,5 +1506,69 @@ mod abort_tests {
         assert!(seen(&["finalized", "pending"], true), "timeout with a finalized node");
         assert!(!seen(&["pending", "pending"], true), "timeout, nothing finalized");
         assert!(receipt_error(&["finalized", "pending"], false).is_ok(), "keep polling");
+    }
+}
+
+#[cfg(test)]
+mod output_authority_tests {
+    use std::path::Path;
+
+    use super::*;
+
+    /// A payer builds a leg for a recipient it holds no secret of: only the recipient's spending authority and
+    /// x25519 view public key. The proof verifies and the real recipient, with its own keys, opens the note.
+    #[test]
+    fn leg_proves_with_the_recipient_output_given_as_public_values() {
+        let route = |lane: u32| PrivateSettlementRouteV1 {
+            dataspace_id: DataSpaceId::new(u64::from(lane)),
+            lane_id: LaneId::new(lane),
+            lane_incarnation: Hash::new(b"rd-dfabi-selftest"),
+        };
+        let peers = Path::new(concat!(env!("CARGO_MANIFEST_DIR"), "/fixtures/peers.json"));
+        let (authority, _) = committee_authority(peers, route(1)).unwrap();
+        let authority_digest = authority.digest().unwrap();
+        let network_id = NetworkId::from_genesis_hash(HashOf::from_untyped_unchecked(Hash::new(b"rd-dfabi-selftest-network")));
+        let auditor_key = fixture_key(0x30);
+        let mut rng = iroha_crypto::rng_from_seed_slice(&rnd());
+        let hybrid = iroha_crypto::HybridKeyPair::generate(&mut rng).unwrap();
+        let encryption = PrivateSettlementHybridPublicKeyV1::from_hybrid(hybrid.public());
+        let governed = [(1, "7onbjg2gRXveoAAUFsohCZyGW98t"), (2, "4mBWK1JCwQdHLDPpuVKc56eLsXka")]
+            .into_iter()
+            .map(|(lane, asset)| govern(route(lane), asset.parse().unwrap(), 100, 100 + EXPIRY_BLOCKS, auditor_key.public_key(), &encryption))
+            .collect::<Result<Vec<_>>>()
+            .unwrap();
+        let pool_id = governed[0].governance.body.pool_id;
+        let sponsor_key = fixture_key(0x31);
+        let fee = bounded_fee_for("6TEAJqbb8oEPmLncoNiMRbLEK6tw").unwrap();
+        let genesis = *network_id.as_genesis_hash().as_ref();
+        let funding = funding(1_000).unwrap();
+        let salt = rnd();
+        let manifest = proof_manifest(network_id, 101, 100 + EXPIRY_BLOCKS, AccountId::new(sponsor_key.public_key().clone()), fee, &governed, salt).unwrap();
+        let leg = Leg {
+            lane: 1,
+            asset: governed[0].governance.body.asset_definition_id.clone(),
+            payer: fixture_key(0x32),
+            recipient: fixture_key(0x33),
+            funding: 1_000,
+            amount: 100,
+        };
+        // The recipient keeps its secrets; the payer is given the public values and a placeholder it never uses.
+        let recipient = NoteKeys::random();
+        let public = (recipient.authority().unwrap(), ivm_private_recipient_public_key_v1(&recipient.view).unwrap());
+        let notes = LegNotes { recipient: NoteKeys::random(), change: NoteKeys::random() };
+        let prepared = on_big_stack(|| {
+            prepare_leg_to(0, &leg, &governed[0], Spend::Bootstrap(funding), &notes, Some(public), &manifest, authority_digest, &sponsor_key, salt)
+        })
+        .unwrap();
+        verify_atomic_private_settlement_v1(&manifest, &prepared.statement, genesis, 101, &prepared.proof)
+            .unwrap_or_else(|e| panic!("proof rejected: {e:?}"));
+        let opened = prepared
+            .statement
+            .output_commitments
+            .iter()
+            .zip(&prepared.statement.encrypted_outputs)
+            .find_map(|(commitment, encrypted)| open_output(pool_id, *commitment, encrypted, &recipient).unwrap())
+            .expect("the real recipient found no note addressed to its public values");
+        assert_eq!(opened.value, 100);
     }
 }
