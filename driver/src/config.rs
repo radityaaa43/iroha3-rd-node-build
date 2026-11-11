@@ -22,6 +22,10 @@ pub struct Config {
     /// Coordinator only; the auditor never reads it.
     #[serde(default)]
     pub client_toml: PathBuf,
+    /// The party that runs this process: its Torii is the sponsor's submit target (iroha3 PLAN S10). Default `bi`, the
+    /// old single-operator behaviour; each bank's own driver sets its own name.
+    #[serde(default = "default_party")]
+    pub party: String,
     /// network/public/peers.json: party, BLS public key and PoP of each validator.
     pub peers_json: PathBuf,
     /// Directory with `<name>.seed` files (hex, 32 bytes).
@@ -78,6 +82,10 @@ impl Default for AuditorConfig {
     }
 }
 
+fn default_party() -> String {
+    "bi".into()
+}
+
 fn default_pools_file() -> PathBuf {
     "/pools/pools.json".into()
 }
@@ -93,6 +101,16 @@ impl Config {
 
     pub fn torii(&self, party: &str) -> Result<&Url> {
         self.torii.get(party).ok_or_else(|| eyre!("no torii for {party}"))
+    }
+
+    /// Torii of the acting party (`party`).
+    pub fn acting_torii(&self) -> Result<&Url> {
+        self.torii(&self.party)
+    }
+
+    /// Sponsor of a command = the acting party: its client.toml key, submitting to its OWN Torii.
+    pub fn acting_sponsor(&self) -> Result<(Client, KeyPair)> {
+        self.sponsor(&self.party)
     }
 
     /// Sponsor client (operator client.toml) bound to `party`'s Torii, plus its key.
