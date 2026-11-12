@@ -43,7 +43,9 @@ pub fn fetch(cfg: &Config, asset: &str) -> Result<String> {
     let config = iroha::config::Config::load_file(&cfg.client_toml).map_err(|e| eyre!("load {}: {e:?}", cfg.client_toml.display()))?;
     let account = AccountId::new(config.key_pair.public_key().clone());
     let client = iroha::client::Client::builder(config).build()?;
-    let found = client.query_single(FindAssetById::new(AssetId::new(definition, account.clone()))).map_err(|e| eyre!("{e}"))?;
+    // RD/DFABI: the `#dataspace:<home>` bucket (a Global id finds nothing); the fee asset: Global.
+    let scope = crate::dvp_native::home_scope(cfg, &definition);
+    let found = client.query_single(FindAssetById::new(AssetId::with_scope(definition, account.clone(), scope))).map_err(|e| eyre!("{e}"))?;
     let json = norito::json::to_json(&found).map_err(|e| eyre!("encode asset: {e}"))?;
     Ok(wrap(&account.to_string(), asset, &json))
 }
@@ -73,6 +75,16 @@ mod tests {
         for bad in ["/balance", "/balance?", "/balance?asset=", "/balance?account=x", "/balance?asset=a&asset=b", "/balance?asset=a&account=x", "/balance?asset=a&", "/balance?asse=a"] {
             assert!(asset_param(bad).is_err(), "{bad:?} must be refused");
         }
+    }
+
+    /// RD and DFABI balances sit in the `#dataspace:<home>` bucket; a Global id finds nothing (live: 404 "Failed to find
+    /// asset" for every party after Applied mints; FindAssetById reads the exact key, iroha@071e281e isi/asset.rs:8217).
+    #[test]
+    fn the_query_names_the_scoped_bucket_not_the_global_one() {
+        let src = include_str!("balance.rs");
+        let fetch = &src[src.find("pub fn fetch").unwrap()..src.find("#[cfg(test)]").unwrap()];
+        assert!(fetch.contains("AssetId::with_scope(") && fetch.contains("home_scope(cfg"), "fetch must query the scoped bucket");
+        assert!(!fetch.contains("AssetId::new("), "a Global id never finds a DataspaceRestricted balance");
     }
 
     #[test]

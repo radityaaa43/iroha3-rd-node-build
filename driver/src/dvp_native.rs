@@ -19,7 +19,7 @@ use iroha::{
     client::AccountTransactionDraft,
     data_model::{
         account::AccountId,
-        asset::{AssetDefinitionId, AssetId},
+        asset::{AssetBalanceScope, AssetDefinitionId, AssetId},
         isi::{
             DvpIsi, Grant, InstructionBox, SettlementAtomicity, SettlementExecutionOrder, SettlementId, SettlementLeg,
             SettlementPlan,
@@ -28,7 +28,7 @@ use iroha::{
     executor_data_model::permission::settlement::CanExecuteSettlement,
 };
 use iroha_crypto::PublicKey;
-use iroha_model_base::metadata::Metadata;
+use iroha_model_base::{metadata::Metadata, topology::DataSpaceId};
 
 use crate::{aps::bounded_fee, config::Config};
 
@@ -82,20 +82,54 @@ pub fn build_dvp(submitter: &AccountId, counterparty: &AccountId, give: &Side, t
     ))
 }
 
-/// The consent `grantor` gives to `to` (the future submitter), in the grantor's own give/take terms.
-pub fn build_consent(grantor: &AccountId, to: &AccountId, give: &Side, take: &Side, intent: &[u8; 32]) -> Result<CanExecuteSettlement> {
+/// Balance scope of `asset`: the `restricted` ids (RD, DFABI) live in the home dataspace `home_lane` (dataspace id = lane id),
+/// every other asset (the fee asset) is Global. An id that does not parse matches nothing.
+pub fn scope_of(restricted: &[&str], home_lane: u32, asset: &AssetDefinitionId) -> AssetBalanceScope {
+    if restricted.iter().any(|id| AssetDefinitionId::from_str(id).is_ok_and(|id| id == *asset)) {
+        AssetBalanceScope::Dataspace(DataSpaceId::new(u64::from(home_lane)))
+    } else {
+        AssetBalanceScope::Global
+    }
+}
+
+/// [`scope_of`] for the config's RD and DFABI. Both are DataspaceRestricted and homed in ONE dataspace, ds-rd
+/// (iroha3-rd-dfabi network/genesis-rd-dfabi.jq: a DvP across two restricted dataspaces cannot execute), so the home is
+/// `lanes.rd` for both.
+// ponytail: home fixed to lanes.rd; read the definition's owning domain from the chain if RD and DFABI ever move apart.
+pub fn home_scope(cfg: &Config, asset: &AssetDefinitionId) -> AssetBalanceScope {
+    scope_of(&[&cfg.assets.rd, &cfg.assets.dfabi], cfg.lanes.rd, asset)
+}
+
+/// The consent `grantor` gives to `to` (the future submitter), in the grantor's own give/take terms. `scope` is the balance
+/// bucket of the debited (give) asset: core refuses a Global bucket for a DataspaceRestricted asset (iroha@071e281e
+/// isi/settlement.rs:333-338).
+pub fn build_consent(
+    grantor: &AccountId,
+    to: &AccountId,
+    give: &Side,
+    take: &Side,
+    intent: &[u8; 32],
+    scope: AssetBalanceScope,
+) -> Result<CanExecuteSettlement> {
     // The grantee submits, so what the grantor gives is the grantee's take (payment leg, debited from the grantor).
     let dvp = build_dvp(to, grantor, take, give, intent)?;
     Ok(CanExecuteSettlement {
-        debited_asset: AssetId::new(dvp.payment_leg.asset_definition_id.clone(), grantor.clone()),
+        debited_asset: AssetId::with_scope(dvp.payment_leg.asset_definition_id.clone(), grantor.clone(), scope),
         settlement_id: dvp.settlement_id.clone(),
         intent_hash: dvp.intent_hash(),
     })
 }
 
 /// `Grant<CanExecuteSettlement>` from `grantor` to `to`.
-pub fn build_grant(grantor: &AccountId, to: &AccountId, give: &Side, take: &Side, intent: &[u8; 32]) -> Result<InstructionBox> {
-    Ok(Grant::account_permission(build_consent(grantor, to, give, take, intent)?, to.clone()).into())
+pub fn build_grant(
+    grantor: &AccountId,
+    to: &AccountId,
+    give: &Side,
+    take: &Side,
+    intent: &[u8; 32],
+    scope: AssetBalanceScope,
+) -> Result<InstructionBox> {
+    Ok(Grant::account_permission(build_consent(grantor, to, give, take, intent, scope)?, to.clone()).into())
 }
 
 /// Validate the public terms of a request without any key or chain access (the server answers 400 on failure).
@@ -129,7 +163,9 @@ pub(crate) fn submit(cfg: &Config, client: &Client, instruction: InstructionBox)
 /// `rd-dfabi settle-grant`: grant `CanExecuteSettlement` from the config's own account to `to`.
 pub fn settle_grant(cfg: &Config, to: &str, give: &str, take: &str, intent: &str) -> Result<String> {
     let (client, own) = own_client(cfg)?;
-    let grant = build_grant(&own, &parse_account(to)?, &Side::parse(give)?, &Side::parse(take)?, &parse_intent(intent)?)?;
+    let give = Side::parse(give)?;
+    let scope = home_scope(cfg, &give.asset);
+    let grant = build_grant(&own, &parse_account(to)?, &give, &Side::parse(take)?, &parse_intent(intent)?, scope)?;
     submit(cfg, &client, grant)
 }
 
@@ -171,6 +207,34 @@ mod tests {
 
     fn intent(byte: u8) -> [u8; 32] {
         [byte; 32]
+    }
+
+    /// The home bucket of RD and DFABI in the live genesis: `#dataspace:1` (ds-rd).
+    fn home() -> AssetBalanceScope {
+        AssetBalanceScope::Dataspace(DataSpaceId::new(1))
+    }
+
+    /// Core refuses a consent on a DataspaceRestricted asset whose `debited_asset` is Global (iroha@071e281e
+    /// settlement.rs:333-338, "settlement consent must name the exact dataspace balance for a restricted asset"; live tx
+    /// ac3e48f9.. Rejected at block 19). RD and DFABI share ONE home dataspace, ds-rd = lanes.rd; any other asset stays Global.
+    #[test]
+    fn restricted_assets_live_in_the_home_dataspace_and_every_other_asset_is_global() {
+        let (rd, dfabi) = (asset_literal(1), asset_literal(2));
+        let restricted = [rd.as_str(), dfabi.as_str()];
+        assert_eq!(scope_of(&restricted, 1, &asset(1)), home());
+        assert_eq!(scope_of(&restricted, 1, &asset(2)), home(), "DFABI is homed in ds-rd too, not in lanes.dfabi");
+        assert_eq!(scope_of(&restricted, 1, &asset(3)), AssetBalanceScope::Global);
+        assert_eq!(scope_of(&["not-an-id", "x"], 1, &asset(1)), AssetBalanceScope::Global);
+    }
+
+    #[test]
+    fn the_consent_names_the_exact_scoped_balance_of_the_grantor() {
+        let (a, b) = (account(1), account(2));
+        let consent = build_consent(&b, &a, &side(2, 10), &side(1, 5), &intent(9), home()).unwrap();
+        assert_eq!(consent.debited_asset, AssetId::with_scope(asset(2), b.clone(), home()));
+        let global = build_consent(&b, &a, &side(2, 10), &side(1, 5), &intent(9), AssetBalanceScope::Global).unwrap();
+        assert_eq!(global.debited_asset, AssetId::new(asset(2), b));
+        assert_eq!(consent.intent_hash, global.intent_hash, "the scope is not part of the DvP intent");
     }
 
     #[test]
@@ -265,10 +329,10 @@ mod tests {
     fn grant_is_the_exact_can_execute_settlement_for_the_payment_balance() {
         let (a, b) = (account(1), account(2));
         // B grants A. B gives asset 2 (payment leg, debited from B) and takes asset 1.
-        let grant = build_grant(&b, &a, &side(2, 10), &side(1, 5), &intent(9)).unwrap();
+        let grant = build_grant(&b, &a, &side(2, 10), &side(1, 5), &intent(9), home()).unwrap();
         let dvp = build_dvp(&a, &b, &side(1, 5), &side(2, 10), &intent(9)).unwrap();
         let token = CanExecuteSettlement {
-            debited_asset: AssetId::new(asset(2), b),
+            debited_asset: AssetId::with_scope(asset(2), b, home()),
             settlement_id: dvp.settlement_id.clone(),
             intent_hash: dvp.intent_hash(),
         };
@@ -278,20 +342,20 @@ mod tests {
     #[test]
     fn consent_matches_the_counterpartys_dvp_and_nothing_else() {
         let (a, b) = (account(1), account(2));
-        let consent = build_consent(&b, &a, &side(2, 10), &side(1, 5), &intent(9)).unwrap();
+        let consent = build_consent(&b, &a, &side(2, 10), &side(1, 5), &intent(9), home()).unwrap();
         let dvp = build_dvp(&a, &b, &side(1, 5), &side(2, 10), &intent(9)).unwrap();
         assert_eq!(consent.intent_hash, dvp.intent_hash());
         assert_eq!(consent.settlement_id, dvp.settlement_id);
-        let other_amount = build_consent(&b, &a, &side(2, 11), &side(1, 5), &intent(9)).unwrap();
+        let other_amount = build_consent(&b, &a, &side(2, 11), &side(1, 5), &intent(9), home()).unwrap();
         assert_ne!(other_amount.intent_hash, dvp.intent_hash());
-        let other_intent = build_consent(&b, &a, &side(2, 10), &side(1, 5), &intent(8)).unwrap();
+        let other_intent = build_consent(&b, &a, &side(2, 10), &side(1, 5), &intent(8), home()).unwrap();
         assert_ne!(other_intent.intent_hash, dvp.intent_hash());
         assert_ne!(other_intent.settlement_id, dvp.settlement_id);
     }
 
     #[test]
     fn grant_refuses_the_same_asset_on_both_legs_and_a_self_grant() {
-        assert!(build_grant(&account(2), &account(1), &side(2, 10), &side(2, 5), &intent(1)).is_err());
-        assert!(build_grant(&account(2), &account(2), &side(2, 10), &side(1, 5), &intent(1)).is_err());
+        assert!(build_grant(&account(2), &account(1), &side(2, 10), &side(2, 5), &intent(1), home()).is_err());
+        assert!(build_grant(&account(2), &account(2), &side(2, 10), &side(1, 5), &intent(1), home()).is_err());
     }
 }
