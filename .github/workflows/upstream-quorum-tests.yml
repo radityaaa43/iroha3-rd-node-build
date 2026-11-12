@@ -1,0 +1,48 @@
+name: upstream-quorum-tests
+# Runs the UNMODIFIED upstream tests that back the S13 claim "the private-settlement auditor committee tolerates one unavailable or substituted endpoint (3 of 4)",
+# at the pinned upstream commit (hyperledger-iroha/iroha@071e281e), on the GitHub runner. Read-only evidence: no secrets, no permissions beyond contents: read, no image build, no push.
+# The pass lines are printed in the job log and in the step summary; they are quoted in the S13 record.
+on:
+  pull_request:
+    paths: ['.github/workflows/upstream-quorum-tests.yml']
+  workflow_dispatch:
+permissions:
+  contents: read
+env:
+  IROHA_COMMIT: 071e281e778c5928cab4d6e007b7ddc9b050df27
+jobs:
+  quorum:
+    runs-on: ubuntu-latest
+    timeout-minutes: 180
+    # same builder base as driver/build.sh (rust 1.93.1-slim-bookworm), pinned by digest
+    container: rust@sha256:5b9332190bb3b9ece73b810cd1f1e9f06343b294ce184bcb067f0747d7d333ea
+    env:
+      CARGO_BUILD_JOBS: 2
+      CARGO_TARGET_DIR: /tmp/target
+    steps:
+      - name: "builder packages"
+        run: apt-get update -y && apt-get install -y --no-install-recommends build-essential pkg-config git ca-certificates && apt-get clean
+      - name: "fetch upstream at the pinned commit"
+        run: |
+          git init -q /tmp/iroha
+          git -C /tmp/iroha fetch -q --depth 1 https://github.com/hyperledger-iroha/iroha "$IROHA_COMMIT"
+          git -C /tmp/iroha checkout -q FETCH_HEAD
+          test "$(git -C /tmp/iroha rev-parse HEAD)" = "$IROHA_COMMIT"
+          echo "upstream at $(git -C /tmp/iroha rev-parse HEAD)"
+      - name: "cargo test -p iroha (the four quorum tests, unmodified)"
+        working-directory: /tmp/iroha
+        shell: bash
+        run: |
+          set -o pipefail
+          cargo test -p iroha --lib -- \
+            auditor_quorum_ignores_one_substituted_responder \
+            auditor_quorum_rejects_fewer_than_three_aligned_responders \
+            availability_public_certifier_tolerates_one_http_failure_and_verifies_three_real_shares \
+            availability_collection_preserves_every_three_of_four_quorum_and_roster_failure \
+            2>&1 | tee /tmp/quorum.log
+          grep -E '^test .* \.\.\. ' /tmp/quorum.log > /tmp/pass-lines.txt || true
+          echo "## upstream quorum tests @ ${IROHA_COMMIT:0:8}" >> "$GITHUB_STEP_SUMMARY"
+          sed 's/^/    /' /tmp/pass-lines.txt >> "$GITHUB_STEP_SUMMARY"
+          # exactly the four named tests ran and all passed (a renamed or filtered-out test must fail the job, not pass with zero tests)
+          test "$(grep -c ' \.\.\. ok$' /tmp/pass-lines.txt)" = 4
+          grep -Eq '^test result: ok\. 4 passed; 0 failed' /tmp/quorum.log
