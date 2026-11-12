@@ -310,10 +310,7 @@ impl Auditor {
                 },
             )
             .wrap_err("submit approval quorum")?;
-        ensure!(
-            response.lifecycle == PrivateSettlementLifecycleDtoV1::Audited,
-            "approval quorum was not durable"
-        );
+        ensure!(approval_durable(response.lifecycle, response.collected), "approval quorum was not durable");
         // Written only after the quorum is durable: a crash before this line re-approves
         // the same leg on retry instead of skipping it forever.
         write_record(&record_path, &bundle_id, leg, "approved", &plaintext)?;
@@ -323,6 +320,17 @@ impl Auditor {
 
     fn record_path(&self, bundle_id: &str, leg: u8) -> PathBuf {
         self.cfg.auditor.store_dir.join(bundle_id).join(format!("{leg}.json"))
+    }
+}
+
+/// A submitted approval is durable once the committee counts it: below a k > 1 threshold the leg stays Collecting
+/// (collected >= 1); the k-th approval moves it to Audited and later stages. Aborted or Expired legs count nothing.
+fn approval_durable(lifecycle: PrivateSettlementLifecycleDtoV1, collected: u8) -> bool {
+    use PrivateSettlementLifecycleDtoV1::*;
+    match lifecycle {
+        Collecting => collected >= 1,
+        Audited | Prepared | CommitCertified | Finalized => true,
+        Aborted | Expired => false,
     }
 }
 
@@ -411,6 +419,23 @@ fn write_record(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    use PrivateSettlementLifecycleDtoV1::*;
+
+    /// Live RED (a) 2026-11-12T19:03Z, 2-of-3: bank-a's approval was recorded (lifecycle Collecting, collected 1 of 2) but the
+    /// auditor demanded Audited and answered 500 "approval quorum was not durable"; the client counted it Unavailable and the
+    /// bundle aborted although bank-b's approval completed the threshold. Only the k-th approval sees Audited.
+    #[test]
+    fn an_approval_is_durable_once_counted_even_below_the_threshold() {
+        assert!(approval_durable(Collecting, 1));
+        assert!(approval_durable(Audited, 2));
+        for later in [Prepared, CommitCertified, Finalized] {
+            assert!(approval_durable(later, 2), "{later:?}");
+        }
+        assert!(!approval_durable(Collecting, 0), "nothing counted");
+        assert!(!approval_durable(Aborted, 1));
+        assert!(!approval_durable(Expired, 1));
+    }
 
     const RD: &str = "7onbjg2gRXveoAAUFsohCZyGW98t";
     const DFABI: &str = "4mBWK1JCwQdHLDPpuVKc56eLsXka";
