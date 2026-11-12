@@ -977,6 +977,9 @@ pub(crate) fn govern_with(
 ) -> Result<Governed> {
     ensure!(!auditors.is_empty(), "an audit policy needs at least one auditor");
     ensure!((1..=auditors.len()).contains(&min_approvals), "min_approvals {min_approvals} must be between 1 and the {} auditors", auditors.len());
+    // Core wants the roster strictly ascending by auditor_id (iroha@071e281e nexus/private_settlement.rs:2228-2237); configs list URLs.
+    let mut auditors = auditors.to_vec();
+    auditors.sort_by_key(|(key, _)| AccountId::new(key.clone()));
     let policy = PrivateSettlementAuditPolicyV1::new(PrivateSettlementAuditPolicyBodyV1 {
         version: ATOMIC_PRIVATE_SETTLEMENT_VERSION_V1,
         dataspace_id: route.dataspace_id,
@@ -1769,6 +1772,21 @@ mod govern_policy_tests {
         let governed = govern_with(route(), RD.parse().unwrap(), 100, Some(200), &auditors(3), 2).unwrap();
         assert_eq!(governed.policy.body.min_approvals, 2);
         assert_eq!(governed.policy.body.auditors.len(), 3);
+    }
+
+    /// Live pool-init 2026-11-12T18:24Z stopped before any tx with "private settlement auditors must be strictly ordered and
+    /// unique": core wants the policy roster ascending by auditor_id (iroha@071e281e data_model nexus/private_settlement.rs:2228-2237),
+    /// the config lists the auditors in URL order (bi, bank-a, bank-b). Any input order must give the canonical roster.
+    #[test]
+    fn the_policy_roster_is_canonical_whatever_the_config_order() {
+        let mut list = auditors(3);
+        list.sort_by_key(|(key, _)| std::cmp::Reverse(AccountId::new(key.clone())));
+        let governed = govern_with(route(), RD.parse().unwrap(), 100, Some(200), &list, 2).unwrap();
+        let ids: Vec<_> = governed.policy.body.auditors.iter().map(|a| a.auditor_id.clone()).collect();
+        let mut sorted = ids.clone();
+        sorted.sort();
+        assert_eq!(ids, sorted);
+        assert_eq!(ids.len(), 3);
     }
 
     #[test]
