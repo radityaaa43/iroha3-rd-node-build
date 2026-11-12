@@ -42,6 +42,7 @@ mod server;
 mod http;
 mod pools;
 mod tls_http;
+mod transfer;
 mod tree;
 mod tx_detail;
 mod wallet;

@@ -164,6 +164,7 @@ mod tests {
         mints: RefCell<Vec<MintTerms>>,
         txs: RefCell<Vec<String>>,
         balances: RefCell<Vec<String>>,
+        transfers: RefCell<Vec<MintTerms>>,
         /// `Some(message)` = the upstream refuses the balance query with this message.
         balance_refusal: Option<String>,
         /// `Some(message)` = the upstream refuses a transaction-details query with this message.
@@ -191,6 +192,15 @@ mod tests {
         fn mint(&self, terms: &MintTerms) -> Result<String> {
             self.mints.borrow_mut().push(terms.clone());
             if self.fail { Err(eyre::eyre!("chain refused")) } else { Ok("txh-mint".to_owned()) }
+        }
+
+        fn transfer_assets(&self) -> Result<Vec<AssetDefinitionId>> {
+            Ok(vec![asset(1).parse()?, asset(2).parse()?])
+        }
+
+        fn transfer(&self, terms: &MintTerms) -> Result<String> {
+            self.transfers.borrow_mut().push(terms.clone());
+            if self.fail { Err(eyre::eyre!("chain refused")) } else { Ok("txh-transfer".to_owned()) }
         }
 
         fn balance(&self, asset: &str) -> Result<String> {
@@ -232,6 +242,35 @@ mod tests {
 
     fn json(text: &str) -> serde_json::Value {
         serde_json::from_str(text).unwrap()
+    }
+
+    fn transfer_body(asset_n: u8, amount: &str) -> String {
+        format!(r#"{{"to":"{}","asset":"{}","amount":"{amount}"}}"#, account(), asset(asset_n))
+    }
+
+    #[test]
+    fn a_valid_transfer_of_a_configured_asset_is_submitted_once() {
+        let fake = Fake::default();
+        let (status, response) = route("POST", "/transfer", &transfer_body(1, "7"), &fake);
+        assert_eq!((status, json(&response)), (200, serde_json::json!({"tx_hash": "txh-transfer", "status": "Applied"})));
+        assert_eq!(*fake.transfers.borrow(), vec![MintTerms { to: account(), asset: asset(1), amount: "7".to_owned() }]);
+    }
+
+    #[test]
+    fn a_transfer_of_another_asset_a_zero_amount_or_garbage_is_400_and_a_get_is_405() {
+        let fake = Fake::default();
+        let unknown = transfer_body(1, "7").replace('}', r#","from":"x"}"#);
+        for bad in [transfer_body(3, "7"), transfer_body(1, "0"), transfer_body(1, "-1"), "{}".to_owned(), "x".to_owned(), unknown] {
+            assert_eq!(route("POST", "/transfer", &bad, &fake).0, 400, "{bad}");
+        }
+        assert_eq!(route("GET", "/transfer", "", &fake).0, 405);
+        assert!(fake.transfers.borrow().is_empty());
+    }
+
+    #[test]
+    fn a_refused_transfer_is_502() {
+        let fake = Fake { fail: true, ..Fake::default() };
+        assert_eq!(route("POST", "/transfer", &transfer_body(1, "7"), &fake).0, 502);
     }
 
     #[test]

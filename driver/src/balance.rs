@@ -75,6 +75,16 @@ mod tests {
         }
     }
 
+    /// RD and DFABI balances sit in the `#dataspace:<home>` bucket; a Global id finds nothing (live: 404 "Failed to find
+    /// asset" for every party after Applied mints; FindAssetById reads the exact key, iroha@071e281e isi/asset.rs:8217).
+    #[test]
+    fn the_query_names_the_scoped_bucket_not_the_global_one() {
+        let src = include_str!("balance.rs");
+        let fetch = &src[src.find("pub fn fetch").unwrap()..src.find("#[cfg(test)]").unwrap()];
+        assert!(fetch.contains("AssetId::with_scope(") && fetch.contains("home_scope(cfg"), "fetch must query the scoped bucket");
+        assert!(!fetch.contains("AssetId::new("), "a Global id never finds a DataspaceRestricted balance");
+    }
+
     #[test]
     fn wrap_puts_account_asset_and_the_unchanged_asset_json_in_one_object() {
         let body = wrap("acct", RD, r#"{"id":"x","value":"5"}"#);

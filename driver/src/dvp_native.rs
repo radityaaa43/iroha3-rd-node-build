@@ -173,6 +173,34 @@ mod tests {
         [byte; 32]
     }
 
+    /// The home bucket of RD and DFABI in the live genesis: `#dataspace:1` (ds-rd).
+    fn home() -> AssetBalanceScope {
+        AssetBalanceScope::Dataspace(DataSpaceId::new(1))
+    }
+
+    /// Core refuses a consent on a DataspaceRestricted asset whose `debited_asset` is Global (iroha@071e281e
+    /// settlement.rs:333-338, "settlement consent must name the exact dataspace balance for a restricted asset"; live tx
+    /// ac3e48f9.. Rejected at block 19). RD and DFABI share ONE home dataspace, ds-rd = lanes.rd; any other asset stays Global.
+    #[test]
+    fn restricted_assets_live_in_the_home_dataspace_and_every_other_asset_is_global() {
+        let (rd, dfabi) = (asset_literal(1), asset_literal(2));
+        let restricted = [rd.as_str(), dfabi.as_str()];
+        assert_eq!(scope_of(&restricted, 1, &asset(1)), home());
+        assert_eq!(scope_of(&restricted, 1, &asset(2)), home(), "DFABI is homed in ds-rd too, not in lanes.dfabi");
+        assert_eq!(scope_of(&restricted, 1, &asset(3)), AssetBalanceScope::Global);
+        assert_eq!(scope_of(&["not-an-id", "x"], 1, &asset(1)), AssetBalanceScope::Global);
+    }
+
+    #[test]
+    fn the_consent_names_the_exact_scoped_balance_of_the_grantor() {
+        let (a, b) = (account(1), account(2));
+        let consent = build_consent(&b, &a, &side(2, 10), &side(1, 5), &intent(9), home()).unwrap();
+        assert_eq!(consent.debited_asset, AssetId::with_scope(asset(2), b.clone(), home()));
+        let global = build_consent(&b, &a, &side(2, 10), &side(1, 5), &intent(9), AssetBalanceScope::Global).unwrap();
+        assert_eq!(global.debited_asset, AssetId::new(asset(2), b));
+        assert_eq!(consent.intent_hash, global.intent_hash, "the scope is not part of the DvP intent");
+    }
+
     #[test]
     fn side_parses_asset_and_amount() {
         assert_eq!(Side::parse(&format!("{}:250", asset_literal(1))).unwrap(), side(1, 250));
@@ -265,10 +293,10 @@ mod tests {
     fn grant_is_the_exact_can_execute_settlement_for_the_payment_balance() {
         let (a, b) = (account(1), account(2));
         // B grants A. B gives asset 2 (payment leg, debited from B) and takes asset 1.
-        let grant = build_grant(&b, &a, &side(2, 10), &side(1, 5), &intent(9)).unwrap();
+        let grant = build_grant(&b, &a, &side(2, 10), &side(1, 5), &intent(9), home()).unwrap();
         let dvp = build_dvp(&a, &b, &side(1, 5), &side(2, 10), &intent(9)).unwrap();
         let token = CanExecuteSettlement {
-            debited_asset: AssetId::new(asset(2), b),
+            debited_asset: AssetId::with_scope(asset(2), b, home()),
             settlement_id: dvp.settlement_id.clone(),
             intent_hash: dvp.intent_hash(),
         };
@@ -278,20 +306,20 @@ mod tests {
     #[test]
     fn consent_matches_the_counterpartys_dvp_and_nothing_else() {
         let (a, b) = (account(1), account(2));
-        let consent = build_consent(&b, &a, &side(2, 10), &side(1, 5), &intent(9)).unwrap();
+        let consent = build_consent(&b, &a, &side(2, 10), &side(1, 5), &intent(9), home()).unwrap();
         let dvp = build_dvp(&a, &b, &side(1, 5), &side(2, 10), &intent(9)).unwrap();
         assert_eq!(consent.intent_hash, dvp.intent_hash());
         assert_eq!(consent.settlement_id, dvp.settlement_id);
-        let other_amount = build_consent(&b, &a, &side(2, 11), &side(1, 5), &intent(9)).unwrap();
+        let other_amount = build_consent(&b, &a, &side(2, 11), &side(1, 5), &intent(9), home()).unwrap();
         assert_ne!(other_amount.intent_hash, dvp.intent_hash());
-        let other_intent = build_consent(&b, &a, &side(2, 10), &side(1, 5), &intent(8)).unwrap();
+        let other_intent = build_consent(&b, &a, &side(2, 10), &side(1, 5), &intent(8), home()).unwrap();
         assert_ne!(other_intent.intent_hash, dvp.intent_hash());
         assert_ne!(other_intent.settlement_id, dvp.settlement_id);
     }
 
     #[test]
     fn grant_refuses_the_same_asset_on_both_legs_and_a_self_grant() {
-        assert!(build_grant(&account(2), &account(1), &side(2, 10), &side(2, 5), &intent(1)).is_err());
-        assert!(build_grant(&account(2), &account(2), &side(2, 10), &side(1, 5), &intent(1)).is_err());
+        assert!(build_grant(&account(2), &account(1), &side(2, 10), &side(2, 5), &intent(1), home()).is_err());
+        assert!(build_grant(&account(2), &account(2), &side(2, 10), &side(1, 5), &intent(1), home()).is_err());
     }
 }
