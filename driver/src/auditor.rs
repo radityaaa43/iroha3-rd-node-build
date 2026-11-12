@@ -412,6 +412,23 @@ fn write_record(
 mod tests {
     use super::*;
 
+    use PrivateSettlementLifecycleDtoV1::*;
+
+    /// Live RED (a) 2026-11-12T19:03Z, 2-of-3: bank-a's approval was recorded (lifecycle Collecting, collected 1 of 2) but the
+    /// auditor demanded Audited and answered 500 "approval quorum was not durable"; the client counted it Unavailable and the
+    /// bundle aborted although bank-b's approval completed the threshold. Only the k-th approval sees Audited.
+    #[test]
+    fn an_approval_is_durable_once_counted_even_below_the_threshold() {
+        assert!(approval_durable(Collecting, 1));
+        assert!(approval_durable(Audited, 2));
+        for later in [Prepared, CommitCertified, Finalized] {
+            assert!(approval_durable(later, 2), "{later:?}");
+        }
+        assert!(!approval_durable(Collecting, 0), "nothing counted");
+        assert!(!approval_durable(Aborted, 1));
+        assert!(!approval_durable(Expired, 1));
+    }
+
     const RD: &str = "7onbjg2gRXveoAAUFsohCZyGW98t";
     const DFABI: &str = "4mBWK1JCwQdHLDPpuVKc56eLsXka";
 
