@@ -977,6 +977,9 @@ pub(crate) fn govern_with(
 ) -> Result<Governed> {
     ensure!(!auditors.is_empty(), "an audit policy needs at least one auditor");
     ensure!((1..=auditors.len()).contains(&min_approvals), "min_approvals {min_approvals} must be between 1 and the {} auditors", auditors.len());
+    // Core wants the roster strictly ascending by auditor_id (iroha@071e281e nexus/private_settlement.rs:2228-2237); configs list URLs.
+    let mut auditors = auditors.to_vec();
+    auditors.sort_by_key(|(key, _)| AccountId::new(key.clone()));
     let policy = PrivateSettlementAuditPolicyV1::new(PrivateSettlementAuditPolicyBodyV1 {
         version: ATOMIC_PRIVATE_SETTLEMENT_VERSION_V1,
         dataspace_id: route.dataspace_id,
