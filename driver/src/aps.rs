@@ -1771,6 +1771,21 @@ mod govern_policy_tests {
         assert_eq!(governed.policy.body.auditors.len(), 3);
     }
 
+    /// Live pool-init 2026-11-12T18:24Z stopped before any tx with "private settlement auditors must be strictly ordered and
+    /// unique": core wants the policy roster ascending by auditor_id (iroha@071e281e data_model nexus/private_settlement.rs:2228-2237),
+    /// the config lists the auditors in URL order (bi, bank-a, bank-b). Any input order must give the canonical roster.
+    #[test]
+    fn the_policy_roster_is_canonical_whatever_the_config_order() {
+        let mut list = auditors(3);
+        list.sort_by_key(|(key, _)| std::cmp::Reverse(AccountId::new(key.clone())));
+        let governed = govern_with(route(), RD.parse().unwrap(), 100, Some(200), &list, 2).unwrap();
+        let ids: Vec<_> = governed.policy.body.auditors.iter().map(|a| a.auditor_id.clone()).collect();
+        let mut sorted = ids.clone();
+        sorted.sort();
+        assert_eq!(ids, sorted);
+        assert_eq!(ids.len(), 3);
+    }
+
     #[test]
     fn k_zero_k_above_n_and_no_auditor_are_refused() {
         assert!(govern_with(route(), RD.parse().unwrap(), 100, Some(200), &auditors(3), 0).is_err());
