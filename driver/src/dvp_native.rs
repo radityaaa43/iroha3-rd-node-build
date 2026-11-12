@@ -19,7 +19,7 @@ use iroha::{
     client::AccountTransactionDraft,
     data_model::{
         account::AccountId,
-        asset::{AssetDefinitionId, AssetId},
+        asset::{AssetBalanceScope, AssetDefinitionId, AssetId},
         isi::{
             DvpIsi, Grant, InstructionBox, SettlementAtomicity, SettlementExecutionOrder, SettlementId, SettlementLeg,
             SettlementPlan,
@@ -28,7 +28,7 @@ use iroha::{
     executor_data_model::permission::settlement::CanExecuteSettlement,
 };
 use iroha_crypto::PublicKey;
-use iroha_model_base::metadata::Metadata;
+use iroha_model_base::{metadata::Metadata, topology::DataSpaceId};
 
 use crate::{aps::bounded_fee, config::Config};
 
@@ -82,20 +82,54 @@ pub fn build_dvp(submitter: &AccountId, counterparty: &AccountId, give: &Side, t
     ))
 }
 
-/// The consent `grantor` gives to `to` (the future submitter), in the grantor's own give/take terms.
-pub fn build_consent(grantor: &AccountId, to: &AccountId, give: &Side, take: &Side, intent: &[u8; 32]) -> Result<CanExecuteSettlement> {
+/// Balance scope of `asset`: the `restricted` ids (RD, DFABI) live in the home dataspace `home_lane` (dataspace id = lane id),
+/// every other asset (the fee asset) is Global. An id that does not parse matches nothing.
+pub fn scope_of(restricted: &[&str], home_lane: u32, asset: &AssetDefinitionId) -> AssetBalanceScope {
+    if restricted.iter().any(|id| AssetDefinitionId::from_str(id).is_ok_and(|id| id == *asset)) {
+        AssetBalanceScope::Dataspace(DataSpaceId::new(u64::from(home_lane)))
+    } else {
+        AssetBalanceScope::Global
+    }
+}
+
+/// [`scope_of`] for the config's RD and DFABI. Both are DataspaceRestricted and homed in ONE dataspace, ds-rd
+/// (iroha3-rd-dfabi network/genesis-rd-dfabi.jq: a DvP across two restricted dataspaces cannot execute), so the home is
+/// `lanes.rd` for both.
+// ponytail: home fixed to lanes.rd; read the definition's owning domain from the chain if RD and DFABI ever move apart.
+pub fn home_scope(cfg: &Config, asset: &AssetDefinitionId) -> AssetBalanceScope {
+    scope_of(&[&cfg.assets.rd, &cfg.assets.dfabi], cfg.lanes.rd, asset)
+}
+
+/// The consent `grantor` gives to `to` (the future submitter), in the grantor's own give/take terms. `scope` is the balance
+/// bucket of the debited (give) asset: core refuses a Global bucket for a DataspaceRestricted asset (iroha@071e281e
+/// isi/settlement.rs:333-338).
+pub fn build_consent(
+    grantor: &AccountId,
+    to: &AccountId,
+    give: &Side,
+    take: &Side,
+    intent: &[u8; 32],
+    scope: AssetBalanceScope,
+) -> Result<CanExecuteSettlement> {
     // The grantee submits, so what the grantor gives is the grantee's take (payment leg, debited from the grantor).
     let dvp = build_dvp(to, grantor, take, give, intent)?;
     Ok(CanExecuteSettlement {
-        debited_asset: AssetId::new(dvp.payment_leg.asset_definition_id.clone(), grantor.clone()),
+        debited_asset: AssetId::with_scope(dvp.payment_leg.asset_definition_id.clone(), grantor.clone(), scope),
         settlement_id: dvp.settlement_id.clone(),
         intent_hash: dvp.intent_hash(),
     })
 }
 
 /// `Grant<CanExecuteSettlement>` from `grantor` to `to`.
-pub fn build_grant(grantor: &AccountId, to: &AccountId, give: &Side, take: &Side, intent: &[u8; 32]) -> Result<InstructionBox> {
-    Ok(Grant::account_permission(build_consent(grantor, to, give, take, intent)?, to.clone()).into())
+pub fn build_grant(
+    grantor: &AccountId,
+    to: &AccountId,
+    give: &Side,
+    take: &Side,
+    intent: &[u8; 32],
+    scope: AssetBalanceScope,
+) -> Result<InstructionBox> {
+    Ok(Grant::account_permission(build_consent(grantor, to, give, take, intent, scope)?, to.clone()).into())
 }
 
 /// Validate the public terms of a request without any key or chain access (the server answers 400 on failure).
@@ -129,7 +163,9 @@ pub(crate) fn submit(cfg: &Config, client: &Client, instruction: InstructionBox)
 /// `rd-dfabi settle-grant`: grant `CanExecuteSettlement` from the config's own account to `to`.
 pub fn settle_grant(cfg: &Config, to: &str, give: &str, take: &str, intent: &str) -> Result<String> {
     let (client, own) = own_client(cfg)?;
-    let grant = build_grant(&own, &parse_account(to)?, &Side::parse(give)?, &Side::parse(take)?, &parse_intent(intent)?)?;
+    let give = Side::parse(give)?;
+    let scope = home_scope(cfg, &give.asset);
+    let grant = build_grant(&own, &parse_account(to)?, &give, &Side::parse(take)?, &parse_intent(intent)?, scope)?;
     submit(cfg, &client, grant)
 }
 

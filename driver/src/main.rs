@@ -163,6 +163,12 @@ fn main() -> Result<()> {
             println!("tx_hash={} status=Applied", mint::mint(&Config::load(Path::new(config))?, &terms)?);
             Ok(())
         }
+        ["transfer", config, rest @ ..] => {
+            let flags = flags(rest)?;
+            let terms = mint::MintTerms { to: flags.get("to")?.to_owned(), asset: flags.get("asset")?.to_owned(), amount: flags.get("amount")?.to_owned() };
+            println!("tx_hash={} status=Applied", transfer::transfer(&Config::load(Path::new(config))?, &terms)?);
+            Ok(())
+        }
         ["server", config, "--listen", addr] => server::run(Config::load(Path::new(config))?, addr),
         ["abort-bundle", config, "--bundle", bundle] => pools::abort_bundle(&Config::load(Path::new(config))?, bundle),
         ["wallet", config, "--party", party] => pools::wallet(&Config::load(Path::new(config))?, party),

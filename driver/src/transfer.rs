@@ -5,16 +5,48 @@
 //! balance. The source is the own balance as a Global id: core resolves it, and the destination, into the execution
 //! dataspace that the router picks from the asset definition (iroha@071e281e isi/asset.rs execute_user_numeric_asset_transfer).
 
+use std::str::FromStr;
+
+use eyre::{Result, ensure, eyre};
+use iroha::data_model::{
+    account::AccountId,
+    asset::{AssetDefinitionId, AssetId},
+    isi::{InstructionBox, Transfer},
+};
+
+use crate::{config::Config, dvp_native, mint::MintTerms};
+
+/// The assets that may move here: the config's RD and DFABI.
+pub fn allowed(cfg: &Config) -> Result<Vec<AssetDefinitionId>> {
+    [&cfg.assets.rd, &cfg.assets.dfabi].iter().map(|id| AssetDefinitionId::from_str(id).map_err(|e| eyre!("config asset {id:?}: {e}"))).collect()
+}
+
+/// Validate the terms without any key or chain access (the server answers 400 on failure).
+pub fn check_transfer(terms: &MintTerms, allowed: &[AssetDefinitionId]) -> Result<(AccountId, AssetDefinitionId, u128)> {
+    let to = dvp_native::parse_account(&terms.to)?;
+    let amount = dvp_native::parse_amount(&terms.amount)?;
+    let asset = AssetDefinitionId::from_str(&terms.asset).map_err(|e| eyre!("asset {:?}: {e}", terms.asset))?;
+    ensure!(allowed.contains(&asset), "asset {:?} cannot be transferred here (RD and DFABI only)", terms.asset);
+    Ok((to, asset, amount))
+}
+
+/// The one instruction: move `amount` of the own `asset` balance to `to`.
+pub fn build_transfer(own: &AccountId, to: &AccountId, asset: &AssetDefinitionId, amount: u128) -> Result<InstructionBox> {
+    ensure!(own != to, "the destination must differ from the own account");
+    Ok(Transfer::asset_quantity(AssetId::new(asset.clone(), own.clone()), amount, to.clone()).into())
+}
+
+/// Check, sign with the own key, pay the bounded fee, wait for `Applied`; return the transaction hash.
+pub fn transfer(cfg: &Config, terms: &MintTerms) -> Result<String> {
+    let (to, asset, amount) = check_transfer(terms, &allowed(cfg)?)?;
+    let (client, own) = dvp_native::own_client(cfg)?;
+    dvp_native::submit(cfg, &client, build_transfer(&own, &to, &asset, amount)?)
+}
+
 #[cfg(test)]
 mod tests {
-    use iroha::data_model::{
-        account::AccountId,
-        asset::{AssetDefinitionId, AssetId},
-        isi::{InstructionBox, Transfer},
-    };
-
     use super::*;
-    use crate::{config::signing_key, mint::MintTerms};
+    use crate::config::signing_key;
 
     fn asset(n: u8) -> AssetDefinitionId {
         AssetDefinitionId::from_uuid_bytes([n, 0, 0, 0, 0, 0, 0x40, 0, 0x80, 0, 0, 0, 0, 0, 0, 0]).unwrap()

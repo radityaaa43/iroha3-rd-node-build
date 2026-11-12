@@ -43,7 +43,9 @@ pub fn fetch(cfg: &Config, asset: &str) -> Result<String> {
     let config = iroha::config::Config::load_file(&cfg.client_toml).map_err(|e| eyre!("load {}: {e:?}", cfg.client_toml.display()))?;
     let account = AccountId::new(config.key_pair.public_key().clone());
     let client = iroha::client::Client::builder(config).build()?;
-    let found = client.query_single(FindAssetById::new(AssetId::new(definition, account.clone()))).map_err(|e| eyre!("{e}"))?;
+    // RD/DFABI: the `#dataspace:<home>` bucket (a Global id finds nothing); the fee asset: Global.
+    let scope = crate::dvp_native::home_scope(cfg, &definition);
+    let found = client.query_single(FindAssetById::new(AssetId::with_scope(definition, account.clone(), scope))).map_err(|e| eyre!("{e}"))?;
     let json = norito::json::to_json(&found).map_err(|e| eyre!("encode asset: {e}"))?;
     Ok(wrap(&account.to_string(), asset, &json))
 }

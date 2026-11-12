@@ -1,7 +1,7 @@
 //! Per-bank driver server mode (iroha3 PLAN S17, ARCHITECTURE-iroha3 row 10a, docs/server-mode.md).
 //!
 //! A thin HTTP wrapper over the two D-native commands of `dvp_native.rs`, running in ONE bank's namespace with that bank's own
-//! client.toml (own key, own Torii). It exposes exactly: `GET /healthz`, `POST /settle-grant`, `POST /dvp-native`, `POST /mint` (403 unless the config sets `mint_enabled`: BI only) and `GET /tx/{hash}` (a signed query with the own key). Request bodies
+//! client.toml (own key, own Torii). It exposes exactly: `GET /healthz`, `POST /settle-grant`, `POST /dvp-native`, `POST /mint` (403 unless the config sets `mint_enabled`: BI only), `POST /transfer` (RD/DFABI from the own account) and `GET /tx/{hash}` (a signed query with the own key). Request bodies
 //! carry public terms only; nothing secret is read from a request, written to a response or logged.
 
 use std::sync::Mutex;
@@ -14,8 +14,9 @@ use crate::{
     dvp_native, http,
     mint::{self, MintPolicy, MintTerms},
     tx_detail,
-    balance,
+    balance, transfer,
 };
+use iroha::data_model::asset::AssetDefinitionId;
 
 /// Public terms of one D-native DvP, in the calling bank's own give/take view (see `dvp_native.rs`).
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
@@ -36,6 +37,10 @@ pub trait Submitter {
     /// `Some` only on the BI driver (config `mint_enabled`); `None` = every `/mint` is refused with 403.
     fn mint_policy(&self) -> Result<Option<MintPolicy>>;
     fn mint(&self, terms: &MintTerms) -> Result<String>;
+    /// The assets `/transfer` may move (the config's RD and DFABI).
+    fn transfer_assets(&self) -> Result<Vec<AssetDefinitionId>>;
+    /// ONE native transfer from the own account (`transfer::transfer`); terms already checked.
+    fn transfer(&self, terms: &MintTerms) -> Result<String>;
     /// Signed transaction-details query with the own key (`tx_detail::fetch`); `hash` is already validated.
     fn tx(&self, hash: &str) -> Result<String>;
     /// Signed query of the own account's balance of ONE asset (`balance::fetch`); `asset` is already validated.
@@ -82,6 +87,23 @@ pub fn route(method: &str, path: &str, body: &str, submitter: &dyn Submitter) ->
             }
         },
         (_, "/mint") => error(405, "method not allowed".to_owned()),
+        ("POST", "/transfer") => {
+            let terms: MintTerms = match serde_json::from_str(body) {
+                Ok(terms) => terms,
+                Err(e) => return error(400, format!("bad request body: {e}")),
+            };
+            match submitter.transfer_assets() {
+                Err(e) => error(502, format!("{e:#}")),
+                Ok(allowed) => match transfer::check_transfer(&terms, &allowed) {
+                    Err(e) => error(400, format!("{e:#}")),
+                    Ok(_) => match submitter.transfer(&terms) {
+                        Ok(hash) => reply(200, serde_json::json!({ "tx_hash": hash, "status": "Applied" })),
+                        Err(e) => error(502, format!("{e:#}")),
+                    },
+                },
+            }
+        }
+        (_, "/transfer") => error(405, "method not allowed".to_owned()),
         ("GET", p) if p.starts_with("/tx/") => match tx_detail::check_hash(&p["/tx/".len()..]) {
             Err(e) => error(400, format!("{e:#}")),
             Ok(hash) => match submitter.tx(&hash) {
@@ -128,6 +150,16 @@ impl Submitter for Real {
         mint::mint(&cfg, terms)
     }
 
+    fn transfer_assets(&self) -> Result<Vec<AssetDefinitionId>> {
+        let cfg = self.cfg.lock().unwrap_or_else(|p| p.into_inner());
+        transfer::allowed(&cfg)
+    }
+
+    fn transfer(&self, terms: &MintTerms) -> Result<String> {
+        let cfg = self.cfg.lock().unwrap_or_else(|p| p.into_inner());
+        transfer::transfer(&cfg, terms)
+    }
+
     fn tx(&self, hash: &str) -> Result<String> {
         let cfg = self.cfg.lock().unwrap_or_else(|p| p.into_inner());
         tx_detail::fetch(&cfg, hash)
@@ -152,8 +184,6 @@ pub fn run(cfg: Config, listen: &str) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use std::cell::RefCell;
-
-    use iroha::data_model::asset::AssetDefinitionId;
 
     use super::*;
     use crate::config::signing_key;
@@ -195,7 +225,7 @@ mod tests {
         }
 
         fn transfer_assets(&self) -> Result<Vec<AssetDefinitionId>> {
-            Ok(vec![asset(1).parse()?, asset(2).parse()?])
+            Ok(vec![asset(1).parse().unwrap(), asset(2).parse().unwrap()])
         }
 
         fn transfer(&self, terms: &MintTerms) -> Result<String> {
