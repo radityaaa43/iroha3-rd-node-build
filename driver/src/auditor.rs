@@ -310,10 +310,7 @@ impl Auditor {
                 },
             )
             .wrap_err("submit approval quorum")?;
-        ensure!(
-            response.lifecycle == PrivateSettlementLifecycleDtoV1::Audited,
-            "approval quorum was not durable"
-        );
+        ensure!(approval_durable(response.lifecycle, response.collected), "approval quorum was not durable");
         // Written only after the quorum is durable: a crash before this line re-approves
         // the same leg on retry instead of skipping it forever.
         write_record(&record_path, &bundle_id, leg, "approved", &plaintext)?;
@@ -323,6 +320,17 @@ impl Auditor {
 
     fn record_path(&self, bundle_id: &str, leg: u8) -> PathBuf {
         self.cfg.auditor.store_dir.join(bundle_id).join(format!("{leg}.json"))
+    }
+}
+
+/// A submitted approval is durable once the committee counts it: below a k > 1 threshold the leg stays Collecting
+/// (collected >= 1); the k-th approval moves it to Audited and later stages. Aborted or Expired legs count nothing.
+fn approval_durable(lifecycle: PrivateSettlementLifecycleDtoV1, collected: u8) -> bool {
+    use PrivateSettlementLifecycleDtoV1::*;
+    match lifecycle {
+        Collecting => collected >= 1,
+        Audited | Prepared | CommitCertified | Finalized => true,
+        Aborted | Expired => false,
     }
 }
 
