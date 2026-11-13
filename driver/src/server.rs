@@ -548,7 +548,7 @@ mod tests {
     fn aps_paths_go_to_the_aps_handlers_and_everything_else_stays_with_the_submitter() {
         use crate::aps_http::{Aps, testkit::{FakeBackend, FakePeer}};
         let (backend, peer) = (FakeBackend::default(), FakePeer::standard());
-        let aps = Aps::new(&backend, &peer, crate::config::ApsConfig::default());
+        let aps = Aps::new(&backend, &peer, crate::config::ApsConfig { coordinator: true, ..Default::default() });
         let fake = Fake::default();
         assert_eq!(dispatch("GET", "/aps/wallet", "", &fake, &aps).0, 200);
         assert_eq!(dispatch("POST", "/aps/wallet", "", &fake, &aps).0, 405);
