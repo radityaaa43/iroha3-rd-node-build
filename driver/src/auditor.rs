@@ -524,6 +524,22 @@ mod tests {
         assert_ne!(late_verdict(Finalized), "approved", "a late verdict never reads as a counted approval");
     }
 
+    /// Live 2026-11-13T03:01Z on #33 (bundle at h199, all three auditors up): the third auditor's submit was still refused
+    /// with "exact auditor quorum is unavailable" while the leg was AUDITED, not yet prepared. Upstream
+    /// sidecar_store::record_audit_approval: `Err(_) if durable.lifecycle == Audited => InvalidTransition`: once k approvals
+    /// are in, a NEW approver is refused (Audited only takes an idempotent retry of a counted approval). After a refused
+    /// submit, Audited is therefore late too; Collecting stays retryable; an aborted or expired leg is not recorded.
+    #[test]
+    fn a_refused_submit_is_late_once_the_threshold_is_met() {
+        assert!(!late_after_refusal(Collecting), "below the threshold a failure is retried, not recorded");
+        for closed in [Audited, Prepared, CommitCertified, Finalized] {
+            assert!(late_after_refusal(closed), "{closed:?}");
+        }
+        assert!(!late_after_refusal(Aborted));
+        assert!(!late_after_refusal(Expired));
+        assert_eq!(late_verdict(Audited), "approved (late: Audited)");
+    }
+
     #[test]
     fn a_late_answer_is_a_409_not_a_500() {
         let late: eyre::Report = Late(late_verdict(Prepared)).into();
