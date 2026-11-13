@@ -16,8 +16,8 @@ use eyre::{Result, WrapErr, bail, ensure};
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 
 use crate::{
-    config::{ApsConfig, Config, TlsConfig, signing_key},
-    dvp_native, http, pools,
+    config::{ApsConfig, TlsConfig},
+    dvp_native, http,
 };
 
 /// How long a registered intent stays usable (a restart forgets all of them: Lensa repeats the flow).
@@ -33,7 +33,7 @@ pub struct AddressReq {
     /// norito hex (`aps::enc`).
     pub route: String,
     pub expiry_height: u64,
-    /// norito hex (`aps::enc`).
+    /// The canonical `NetworkId` text literal (`hash:<HEX>#<CHECKSUM>`).
     pub network_id: String,
 }
 
@@ -120,7 +120,8 @@ pub trait ApsBackend: Send + Sync {
     fn sponsor_output(&self, ctx: &AddressReq, active: bool) -> Result<SponsorOutput>;
     /// Coordinator side: build the bundle manifest over the two pools.
     fn begin_bundle(&self) -> Result<BundleCtx>;
-    /// Payer side: scan the own notes, pick one, prove the leg; returns norito hex of `AtomicPrivateSettlementPreparedLegV1`.
+    /// Payer side: scan the own notes, pick one, prove the leg; returns the prepared leg as `statement.proof.capsule` (each hex:
+    /// `AtomicPrivateSettlementPreparedLegV1` has no norito codec upstream).
     /// The intent is already consumed; `req.intent` is empty for the coordinator's own BI -> BI companion leg.
     fn prove_leg(&self, req: &LegReq) -> Result<String>;
     /// Coordinator side: audit quorum, prepare, commit. `None` = the bundle was aborted (nothing moved).
@@ -322,7 +323,8 @@ fn check_intent(req: &IntentReq) -> Result<(String, IntentTerms)> {
 fn check_address(req: &AddressReq) -> Result<()> {
     ensure!(hex_n(&req.bundle_id, 32) && hex_n(&req.pool_id, 32), "bundle_id and pool_id must be 64 hex characters");
     ensure!(req.leg_ordinal < 2, "leg_ordinal must be 0 or 1");
-    ensure!(hex_any(&req.route) && hex_any(&req.network_id), "route and network_id must be hex");
+    ensure!(hex_any(&req.route), "route must be hex");
+    ensure!(!req.network_id.is_empty() && req.network_id.len() <= 200, "network_id must be the canonical text literal");
     Ok(())
 }
 
@@ -611,7 +613,7 @@ impl<'a> Aps<'a> {
                 self.backend.prove_leg(&req).map_err(fail)?
             } else {
                 let answer: Prepared = self.ask(&payer, "/aps/leg", &req)?;
-                if !hex_any(&answer.prepared) {
+                if !answer.prepared.split('.').all(hex_any) {
                     return Err(error(502, "/aps/leg: bad answer"));
                 }
                 answer.prepared
@@ -623,74 +625,6 @@ impl<'a> Aps<'a> {
             Some(done) => reply(200, serde_json::json!({ "outcome": "finalized", "bundle_id": bundle.bundle_id, "carrier_tx": done.carrier_tx, "height": done.height })),
             None => reply(200, serde_json::json!({ "outcome": "aborted", "bundle_id": bundle.bundle_id, "carrier_tx": null, "height": null })),
         })
-    }
-}
-
-/// The real backend, on the driver's own config. The calls that need the split-leg API (T1, `aps_split`) are not wired yet.
-pub struct RealBackend<'a> {
-    cfg: &'a Mutex<Config>,
-}
-
-impl<'a> RealBackend<'a> {
-    pub fn new(cfg: &'a Mutex<Config>) -> Self {
-        Self { cfg }
-    }
-}
-
-fn not_wired() -> eyre::Report {
-    eyre::eyre!("split leg not wired")
-}
-
-impl ApsBackend for RealBackend<'_> {
-    fn own_key(&self) -> Result<String> {
-        let cfg = self.cfg.lock().unwrap_or_else(|p| p.into_inner());
-        Ok(signing_key(&cfg.seed(&cfg.party)?).public_key().to_string())
-    }
-
-    fn address(&self, _req: &AddressReq) -> Result<OutputKey> {
-        Err(not_wired())
-    }
-
-    fn sponsor_output(&self, _ctx: &AddressReq, _active: bool) -> Result<SponsorOutput> {
-        Err(not_wired())
-    }
-
-    fn begin_bundle(&self) -> Result<BundleCtx> {
-        Err(not_wired())
-    }
-
-    fn prove_leg(&self, _req: &LegReq) -> Result<String> {
-        Err(not_wired())
-    }
-
-    fn settle(&self, _bundle: &BundleCtx, _prepared: &[String; 2]) -> Result<Option<Settled>> {
-        Err(not_wired())
-    }
-
-    fn bundles(&self) -> Result<BundleLists> {
-        let cfg = self.cfg.lock().unwrap_or_else(|p| p.into_inner());
-        let file = pools::PoolFile::load(&cfg.pools_file)?;
-        let mut lists = BundleLists::default();
-        for (asset, ids) in [(pools::Asset::Rd, &mut lists.rd), (pools::Asset::Dfabi, &mut lists.dfabi)] {
-            for bundle in file.finalized(asset) {
-                ids.push(bundle.id.clone());
-                lists.heights.insert(bundle.id, bundle.height);
-            }
-        }
-        Ok(lists)
-    }
-
-    fn merge_bundles(&self, lists: &BundleLists) -> Result<()> {
-        let cfg = self.cfg.lock().unwrap_or_else(|p| p.into_inner());
-        pools::PoolFile::update(&cfg.pools_file, |file| {
-            file.merge_finalized(pools::Asset::Rd, &lists.rd, &lists.heights);
-            file.merge_finalized(pools::Asset::Dfabi, &lists.dfabi, &lists.heights);
-        })
-    }
-
-    fn wallet(&self) -> Result<serde_json::Value> {
-        let cfg = self.cfg.lock().unwrap_or_else(|p| p.into_inner());
-        pools::wallet_json(&cfg, &cfg.party)
     }
 }
 

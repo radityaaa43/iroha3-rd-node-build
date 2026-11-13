@@ -10,7 +10,7 @@ use eyre::Result;
 use serde::Deserialize;
 
 use crate::{
-    aps_http,
+    aps_http, aps_real,
     config::Config,
     dvp_native, http,
     mint::{self, MintPolicy, MintTerms},
@@ -182,7 +182,7 @@ pub fn run(cfg: Config, listen: &str) -> Result<()> {
     let peer = aps_http::RealPeer { tls: cfg.tls.clone() };
     let aps_cfg = cfg.aps.clone();
     let real = Real { cfg: Mutex::new(cfg) };
-    let backend = aps_http::RealBackend::new(&real.cfg);
+    let backend = aps_real::RealBackend::new(&real.cfg);
     let aps = aps_http::Aps::new(&backend, &peer, aps_cfg);
     // One thread per connection: a bank's forwarded `/aps/submit` waits on BI while BI calls back into the same bank.
     http::serve_threaded(listen, |method, path, body| {

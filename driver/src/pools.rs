@@ -23,12 +23,13 @@ use iroha::{
         account::AccountId,
         isi::private_settlement::ActivatePrivateSettlementPoolV1,
         nexus::{
-            PrivateSettlementAuditNoteOpeningV1, PrivateSettlementHybridPublicKeyV1, PrivateSettlementReceiptV1,
-            PrivateSettlementRouteV1,
+            AtomicPrivateSettlementV1, PrivateSettlementAuditNoteOpeningV1, PrivateSettlementHybridPublicKeyV1,
+            PrivateSettlementReceiptV1, PrivateSettlementRouteV1,
         },
         privacy::{PrivacyCommitmentV1, PrivacyPoolIdV1, PrivacyProtocolIdV1},
     },
 };
+use iroha_core::privacy_engines::atomic_private_settlement::AtomicPrivateSettlementPreparedLegV1;
 use iroha_crypto::{Hash, PublicKey};
 use iroha_model_base::{
     metadata::Metadata,
@@ -38,10 +39,11 @@ use serde::{Deserialize, Serialize};
 
 use crate::{
     aps::{
-        Committee, EXPIRY_BLOCKS, Governed, Leg, LegNotes, Options, SPONSOR_REIMBURSEMENT, Spend, auditor_call,
+        Committee, EXPIRY_BLOCKS, Expect, Governed, Leg, LegNotes, Options, SPONSOR_REIMBURSEMENT, Spend, auditor_call,
         bounded_fee, committee, dec, enc, funding_with_secret, govern_until, on_big_stack, peak_rss, prepare_leg,
         proof_manifest, rnd, settle,
     },
+    aps_split::{LegPayer, OutputKey, prepare_leg_split},
     auditor::Keys,
     config::{Config, signing_key},
     history::PoolHistory,
@@ -377,13 +379,7 @@ fn run_bundle(cfg: &Config, legs: [LegSpec; 2], options: &Options, kind: &str) -
         spends.push((note, keys, history));
         governed.push(record.governed()?);
     }
-    let committees = governed
-        .iter()
-        .map(|g| {
-            let (authority, endpoints) = committee(cfg, g.route)?;
-            Ok(Committee { authority, endpoints })
-        })
-        .collect::<Result<Vec<_>>>()?;
+    let committees = committees_of(cfg, &governed)?;
     let network_id = *sponsor.client().network_id();
     let height = sponsor.client().get_privacy_capabilities()?.committed_height;
     let salt = rnd();
@@ -418,6 +414,33 @@ fn run_bundle(cfg: &Config, legs: [LegSpec; 2], options: &Options, kind: &str) -
         })?);
         println!("leg {ordinal} proved after {:?} {}", started.elapsed(), peak_rss());
     }
+    settle_recorded(cfg, &sponsor, manifest, &prepared, &governed, &committees, started, options)?;
+    println!("kind={kind}");
+    Ok(())
+}
+
+fn committees_of(cfg: &Config, governed: &[Governed]) -> Result<Vec<Committee>> {
+    governed
+        .iter()
+        .map(|g| {
+            let (authority, endpoints) = committee(cfg, g.route)?;
+            Ok(Committee { authority, endpoints })
+        })
+        .collect()
+}
+
+/// List the bundle as in flight in pools.json (recorded before submission, so a finalized bundle is never lost), settle it, record how it ended.
+#[allow(clippy::too_many_arguments)]
+fn settle_recorded(
+    cfg: &Config,
+    sponsor: &Client,
+    manifest: AtomicPrivateSettlementV1,
+    prepared: &[AtomicPrivateSettlementPreparedLegV1],
+    governed: &[Governed],
+    committees: &[Committee],
+    started: Instant,
+    options: &Options,
+) -> Result<Option<(String, u64)>> {
     let id = hex::encode(manifest.bundle_id.as_ref());
     PoolFile::update(&cfg.pools_file, |pools| {
         for asset in [Asset::Rd, Asset::Dfabi] {
@@ -425,12 +448,111 @@ fn run_bundle(cfg: &Config, legs: [LegSpec; 2], options: &Options, kind: &str) -
         }
     })?;
     let aborted = Cell::new(false);
-    let outcome = settle(cfg, &sponsor, manifest, &prepared, &governed, &committees, started, options, &aborted);
+    let outcome = settle(cfg, sponsor, manifest, prepared, governed, committees, started, options, &aborted);
     let end = bundle_end(&outcome, aborted.get());
     PoolFile::update(&cfg.pools_file, |pools| record_end(pools, &id, &end))?;
-    outcome?;
-    println!("kind={kind}");
-    Ok(())
+    outcome
+}
+
+/// What the coordinator fixes before any party signs or proves: the manifest and, per leg ([rd, dfabi]), its route, pool and committee digest.
+pub(crate) struct BundleStart {
+    pub manifest: AtomicPrivateSettlementV1,
+    pub salt: [u8; 32],
+    pub legs: Vec<(PrivateSettlementRouteV1, [u8; 32], Hash)>,
+}
+
+/// Coordinator: the manifest of a new bundle over the RD and DFABI pools (`run_bundle` up to the legs, with no payer's secret).
+pub(crate) fn begin_bundle(cfg: &Config) -> Result<BundleStart> {
+    let pools = PoolFile::load(&cfg.pools_file)?;
+    let (sponsor, sponsor_key) = cfg.acting_sponsor()?;
+    let governed = [pools.get(Asset::Rd).governed()?, pools.get(Asset::Dfabi).governed()?];
+    let committees = committees_of(cfg, &governed)?;
+    let network_id = *sponsor.client().network_id();
+    let height = sponsor.client().get_privacy_capabilities()?.committed_height;
+    let salt = rnd();
+    let manifest = proof_manifest(
+        network_id,
+        height,
+        height + EXPIRY_BLOCKS,
+        AccountId::new(sponsor_key.public_key().clone()),
+        bounded_fee(cfg)?,
+        &governed,
+        salt,
+    )?;
+    let legs = governed
+        .iter()
+        .zip(&committees)
+        .map(|(g, c)| {
+            let pool: [u8; 32] = *g.governance.body.pool_id.as_ref();
+            Ok((g.route, pool, c.authority.digest()?))
+        })
+        .collect::<Result<Vec<_>>>()?;
+    Ok(BundleStart { manifest, salt, legs })
+}
+
+/// Coordinator: settle a bundle whose legs the parties proved (the tail of `run_bundle`). An audit rejection aborts the
+/// bundle and is `None`, not an error.
+pub(crate) fn settle_bundle(cfg: &Config, manifest: AtomicPrivateSettlementV1, prepared: &[AtomicPrivateSettlementPreparedLegV1]) -> Result<Option<(String, u64)>> {
+    let pools = PoolFile::load(&cfg.pools_file)?;
+    let (sponsor, _) = cfg.acting_sponsor()?;
+    let governed = [pools.get(Asset::Rd).governed()?, pools.get(Asset::Dfabi).governed()?];
+    let committees = committees_of(cfg, &governed)?;
+    let options = Options { expect: Expect::Either, replay: false };
+    settle_recorded(cfg, &sponsor, manifest, prepared, &governed, &committees, Instant::now(), &options)
+}
+
+/// One leg as `POST /aps/leg` hands it to the payer.
+pub(crate) struct SplitLeg {
+    pub ordinal: usize,
+    pub manifest: AtomicPrivateSettlementV1,
+    pub authority_digest: Hash,
+    pub reimbursement_salt: [u8; 32],
+    pub recipient: PublicKey,
+    pub amount: u128,
+    pub recipient_output: OutputKey,
+    pub sponsor_output: OutputKey,
+}
+
+/// Payer side of one leg of a bundle the coordinator built: scan the own notes, pick one, prove with the own secrets only
+/// (`aps_split::prepare_leg_split`); the recipient's and the sponsor's outputs arrive signed by their owners.
+pub(crate) fn prove_split_leg(cfg: &Config, payer: &str, asset: Asset, leg: &SplitLeg) -> Result<AtomicPrivateSettlementPreparedLegV1> {
+    let pools = PoolFile::load(&cfg.pools_file)?;
+    let record = pools.get(asset);
+    let (client, _) = cfg.sponsor(payer)?;
+    let history = record.history(&client, &receipt_cache(cfg))?;
+    let keys = cfg.note_keys(payer)?;
+    let (unspent, _) = scan(&history, &keys, &origin_notes(cfg, payer, asset)?)?;
+    let reimbursement = if leg.ordinal == 0 { SPONSOR_REIMBURSEMENT } else { 0 };
+    // Refused before any proving; no amounts in the message (logs).
+    let note = pick_note(&unspent, leg.amount + reimbursement)
+        .wrap_err_with(|| format!("leg {}: insufficient payer note (rejected before proving)", leg.ordinal))?;
+    let governed = record.governed()?;
+    let (bundle, pool) = (*leg.manifest.bundle_id.as_ref(), *governed.governance.body.pool_id.as_ref());
+    let change = keys.one_time(&bundle, &pool, 1);
+    let sponsor = leg.manifest.sponsor.try_signatory().ok_or_else(|| eyre!("the manifest sponsor is not a single-key account"))?;
+    let spec = LegPayer {
+        lane: lane_of(cfg, asset),
+        asset: asset_id(cfg, asset).parse()?,
+        payer: signing_key(&cfg.seed(payer)?),
+        recipient: leg.recipient.clone(),
+        amount: leg.amount,
+    };
+    let spend = Spend::Continue { opening: note.opening, secret: keys.spend, tree: history.tree, epoch: history.epoch };
+    on_big_stack(|| {
+        prepare_leg_split(
+            leg.ordinal,
+            &spec,
+            &governed,
+            spend,
+            &change,
+            &leg.recipient_output,
+            &leg.sponsor_output,
+            sponsor,
+            &leg.manifest,
+            leg.authority_digest,
+            leg.reimbursement_salt,
+        )
+    })
 }
 
 /// How a bundle ended, for pools.json.

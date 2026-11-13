@@ -112,6 +112,8 @@ pub struct Leg {
 pub enum Expect {
     Finalized,
     Aborted,
+    /// Either outcome is a result (the HTTP coordinator answers "aborted" for an audit-rejected bundle).
+    Either,
 }
 
 pub struct Options {
@@ -582,6 +584,7 @@ pub(crate) fn check_outcome(outcome: &'static str, expect: Expect) -> Result<()>
     let want = match expect {
         Expect::Finalized => "finalized",
         Expect::Aborted => "aborted",
+        Expect::Either => return Ok(()),
     };
     ensure!(outcome == want, "expected {want}, got {outcome}");
     Ok(())
