@@ -318,10 +318,11 @@ impl Auditor {
             .wrap_err("submit approval quorum");
         let response = match submitted {
             Ok(response) => response,
-            // The committee refuses an approval once the leg left Collecting | Audited. Only then is the verdict
-            // recorded late; any other failure stays retryable (no record).
+            // Once k approvals are in, the committee refuses a new approver (upstream record_audit_approval: Audited
+            // takes only an idempotent retry). Then the verdict is recorded late; below the threshold a failure
+            // stays retryable (no record).
             Err(error) => match fetch().map(|now| now.lifecycle) {
-                Ok(now) if stage(now) == Stage::Closed => {
+                Ok(now) if late_after_refusal(now) => {
                     return record_late(&record_path, &bundle_id, leg, now, &plaintext);
                 }
                 _ => return Err(error),
@@ -340,7 +341,8 @@ impl Auditor {
     }
 }
 
-/// Where a leg is relative to the audit: Open takes an approval (upstream accepts Collecting | Audited), Closed is past
+/// Where a leg is relative to the audit: Open is worth a submit (Collecting takes a new approval, Audited only a retry of a
+/// counted one), Closed is past
 /// it (the bundle went on with other auditors), Dead never settled.
 #[derive(Debug, PartialEq, Eq)]
 enum Stage {
@@ -358,11 +360,16 @@ fn stage(lifecycle: PrivateSettlementLifecycleDtoV1) -> Stage {
     }
 }
 
-fn late_verdict(lifecycle: PrivateSettlementLifecycleDtoV1) -> String {
-    format!("approved (late: {lifecycle:?}, not counted)")
+/// After a refused submit: the threshold was met without this auditor (Audited or later), so its verdict is late.
+fn late_after_refusal(lifecycle: PrivateSettlementLifecycleDtoV1) -> bool {
+    lifecycle == PrivateSettlementLifecycleDtoV1::Audited || stage(lifecycle) == Stage::Closed
 }
 
-/// An approve call that came after the audit closed: the verdict is kept, the approval did not count.
+fn late_verdict(lifecycle: PrivateSettlementLifecycleDtoV1) -> String {
+    format!("approved (late: {lifecycle:?})")
+}
+
+/// An approve call that came after the threshold was met without it: the verdict is kept, the leg went on without it.
 #[derive(Debug)]
 struct Late(String);
 
@@ -509,7 +516,7 @@ mod tests {
     /// Live baseline 2026-11-12T19:31Z, 2-of-3 with all three auditors up: the coordinator prepared the bundle after the
     /// second approval, the committee refused the third (upstream sidecar_store record_audit_approval accepts only
     /// Collecting | Audited) and that auditor kept NO record of a leg it had decrypted, so BI's lens can miss legs.
-    /// Collecting and Audited still take an approval (upstream approve_private_settlement_leg_v1); a leg past the audit
+    /// Collecting and Audited are worth a submit (Audited only for a retry, see the next test); a leg past the audit
     /// is recorded locally, marked late; an aborted or expired leg never settled and is not recorded.
     #[test]
     fn a_leg_past_the_audit_is_recorded_late_not_submitted() {
@@ -520,7 +527,7 @@ mod tests {
         }
         assert_eq!(stage(Aborted), Stage::Dead);
         assert_eq!(stage(Expired), Stage::Dead);
-        assert_eq!(late_verdict(Prepared), "approved (late: Prepared, not counted)");
+        assert_eq!(late_verdict(Prepared), "approved (late: Prepared)");
         assert_ne!(late_verdict(Finalized), "approved", "a late verdict never reads as a counted approval");
     }
 
