@@ -180,8 +180,11 @@ pub fn run(cfg: Config) -> Result<()> {
         match result {
             Ok(body) => (200, body),
             Err(error) => {
-                eprintln!("{method} {path}: {error:#}");
-                (500, serde_json::json!({ "error": format!("{error:#}") }).to_string())
+                let status = status_of(&error);
+                if status == 500 {
+                    eprintln!("{method} {path}: {error:#}");
+                }
+                (status, serde_json::json!({ "error": format!("{error:#}") }).to_string())
             }
         }
     })
@@ -229,17 +232,20 @@ impl Auditor {
         let capsule_request = PrivateSettlementAuditorCapsuleRequestV1 {
             audit_policy: policy.clone(),
         };
-        let fetched = self
-            .client
-            .client()
-            .private_settlement_auditor_capsule_quorum_for_authority_v1(
-                &endpoints,
-                &authority,
-                payload_digest,
-                &capsule_request,
-                &signer,
-            )
-            .wrap_err("fetch audit capsule")?;
+        let fetch = || {
+            self.client
+                .client()
+                .private_settlement_auditor_capsule_quorum_for_authority_v1(
+                    &endpoints,
+                    &authority,
+                    payload_digest,
+                    &capsule_request,
+                    &signer,
+                )
+                .wrap_err("fetch audit capsule")
+        };
+        let fetched = fetch()?;
+        let lifecycle = fetched.lifecycle;
         let bundle_id = hex::encode(fetched.manifest.bundle_id.as_ref());
         let leg = fetched.statement.leg_ordinal;
         let record_path = self.record_path(&bundle_id, leg);
@@ -250,10 +256,7 @@ impl Auditor {
                 reason: "already decided".into(),
             });
         }
-        ensure!(
-            fetched.lifecycle == PrivateSettlementLifecycleDtoV1::Collecting,
-            "leg is not collecting audit approvals"
-        );
+        ensure!(stage(lifecycle) != Stage::Dead, "leg is {lifecycle:?}: it never settled");
         let view = PrivateSettlementAuditorSidecarViewV1 {
             manifest: fetched.manifest,
             policy: fetched.audit_policy,
@@ -295,8 +298,11 @@ impl Auditor {
             eprintln!("bundle={bundle_id} leg={leg} rejected: {reason}");
             return Ok(ApproveResponse { approved: false, reason: reason.into() });
         }
+        if stage(lifecycle) == Stage::Closed {
+            return record_late(&record_path, &bundle_id, leg, lifecycle, &plaintext);
+        }
         let approval = approval.map_err(|e| eyre!("approve leg: {e:?}"))?;
-        let response = self
+        let submitted = self
             .client
             .client()
             .submit_private_settlement_audit_approval_quorum_for_authority_v1(
@@ -309,7 +315,18 @@ impl Auditor {
                     approval,
                 },
             )
-            .wrap_err("submit approval quorum")?;
+            .wrap_err("submit approval quorum");
+        let response = match submitted {
+            Ok(response) => response,
+            // The committee refuses an approval once the leg left Collecting | Audited. Only then is the verdict
+            // recorded late; any other failure stays retryable (no record).
+            Err(error) => match fetch().map(|now| now.lifecycle) {
+                Ok(now) if stage(now) == Stage::Closed => {
+                    return record_late(&record_path, &bundle_id, leg, now, &plaintext);
+                }
+                _ => return Err(error),
+            },
+        };
         ensure!(approval_durable(response.lifecycle, response.collected), "approval quorum was not durable");
         // Written only after the quorum is durable: a crash before this line re-approves
         // the same leg on retry instead of skipping it forever.
@@ -321,6 +338,58 @@ impl Auditor {
     fn record_path(&self, bundle_id: &str, leg: u8) -> PathBuf {
         self.cfg.auditor.store_dir.join(bundle_id).join(format!("{leg}.json"))
     }
+}
+
+/// Where a leg is relative to the audit: Open takes an approval (upstream accepts Collecting | Audited), Closed is past
+/// it (the bundle went on with other auditors), Dead never settled.
+#[derive(Debug, PartialEq, Eq)]
+enum Stage {
+    Open,
+    Closed,
+    Dead,
+}
+
+fn stage(lifecycle: PrivateSettlementLifecycleDtoV1) -> Stage {
+    use PrivateSettlementLifecycleDtoV1::*;
+    match lifecycle {
+        Collecting | Audited => Stage::Open,
+        Prepared | CommitCertified | Finalized => Stage::Closed,
+        Aborted | Expired => Stage::Dead,
+    }
+}
+
+fn late_verdict(lifecycle: PrivateSettlementLifecycleDtoV1) -> String {
+    format!("approved (late: {lifecycle:?}, not counted)")
+}
+
+/// An approve call that came after the audit closed: the verdict is kept, the approval did not count.
+#[derive(Debug)]
+struct Late(String);
+
+impl std::fmt::Display for Late {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.0)
+    }
+}
+
+impl std::error::Error for Late {}
+
+fn status_of(error: &eyre::Report) -> u16 {
+    if error.is::<Late>() { 409 } else { 500 }
+}
+
+/// Keep the decrypted leg in the store (BI's lens must not miss it) and answer 409: the coordinator counts it Unavailable.
+fn record_late(
+    path: &PathBuf,
+    bundle_id: &str,
+    leg: u8,
+    lifecycle: PrivateSettlementLifecycleDtoV1,
+    plain: &PrivateSettlementAuditPlaintextV1,
+) -> Result<ApproveResponse> {
+    let verdict = late_verdict(lifecycle);
+    write_record(path, bundle_id, leg, &verdict, plain)?;
+    eprintln!("bundle={bundle_id} leg={leg} {verdict}");
+    Err(Late(verdict).into())
 }
 
 /// A submitted approval is durable once the committee counts it: below a k > 1 threshold the leg stays Collecting

@@ -76,7 +76,9 @@ fn serve_one(
     stream.set_read_timeout(Some(Duration::from_secs(30)))?;
     let mut reader = BufReader::new(stream.try_clone()?);
     let mut request_line = String::new();
-    reader.read_line(&mut request_line)?;
+    if reader.read_line(&mut request_line)? == 0 {
+        return Ok(()); // closed before a request line: a tcpSocket probe, nothing to answer
+    }
     let mut parts = request_line.split_whitespace();
     let (method, path) = (parts.next().unwrap_or(""), parts.next().unwrap_or(""));
     // A request without Content-Length has no body (RFC 9112 6.3); reading to EOF would hang a
