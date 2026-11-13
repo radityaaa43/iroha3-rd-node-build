@@ -51,6 +51,23 @@ pub struct Config {
     /// Only the BI driver sets this (S18, K6): enables `mint` / `POST /mint` for RD and DFABI. Absent = refused.
     #[serde(default)]
     pub mint_enabled: bool,
+    /// `[aps]`: this driver's part in the all-flows APS HTTP endpoints (plan 2026-11-13-04 T2). Absent = a party driver.
+    #[serde(default)]
+    pub aps: ApsConfig,
+}
+
+/// `[aps]`: who runs `POST /aps/submit` and where the other drivers send theirs.
+#[derive(Clone, Debug, Default, Deserialize)]
+pub struct ApsConfig {
+    /// Only the BI driver: it coordinates bundles itself (one at a time).
+    #[serde(default)]
+    pub coordinator: bool,
+    /// Every other driver: the BI gateway (`https://gateway.rd-iroha3-bi.svc...:8443`, mutual TLS via `[tls]`) its `/aps/submit` goes to.
+    #[serde(default)]
+    pub coordinator_url: Option<String>,
+    /// Coordinator only: account public key (`ed0120...`) -> gateway URL of the party that holds that account.
+    #[serde(default)]
+    pub peers: BTreeMap<String, String>,
 }
 
 /// `[tls]`: mutual TLS to other parties' gateways (iroha3 S13 transport A). Only used for `https://` auditor URLs.
@@ -355,5 +372,23 @@ dfabi = 2
             assert!(cfg.auditor_key_name().is_err(), "{bad:?} must be refused");
         }
         assert_eq!(config("").auditor_key_name().unwrap(), "bi-auditor");
+    }
+
+    #[test]
+    fn aps_is_off_by_default_so_existing_configs_still_load() {
+        let cfg = config("");
+        assert!(!cfg.aps.coordinator);
+        assert_eq!(cfg.aps.coordinator_url, None);
+        assert!(cfg.aps.peers.is_empty());
+    }
+
+    #[test]
+    fn the_aps_section_names_the_coordinator_and_the_peer_gateways() {
+        let bank = config("[aps]\ncoordinator_url = \"https://gateway.rd-iroha3-bi.svc.cluster.local:8443\"\n");
+        assert!(!bank.aps.coordinator);
+        assert_eq!(bank.aps.coordinator_url.as_deref(), Some("https://gateway.rd-iroha3-bi.svc.cluster.local:8443"));
+        let bi = config("[aps]\ncoordinator = true\n[aps.peers]\n\"ed0120aa\" = \"https://gateway.rd-iroha3-bank-a.svc.cluster.local:8443\"\n");
+        assert!(bi.aps.coordinator);
+        assert_eq!(bi.aps.peers["ed0120aa"], "https://gateway.rd-iroha3-bank-a.svc.cluster.local:8443");
     }
 }

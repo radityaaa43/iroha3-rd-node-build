@@ -1,7 +1,7 @@
 //! Per-bank driver server mode (iroha3 PLAN S17, ARCHITECTURE-iroha3 row 10a, docs/server-mode.md).
 //!
 //! A thin HTTP wrapper over the two D-native commands of `dvp_native.rs`, running in ONE bank's namespace with that bank's own
-//! client.toml (own key, own Torii). It exposes exactly: `GET /healthz`, `POST /settle-grant`, `POST /dvp-native`, `POST /mint` (403 unless the config sets `mint_enabled`: BI only), `POST /transfer` (RD/DFABI from the own account) and `GET /tx/{hash}` (a signed query with the own key). Request bodies
+//! client.toml (own key, own Torii). It exposes exactly: `GET /healthz`, `POST /settle-grant`, `POST /dvp-native`, `POST /mint` (403 unless the config sets `mint_enabled`: BI only), `POST /transfer` (RD/DFABI from the own account) and `GET /tx/{hash}` (a signed query with the own key), plus the APS endpoints `/aps/*` of `aps_http.rs`. Request bodies
 //! carry public terms only; nothing secret is read from a request, written to a response or logged.
 
 use std::sync::Mutex;
@@ -10,6 +10,7 @@ use eyre::Result;
 use serde::Deserialize;
 
 use crate::{
+    aps_http, aps_real,
     config::Config,
     dvp_native, http,
     mint::{self, MintPolicy, MintTerms},
@@ -124,6 +125,11 @@ pub fn route(method: &str, path: &str, body: &str, submitter: &dyn Submitter) ->
     }
 }
 
+/// `/aps/*` goes to the APS handlers (`aps_http`), everything else to `route`.
+fn dispatch(method: &str, path: &str, body: &str, submitter: &dyn Submitter, aps: &aps_http::Aps) -> (u16, String) {
+    if path.starts_with("/aps/") { aps.route(method, path, body) } else { route(method, path, body, submitter) }
+}
+
 struct Real {
     // One submission at a time per bank (serialised like the auditor mode); `Mutex` keeps `Real: Sync`.
     cfg: Mutex<Config>,
@@ -173,9 +179,14 @@ impl Submitter for Real {
 
 /// `rd-dfabi server <config> --listen <addr>`.
 pub fn run(cfg: Config, listen: &str) -> Result<()> {
+    let peer = aps_http::RealPeer { tls: cfg.tls.clone() };
+    let aps_cfg = cfg.aps.clone();
     let real = Real { cfg: Mutex::new(cfg) };
-    http::serve(listen, |method, path, body| {
-        let (status, response) = route(method, path, body, &real);
+    let backend = aps_real::RealBackend::new(&real.cfg);
+    let aps = aps_http::Aps::new(&backend, &peer, aps_cfg);
+    // One thread per connection: a bank's forwarded `/aps/submit` waits on BI while BI calls back into the same bank.
+    http::serve_threaded(listen, |method, path, body| {
+        let (status, response) = dispatch(method, path, body, &real, &aps);
         eprintln!("{method} {path} -> {status}");
         (status, response)
     })
@@ -531,5 +542,57 @@ mod tests {
         let (status, response) = route("GET", "/balance?asset=7onbjg2gRXveoAAUFsohCZyGW98t", "", &fake);
         assert_eq!(status, 502);
         assert_eq!(json(&response), serde_json::json!({"error": message}));
+    }
+
+    #[test]
+    fn aps_paths_go_to_the_aps_handlers_and_everything_else_stays_with_the_submitter() {
+        use crate::aps_http::{Aps, testkit::{FakeBackend, FakePeer}};
+        let (backend, peer) = (FakeBackend::default(), FakePeer::standard());
+        let aps = Aps::new(&backend, &peer, crate::config::ApsConfig { coordinator: true, ..Default::default() });
+        let fake = Fake::default();
+        assert_eq!(dispatch("GET", "/aps/wallet", "", &fake, &aps).0, 200);
+        assert_eq!(dispatch("POST", "/aps/wallet", "", &fake, &aps).0, 405);
+        assert_eq!(dispatch("GET", "/aps/nope", "", &fake, &aps).0, 404);
+        assert_eq!(dispatch("GET", "/healthz", "", &fake, &aps).0, 200);
+        assert_eq!(dispatch("GET", "/nope", "", &fake, &aps).0, 404);
+        assert_eq!(dispatch("POST", "/settle-grant", &body("to"), &fake, &aps).0, 200);
+        assert_eq!(fake.calls.borrow().len(), 1, "only the non-APS grant reached the submitter");
+    }
+
+    /// Live: a submit takes 100-200 s and kubelet kills the pod when `/healthz` stays unanswered for about 365 s.
+    #[test]
+    fn healthz_answers_while_a_submit_is_in_progress() {
+        use crate::aps_http::{
+            Aps,
+            testkit::{FakeBackend, FakePeer, account},
+        };
+        use std::time::{Duration, Instant};
+        let backend: &'static FakeBackend = Box::leak(Box::new(FakeBackend { me: account(7), settle_delay: Duration::from_millis(600), ..FakeBackend::default() }));
+        let peer: &'static FakePeer = Box::leak(Box::new(FakePeer::standard()));
+        let cfg = crate::config::ApsConfig {
+            coordinator: true,
+            peers: std::collections::BTreeMap::from([
+                (account(8), "https://gateway.rd-iroha3-bank-a.svc.cluster.local:8443".to_owned()),
+                (account(9), "https://gateway.rd-iroha3-bank-b.svc.cluster.local:8443".to_owned()),
+            ]),
+            ..Default::default()
+        };
+        let aps: &'static Aps<'static> = Box::leak(Box::new(Aps::new(backend, peer, cfg)));
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap().to_string();
+        std::thread::spawn(move || http::serve_listener_threaded(&listener, &|method: &str, path: &str, body: &str| dispatch(method, path, body, &Fake::default(), aps)));
+        let submit = serde_json::json!({ "kind": "pay", "intent": "ab".repeat(32), "asset": "rd", "from": account(8), "to": account(9), "amount": "5" }).to_string();
+        let started = Instant::now();
+        let waiting = {
+            let addr = addr.clone();
+            std::thread::spawn(move || http::request_with(&addr, "POST", "/aps/submit", &submit, None, Duration::from_secs(10)))
+        };
+        std::thread::sleep(Duration::from_millis(100));
+        let (status, _) = http::request_with(&addr, "GET", "/healthz", "", None, Duration::from_secs(5)).unwrap();
+        assert_eq!(status, 200);
+        assert!(started.elapsed() < Duration::from_millis(500), "healthz waited for the submit: {:?}", started.elapsed());
+        let (status, response) = waiting.join().unwrap().unwrap();
+        assert_eq!((status, json(&response)["outcome"].as_str()), (200, Some("finalized")));
+        assert!(started.elapsed() >= Duration::from_millis(600), "the submit really was in progress");
     }
 }

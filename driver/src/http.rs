@@ -69,6 +69,29 @@ pub fn serve(addr: &str, handler: impl Fn(&str, &str, &str) -> (u16, String)) ->
     Ok(())
 }
 
+/// `serve`, but every connection runs on its own thread (std only). Needed where a handler waits on another driver that calls back
+/// into this one: a bank blocks in its forwarded `/aps/submit` while BI asks the same bank for `/aps/leg`.
+/// ponytail: no cap on threads; only parties holding a gateway-issued client certificate reach this port. Add a pool if that changes.
+pub fn serve_threaded(addr: &str, handler: impl Fn(&str, &str, &str) -> (u16, String) + Sync) -> Result<()> {
+    let listener = TcpListener::bind(addr).wrap_err_with(|| format!("bind {addr}"))?;
+    eprintln!("listening on {addr}");
+    serve_listener_threaded(&listener, &handler);
+    Ok(())
+}
+
+pub(crate) fn serve_listener_threaded(listener: &TcpListener, handler: &(impl Fn(&str, &str, &str) -> (u16, String) + Sync)) {
+    std::thread::scope(|scope| {
+        for stream in listener.incoming() {
+            let Ok(stream) = stream else { continue };
+            scope.spawn(move || {
+                if let Err(error) = serve_one(stream, handler) {
+                    eprintln!("request failed: {error}");
+                }
+            });
+        }
+    });
+}
+
 fn serve_one(
     mut stream: TcpStream,
     handler: &impl Fn(&str, &str, &str) -> (u16, String),
@@ -183,5 +206,30 @@ mod tests {
         // a plain host:port still takes the old path (nothing listens: connection refused, not a TLS error)
         let err = send(None, "127.0.0.1:1", "GET", "/healthz", "", Some(Duration::from_millis(300)), Duration::from_secs(1)).unwrap_err();
         assert!(!format!("{err:#}").contains("[tls]"));
+    }
+
+    /// APS: a bank driver waits on BI (its forwarded `/aps/submit`) while BI calls the same bank's `/aps/leg`; one request at a time deadlocks.
+    #[test]
+    fn a_threaded_server_answers_a_second_request_while_the_first_is_still_waiting() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap().to_string();
+        let both = std::sync::Arc::new(std::sync::Barrier::new(2));
+        std::thread::spawn(move || {
+            serve_listener_threaded(&listener, &move |_: &str, path: &str, _: &str| {
+                both.wait(); // returns only once the OTHER request is inside the handler too
+                (200, path.to_owned())
+            })
+        });
+        let clients: Vec<_> = ["/a", "/b"]
+            .into_iter()
+            .map(|path| {
+                let addr = addr.clone();
+                std::thread::spawn(move || request_with(&addr, "GET", path, "", None, Duration::from_secs(5)))
+            })
+            .collect();
+        for (client, path) in clients.into_iter().zip(["/a", "/b"]) {
+            let (status, body) = client.join().unwrap().unwrap();
+            assert_eq!((status, body.as_str()), (200, path));
+        }
     }
 }

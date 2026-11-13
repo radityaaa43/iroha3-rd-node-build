@@ -112,6 +112,8 @@ pub struct Leg {
 pub enum Expect {
     Finalized,
     Aborted,
+    /// Either outcome is a result (the HTTP coordinator answers "aborted" for an audit-rejected bundle).
+    Either,
 }
 
 pub struct Options {
@@ -582,6 +584,7 @@ pub(crate) fn check_outcome(outcome: &'static str, expect: Expect) -> Result<()>
     let want = match expect {
         Expect::Finalized => "finalized",
         Expect::Aborted => "aborted",
+        Expect::Either => return Ok(()),
     };
     ensure!(outcome == want, "expected {want}, got {outcome}");
     Ok(())
@@ -1533,5 +1536,19 @@ mod govern_policy_tests {
         let (key, encryption) = auditors(1).remove(0);
         let governed = govern_until(route(), RD.parse().unwrap(), 100, None, &key, &encryption).unwrap();
         assert_eq!((governed.policy.body.min_approvals, governed.policy.body.auditors.len()), (1, 1));
+    }
+}
+
+#[cfg(test)]
+mod outcome_tests {
+    use super::*;
+
+    /// The HTTP coordinator reports an audit-rejected (aborted) bundle as an outcome, not as an error.
+    #[test]
+    fn either_accepts_both_outcomes_and_the_fixed_expectations_stay_strict() {
+        assert!(check_outcome("finalized", Expect::Either).is_ok());
+        assert!(check_outcome("aborted", Expect::Either).is_ok());
+        assert!(check_outcome("aborted", Expect::Finalized).is_err());
+        assert!(check_outcome("finalized", Expect::Aborted).is_err());
     }
 }
