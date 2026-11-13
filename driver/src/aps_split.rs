@@ -20,7 +20,7 @@ use iroha::data_model::{
         PrivateSettlementAuditViewKeySignatureV1, PrivateSettlementCapsulePaddingV1,
         PrivateSettlementProofProfileV1, PrivateSettlementProofStatementV1, PrivateSettlementRouteV1,
     },
-    privacy::{PrivacyNullifierV1, PrivacyRootV1},
+    privacy::{PrivacyCommitmentV1, PrivacyNullifierV1, PrivacyRootV1},
 };
 use iroha_core::{
     privacy_engines::atomic_private_settlement::{
