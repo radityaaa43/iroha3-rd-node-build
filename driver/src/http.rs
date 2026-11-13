@@ -184,4 +184,29 @@ mod tests {
         let err = send(None, "127.0.0.1:1", "GET", "/healthz", "", Some(Duration::from_millis(300)), Duration::from_secs(1)).unwrap_err();
         assert!(!format!("{err:#}").contains("[tls]"));
     }
+
+    /// APS: a bank driver waits on BI (its forwarded `/aps/submit`) while BI calls the same bank's `/aps/leg`; one request at a time deadlocks.
+    #[test]
+    fn a_threaded_server_answers_a_second_request_while_the_first_is_still_waiting() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap().to_string();
+        let both = std::sync::Arc::new(std::sync::Barrier::new(2));
+        std::thread::spawn(move || {
+            serve_listener_threaded(&listener, &move |_: &str, path: &str, _: &str| {
+                both.wait(); // returns only once the OTHER request is inside the handler too
+                (200, path.to_owned())
+            })
+        });
+        let clients: Vec<_> = ["/a", "/b"]
+            .into_iter()
+            .map(|path| {
+                let addr = addr.clone();
+                std::thread::spawn(move || request_with(&addr, "GET", path, "", None, Duration::from_secs(5)))
+            })
+            .collect();
+        for (client, path) in clients.into_iter().zip(["/a", "/b"]) {
+            let (status, body) = client.join().unwrap().unwrap();
+            assert_eq!((status, body.as_str()), (200, path));
+        }
+    }
 }

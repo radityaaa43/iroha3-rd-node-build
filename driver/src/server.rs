@@ -532,4 +532,19 @@ mod tests {
         assert_eq!(status, 502);
         assert_eq!(json(&response), serde_json::json!({"error": message}));
     }
+
+    #[test]
+    fn aps_paths_go_to_the_aps_handlers_and_everything_else_stays_with_the_submitter() {
+        use crate::aps_http::{Aps, testkit::{FakeBackend, FakePeer}};
+        let (backend, peer) = (FakeBackend::default(), FakePeer::standard());
+        let aps = Aps::new(&backend, &peer, crate::config::ApsConfig::default());
+        let fake = Fake::default();
+        assert_eq!(dispatch("GET", "/aps/wallet", "", &fake, &aps).0, 200);
+        assert_eq!(dispatch("POST", "/aps/wallet", "", &fake, &aps).0, 405);
+        assert_eq!(dispatch("GET", "/aps/nope", "", &fake, &aps).0, 404);
+        assert_eq!(dispatch("GET", "/healthz", "", &fake, &aps).0, 200);
+        assert_eq!(dispatch("GET", "/nope", "", &fake, &aps).0, 404);
+        assert_eq!(dispatch("POST", "/settle-grant", &body("to"), &fake, &aps).0, 200);
+        assert_eq!(fake.calls.borrow().len(), 1, "only the non-APS grant reached the submitter");
+    }
 }

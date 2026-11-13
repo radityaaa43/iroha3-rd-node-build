@@ -356,4 +356,22 @@ dfabi = 2
         }
         assert_eq!(config("").auditor_key_name().unwrap(), "bi-auditor");
     }
+
+    #[test]
+    fn aps_is_off_by_default_so_existing_configs_still_load() {
+        let cfg = config("");
+        assert!(!cfg.aps.coordinator);
+        assert_eq!(cfg.aps.coordinator_url, None);
+        assert!(cfg.aps.peers.is_empty());
+    }
+
+    #[test]
+    fn the_aps_section_names_the_coordinator_and_the_peer_gateways() {
+        let bank = config("[aps]\ncoordinator_url = \"https://gateway.rd-iroha3-bi.svc.cluster.local:8443\"\n");
+        assert!(!bank.aps.coordinator);
+        assert_eq!(bank.aps.coordinator_url.as_deref(), Some("https://gateway.rd-iroha3-bi.svc.cluster.local:8443"));
+        let bi = config("[aps]\ncoordinator = true\n[aps.peers]\n\"ed0120aa\" = \"https://gateway.rd-iroha3-bank-a.svc.cluster.local:8443\"\n");
+        assert!(bi.aps.coordinator);
+        assert_eq!(bi.aps.peers["ed0120aa"], "https://gateway.rd-iroha3-bank-a.svc.cluster.local:8443");
+    }
 }
