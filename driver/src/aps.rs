@@ -141,7 +141,7 @@ pub(crate) struct Governed {
 
 pub struct Funding {
     pub opening: PrivateSettlementAuditNoteOpeningV1,
-    spending_secret: [u8; 32],
+    pub(crate) spending_secret: [u8; 32],
     /// Positive input in slot 0, unspent reserve (value 1) in slot 1.
     pub input_commitments: [PrivacyCommitmentV1; 2],
 }
@@ -164,7 +164,7 @@ pub enum Spend {
 }
 
 impl Spend {
-    fn value(&self) -> u128 {
+    pub(crate) fn value(&self) -> u128 {
         match self {
             Self::Bootstrap(funding) => funding.opening.value,
             Self::Continue { opening, .. } => opening.value,
@@ -608,7 +608,7 @@ pub(crate) fn bounded_fee(cfg: &Config) -> Result<FeePaymentIntent> {
     bounded_fee_for(&cfg.fee_asset)
 }
 
-fn bounded_fee_for(fee_asset: &str) -> Result<FeePaymentIntent> {
+pub(crate) fn bounded_fee_for(fee_asset: &str) -> Result<FeePaymentIntent> {
     Ok(FeePaymentIntent::authority(
         vec![FeeChargeLimit::new(
             FeeChargeKind::Nexus,
@@ -738,7 +738,7 @@ pub fn committee(
 }
 
 /// Authority from network/public/peers.json, plus the party names in authority order.
-fn committee_authority(
+pub(crate) fn committee_authority(
     peers_json: &Path,
     route: PrivateSettlementRouteV1,
 ) -> Result<(PrivateSettlementCommitteeAuthorityV1, Vec<String>)> {
@@ -1041,15 +1041,15 @@ pub(crate) fn funding_with_secret(value: u128, owner_secret: [u8; 32]) -> Result
     Ok(Funding { opening, spending_secret, input_commitments })
 }
 
-fn hash(seed: u8) -> Hash {
+pub(crate) fn hash(seed: u8) -> Hash {
     Hash::prehashed([seed.max(1); Hash::LENGTH])
 }
 
-fn bytes(seed: u8) -> [u8; 32] {
+pub(crate) fn bytes(seed: u8) -> [u8; 32] {
     [seed.max(1); 32]
 }
 
-fn fixture_key(seed: u8) -> KeyPair {
+pub(crate) fn fixture_key(seed: u8) -> KeyPair {
     crate::config::signing_key(&[seed; 32])
 }
 
@@ -1135,7 +1135,7 @@ fn reimbursement_commitment(
     Ok(probe.reimbursement_terms_commitment()?)
 }
 
-fn placeholder_payer_authorization(
+pub(crate) fn placeholder_payer_authorization(
     network_id: NetworkId,
     route: PrivateSettlementRouteV1,
     payer: &KeyPair,
@@ -1208,7 +1208,7 @@ fn placeholder_view_authorization(
     )
 }
 
-fn placeholder_encrypted_output(seed: u8) -> PrivacyEncryptedOutputV1 {
+pub(crate) fn placeholder_encrypted_output(seed: u8) -> PrivacyEncryptedOutputV1 {
     let mut ciphertext = vec![seed.max(1); PRIVACY_IVM_PRIVATE_ENCRYPTED_OUTPUT_BYTES_V1];
     ciphertext[..4].copy_from_slice(b"IPNE");
     PrivacyEncryptedOutputV1 {
@@ -1220,7 +1220,7 @@ fn placeholder_encrypted_output(seed: u8) -> PrivacyEncryptedOutputV1 {
 }
 
 /// Random note opening; commitment and spending authority are recomputed by the callers.
-fn note_opening(active: bool, value: u128) -> PrivateSettlementAuditNoteOpeningV1 {
+pub(crate) fn note_opening(active: bool, value: u128) -> PrivateSettlementAuditNoteOpeningV1 {
     PrivateSettlementAuditNoteOpeningV1 {
         active,
         commitment: PrivacyCommitmentV1::new(rnd()),
