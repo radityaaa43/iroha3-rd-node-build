@@ -635,6 +635,7 @@ impl Peer for RealPeer {
 #[cfg(test)]
 pub(crate) mod testkit {
     use std::{
+        collections::BTreeMap,
         sync::{
             Mutex,
             atomic::{AtomicUsize, Ordering},
@@ -654,6 +655,11 @@ pub(crate) mod testkit {
         format!("{n:02x}").repeat(32)
     }
 
+    /// What the coordinator lists as finalized: two RD bundles, one of them also in the DFABI pool.
+    pub(crate) fn lists() -> BundleLists {
+        BundleLists { rd: vec![id(0xa1), id(0xa2)], dfabi: vec![id(0xa1)], heights: BTreeMap::from([(id(0xa1), 5), (id(0xa2), 9)]) }
+    }
+
     #[derive(Default)]
     pub(crate) struct FakeBackend {
         /// The own account key `own_key` answers.
@@ -665,6 +671,10 @@ pub(crate) mod testkit {
         /// `settle` answers "aborted".
         pub aborts: bool,
         pub settle_delay: Duration,
+        /// What `bundles` answers (coordinator).
+        pub lists: BundleLists,
+        /// Every list `merge_bundles` was given (party driver).
+        pub merged: Mutex<Vec<BundleLists>>,
         pub active: AtomicUsize,
         pub max_active: AtomicUsize,
     }
@@ -719,6 +729,18 @@ pub(crate) mod testkit {
             Ok(if self.aborts { None } else { Some(Settled { carrier_tx: "txh".to_owned(), height: 42 }) })
         }
 
+        fn bundles(&self) -> Result<BundleLists> {
+            self.note("bundles")?;
+            Ok(self.lists.clone())
+        }
+
+        /// Never fails with `error`: a refresh is not what those tests are about.
+        fn merge_bundles(&self, lists: &BundleLists) -> Result<()> {
+            self.calls.lock().unwrap().push("merge_bundles");
+            self.merged.lock().unwrap().push(lists.clone());
+            Ok(())
+        }
+
         fn wallet(&self) -> Result<serde_json::Value> {
             self.note("wallet")?;
             Ok(serde_json::json!({ "party": "fake", "balances": { "rd": "5", "dfabi": "6" }, "items": [] }))
@@ -745,6 +767,7 @@ pub(crate) mod testkit {
                 "/aps/address" => Ok((200, serde_json::json!({ "authority": id(0x33), "view_public": id(0x44), "authorization": "abcd" }).to_string())),
                 "/aps/leg" => Ok((200, r#"{"prepared":"cafe"}"#.to_owned())),
                 "/aps/submit" => Ok((200, r#"{"outcome":"finalized"}"#.to_owned())),
+                "/aps/bundles" => Ok((200, serde_json::to_string(&lists()).unwrap())),
                 _ => Ok((404, r#"{"error":"not found"}"#.to_owned())),
             })
         }
@@ -825,7 +848,7 @@ mod tests {
         let (status, response) = aps.route("POST", "/aps/leg", &leg_body(&intent, 0, &to, "5"));
         assert_eq!((status, json(&response)), (200, serde_json::json!({ "prepared": "beef" })));
         assert_eq!(aps.route("POST", "/aps/leg", &leg_body(&intent, 0, &to, "5")).0, 403, "the intent is spent");
-        assert_eq!(calls(&backend), ["prove"]);
+        assert_eq!(calls(&backend), ["merge_bundles", "prove"]);
         assert_eq!(aps.route("POST", "/aps/intent", &intent_body(&intent, "rd", &to, "5")).0, 409, "a spent intent is not registered again");
     }
 
@@ -875,7 +898,7 @@ mod tests {
         }
         assert!(calls(&backend).is_empty(), "no proving without a matching intent");
         assert_eq!(aps.route("POST", "/aps/leg", &leg_body(&intent, 0, &to, "5")).0, 200, "a refused leg did not spend the intent");
-        assert_eq!(calls(&backend), ["prove"]);
+        assert_eq!(calls(&backend), ["merge_bundles", "prove"]);
     }
 
     #[test]
@@ -889,7 +912,7 @@ mod tests {
         assert_eq!(status, 502);
         assert!(!response.contains(".note") && !response.contains(".seed"), "{response}");
         assert_eq!(aps.route("POST", "/aps/leg", &leg_body(&intent, 0, &to, "5")).0, 403, "a retry needs a new intent");
-        assert_eq!(calls(&backend), ["prove"]);
+        assert_eq!(calls(&backend), ["merge_bundles", "prove"]);
     }
 
     #[test]
@@ -906,9 +929,11 @@ mod tests {
         let (backend, peer) = (driver(8), FakePeer::standard());
         let aps = Aps::new(&backend, &peer, bank());
         let (status, response) = aps.route("GET", "/aps/wallet", "");
-        assert_eq!((status, json(&response)["balances"]["rd"].as_str()), (200, Some("5")));
+        // the bare wallet_json object, nothing wrapped around it (the Lensa adapter reads exactly this)
+        let wallet = serde_json::json!({ "party": "fake", "balances": { "rd": "5", "dfabi": "6" }, "items": [] });
+        assert_eq!((status, json(&response)), (200, wallet));
         assert_eq!(aps.route("POST", "/aps/wallet", "{}").0, 405);
-        assert_eq!(calls(&backend), ["wallet"]);
+        assert_eq!(calls(&backend), ["merge_bundles", "wallet"]);
     }
 
     #[test]
@@ -1155,7 +1180,7 @@ mod tests {
             assert_eq!(aps.route("GET", path, "").0, 404, "GET {path}");
             assert_eq!(aps.route("POST", path, "{}").0, 404, "POST {path}");
         }
-        for (method, path) in [("GET", "/aps/intent"), ("GET", "/aps/address"), ("GET", "/aps/leg"), ("GET", "/aps/submit"), ("POST", "/aps/wallet"), ("DELETE", "/aps/leg")] {
+        for (method, path) in [("GET", "/aps/intent"), ("GET", "/aps/address"), ("GET", "/aps/leg"), ("GET", "/aps/submit"), ("POST", "/aps/wallet"), ("DELETE", "/aps/leg"), ("POST", "/aps/bundles")] {
             assert_eq!(aps.route(method, path, "{}").0, 405, "{method} {path}");
         }
         assert!(calls(&backend).is_empty() && peer.calls.lock().unwrap().is_empty());
@@ -1173,6 +1198,7 @@ mod tests {
             all.push(aps.route("POST", "/aps/leg", &leg_body(&id(1), 0, &to, "5")).1);
             all.push(aps.route("POST", "/aps/address", &address_body()).1);
             all.push(aps.route("GET", "/aps/wallet", "").1);
+            all.push(aps.route("GET", "/aps/bundles", "").1);
             all.push(aps.route("POST", "/aps/submit", &pay_body(&id(2), "rd", &account(8), &to, "5")).1);
             all.push(aps.route("POST", "/aps/submit", "garbage").1);
             all.push(aps.route("GET", "/aps/nope", "").1);
@@ -1183,5 +1209,78 @@ mod tests {
                 assert!(!response.contains(secret), "{secret} in {response}");
             }
         }
+    }
+
+    #[test]
+    fn a_party_driver_refreshes_the_finalized_bundles_from_the_coordinator_before_proving_and_before_the_wallet() {
+        let (backend, peer) = (driver(8), FakePeer::standard());
+        let aps = Aps::new(&backend, &peer, bank());
+        let (to, intent) = (account(9), id(1));
+        assert_eq!(aps.route("POST", "/aps/intent", &intent_body(&intent, "rd", &to, "5")).0, 200);
+        assert_eq!(aps.route("POST", "/aps/leg", &leg_body(&intent, 0, &to, "5")).0, 200);
+        assert_eq!(aps.route("GET", "/aps/wallet", "").0, 200);
+        let sent: Vec<_> = peer.calls.lock().unwrap().iter().map(|call| (call.0.clone(), call.1.clone(), call.2.clone(), call.3.clone())).collect();
+        let ask = (BI.to_owned(), "GET".to_owned(), "/aps/bundles".to_owned(), String::new());
+        assert_eq!(sent, [ask.clone(), ask], "one refresh per leg and per wallet read");
+        assert_eq!(*backend.merged.lock().unwrap(), [lists(), lists()]);
+        assert_eq!(calls(&backend), ["merge_bundles", "prove", "merge_bundles", "wallet"], "merged before it was used");
+    }
+
+    #[test]
+    fn a_failed_refresh_is_502_and_nothing_is_proved_or_read() {
+        let (to, intent) = (account(9), id(1));
+        let answers: Vec<Result<(u16, String)>> = vec![
+            Err(eyre::eyre!("connection refused")),
+            Ok((500, r#"{"error":"boom"}"#.to_owned())),
+            Ok((200, "not json".to_owned())),
+            Ok((200, r#"{"rd":["zz"],"dfabi":[]}"#.to_owned())),
+        ];
+        for answer in answers {
+            let backend = driver(8);
+            let answer = std::sync::Mutex::new(Some(answer));
+            let peer = FakePeer::with(move |_, _, _| answer.lock().unwrap().take().unwrap_or_else(|| Err(eyre::eyre!("again"))));
+            let aps = Aps::new(&backend, &peer, bank());
+            assert_eq!(aps.route("POST", "/aps/intent", &intent_body(&intent, "rd", &to, "5")).0, 200);
+            let (status, response) = aps.route("POST", "/aps/leg", &leg_body(&intent, 0, &to, "5"));
+            assert_eq!(status, 502, "{response}");
+            assert!(json(&response)["error"].is_string());
+            assert!(calls(&backend).is_empty(), "no proving on a stale pool history: {:?}", calls(&backend));
+            assert_eq!(aps.route("GET", "/aps/wallet", "").0, 502, "the wallet is not read from a stale history either");
+            assert!(calls(&backend).is_empty());
+        }
+    }
+
+    #[test]
+    fn a_party_driver_without_coordinator_url_cannot_refresh_so_it_does_not_prove() {
+        let (backend, peer) = (driver(8), FakePeer::standard());
+        let aps = Aps::new(&backend, &peer, ApsConfig::default());
+        let (to, intent) = (account(9), id(1));
+        assert_eq!(aps.route("POST", "/aps/intent", &intent_body(&intent, "rd", &to, "5")).0, 200);
+        assert_eq!(aps.route("POST", "/aps/leg", &leg_body(&intent, 0, &to, "5")).0, 503);
+        assert_eq!(aps.route("GET", "/aps/wallet", "").0, 503);
+        assert!(calls(&backend).is_empty() && peer.calls.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn the_coordinator_serves_its_finalized_bundles_and_never_refreshes_from_anyone() {
+        let backend = FakeBackend { lists: lists(), ..driver(7) };
+        let peer = FakePeer::standard();
+        let aps = Aps::new(&backend, &peer, coordinator());
+        let (status, response) = aps.route("GET", "/aps/bundles", "");
+        assert_eq!(status, 200);
+        let answer = json(&response);
+        assert_eq!((answer["rd"].clone(), answer["dfabi"].clone()), (serde_json::json!([id(0xa1), id(0xa2)]), serde_json::json!([id(0xa1)])));
+        assert_eq!(answer["heights"][id(0xa2)], 9);
+        assert_eq!(aps.route("GET", "/aps/wallet", "").0, 200);
+        assert_eq!(calls(&backend), ["bundles", "wallet"]);
+        assert!(peer.calls.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn a_party_driver_does_not_serve_bundles() {
+        let (backend, peer) = (driver(8), FakePeer::standard());
+        let aps = Aps::new(&backend, &peer, bank());
+        assert_eq!(aps.route("GET", "/aps/bundles", "").0, 404);
+        assert!(calls(&backend).is_empty());
     }
 }

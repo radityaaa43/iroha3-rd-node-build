@@ -602,6 +602,30 @@ mod tests {
         std::fs::remove_dir_all(dir).unwrap();
     }
 
+    /// A party driver starts with no bundles and learns BI's finalized list: no duplicates, its own order kept, heights filled in.
+    #[test]
+    fn merging_the_coordinators_finalized_bundles_adds_the_missing_ones_once() {
+        let mut pools = PoolFile { rd: record(), dfabi: record() };
+        pools.rd.bundles = vec![BundleRef { id: "a".into(), height: 3 }, BundleRef { id: "p".into(), height: 0 }];
+        let ids: Vec<String> = ["a", "b", "p"].iter().map(|id| id.to_string()).collect();
+        let heights = std::collections::BTreeMap::from([("a".to_owned(), 3), ("b".to_owned(), 5), ("p".to_owned(), 7)]);
+        pools.merge_finalized(Asset::Rd, &ids, &heights);
+        pools.merge_finalized(Asset::Rd, &ids, &heights);
+        let merged: Vec<_> = pools.rd.bundles.iter().map(|b| (b.id.as_str(), b.height)).collect();
+        assert_eq!(merged, [("a", 3), ("p", 7), ("b", 5)]);
+        assert!(pools.dfabi.bundles.is_empty());
+        pools.merge_finalized(Asset::Dfabi, &["z".to_owned()], &heights);
+        assert_eq!((pools.dfabi.bundles[0].id.as_str(), pools.dfabi.bundles[0].height), ("z", 0), "an unknown height stays 0");
+    }
+
+    #[test]
+    fn only_finalized_bundles_are_listed() {
+        let mut pools = PoolFile { rd: record(), dfabi: record() };
+        pools.rd.bundles = vec![BundleRef { id: "a".into(), height: 3 }, BundleRef { id: "inflight".into(), height: 0 }, BundleRef { id: "b".into(), height: 4 }];
+        let ids: Vec<_> = pools.finalized(Asset::Rd).into_iter().map(|b| b.id).collect();
+        assert_eq!(ids, ["a", "b"]);
+    }
+
     fn listed(id: &str) -> PoolFile {
         let mut pools = PoolFile { rd: record(), dfabi: record() };
         for pool in [&mut pools.rd, &mut pools.dfabi] {

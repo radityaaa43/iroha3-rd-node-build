@@ -79,7 +79,7 @@ pub fn serve_threaded(addr: &str, handler: impl Fn(&str, &str, &str) -> (u16, St
     Ok(())
 }
 
-fn serve_listener_threaded(listener: &TcpListener, handler: &(impl Fn(&str, &str, &str) -> (u16, String) + Sync)) {
+pub(crate) fn serve_listener_threaded(listener: &TcpListener, handler: &(impl Fn(&str, &str, &str) -> (u16, String) + Sync)) {
     std::thread::scope(|scope| {
         for stream in listener.incoming() {
             let Ok(stream) = stream else { continue };

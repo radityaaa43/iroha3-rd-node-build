@@ -558,4 +558,41 @@ mod tests {
         assert_eq!(dispatch("POST", "/settle-grant", &body("to"), &fake, &aps).0, 200);
         assert_eq!(fake.calls.borrow().len(), 1, "only the non-APS grant reached the submitter");
     }
+
+    /// Live: a submit takes 100-200 s and kubelet kills the pod when `/healthz` stays unanswered for about 365 s.
+    #[test]
+    fn healthz_answers_while_a_submit_is_in_progress() {
+        use crate::aps_http::{
+            Aps,
+            testkit::{FakeBackend, FakePeer, account},
+        };
+        use std::time::{Duration, Instant};
+        let backend: &'static FakeBackend = Box::leak(Box::new(FakeBackend { me: account(7), settle_delay: Duration::from_millis(600), ..FakeBackend::default() }));
+        let peer: &'static FakePeer = Box::leak(Box::new(FakePeer::standard()));
+        let cfg = crate::config::ApsConfig {
+            coordinator: true,
+            peers: std::collections::BTreeMap::from([
+                (account(8), "https://gateway.rd-iroha3-bank-a.svc.cluster.local:8443".to_owned()),
+                (account(9), "https://gateway.rd-iroha3-bank-b.svc.cluster.local:8443".to_owned()),
+            ]),
+            ..Default::default()
+        };
+        let aps: &'static Aps<'static> = Box::leak(Box::new(Aps::new(backend, peer, cfg)));
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap().to_string();
+        std::thread::spawn(move || http::serve_listener_threaded(&listener, &|method: &str, path: &str, body: &str| dispatch(method, path, body, &Fake::default(), aps)));
+        let submit = serde_json::json!({ "kind": "pay", "intent": "ab".repeat(32), "asset": "rd", "from": account(8), "to": account(9), "amount": "5" }).to_string();
+        let started = Instant::now();
+        let waiting = {
+            let addr = addr.clone();
+            std::thread::spawn(move || http::request_with(&addr, "POST", "/aps/submit", &submit, None, Duration::from_secs(10)))
+        };
+        std::thread::sleep(Duration::from_millis(100));
+        let (status, _) = http::request_with(&addr, "GET", "/healthz", "", None, Duration::from_secs(5)).unwrap();
+        assert_eq!(status, 200);
+        assert!(started.elapsed() < Duration::from_millis(500), "healthz waited for the submit: {:?}", started.elapsed());
+        let (status, response) = waiting.join().unwrap().unwrap();
+        assert_eq!((status, json(&response)["outcome"].as_str()), (200, Some("finalized")));
+        assert!(started.elapsed() >= Duration::from_millis(600), "the submit really was in progress");
+    }
 }
