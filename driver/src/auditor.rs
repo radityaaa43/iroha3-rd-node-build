@@ -437,6 +437,31 @@ mod tests {
         assert!(!approval_durable(Expired, 1));
     }
 
+    /// Live baseline 2026-11-12T19:31Z, 2-of-3 with all three auditors up: the coordinator prepared the bundle after the
+    /// second approval, the committee refused the third (upstream sidecar_store record_audit_approval accepts only
+    /// Collecting | Audited) and that auditor kept NO record of a leg it had decrypted, so BI's lens can miss legs.
+    /// Collecting and Audited still take an approval (upstream approve_private_settlement_leg_v1); a leg past the audit
+    /// is recorded locally, marked late; an aborted or expired leg never settled and is not recorded.
+    #[test]
+    fn a_leg_past_the_audit_is_recorded_late_not_submitted() {
+        assert_eq!(stage(Collecting), Stage::Open);
+        assert_eq!(stage(Audited), Stage::Open);
+        for later in [Prepared, CommitCertified, Finalized] {
+            assert_eq!(stage(later), Stage::Closed, "{later:?}");
+        }
+        assert_eq!(stage(Aborted), Stage::Dead);
+        assert_eq!(stage(Expired), Stage::Dead);
+        assert_eq!(late_verdict(Prepared), "approved (late: Prepared, not counted)");
+        assert_ne!(late_verdict(Finalized), "approved", "a late verdict never reads as a counted approval");
+    }
+
+    #[test]
+    fn a_late_answer_is_a_409_not_a_500() {
+        let late: eyre::Report = Late(late_verdict(Prepared)).into();
+        assert_eq!(status_of(&late), 409);
+        assert_eq!(status_of(&eyre!("submit approval quorum")), 500);
+    }
+
     const RD: &str = "7onbjg2gRXveoAAUFsohCZyGW98t";
     const DFABI: &str = "4mBWK1JCwQdHLDPpuVKc56eLsXka";
 

@@ -158,6 +158,22 @@ mod tests {
         assert!(response.ends_with("GET /records/ab []"), "{response}");
     }
 
+    /// Live 2026-11-13: the kubelet tcpSocket readiness probe connects and closes every 10 s; each one reached the
+    /// handler as method "" path "" and logged " : not found" (about 2580 lines per auditor in 7 h).
+    #[test]
+    fn a_connection_closed_without_a_request_is_not_handled() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        drop(TcpStream::connect(listener.local_addr().unwrap()).unwrap());
+        let (stream, _) = listener.accept().unwrap();
+        let called = std::cell::Cell::new(false);
+        serve_one(stream, &|_, _, _| {
+            called.set(true);
+            (404, String::new())
+        })
+        .unwrap();
+        assert!(!called.get(), "an empty connection must not reach the handler");
+    }
+
     #[test]
     fn an_https_target_without_a_tls_section_is_refused_and_a_plain_target_does_not_need_one() {
         let err = send(None, "https://gateway.rd-iroha3-bi.svc.cluster.local:8443", "GET", "/keys", "", None, Duration::from_secs(1)).unwrap_err();
