@@ -8,6 +8,7 @@
 
 use std::{
     cell::Cell,
+    collections::BTreeMap,
     io::Write,
     os::unix::fs::OpenOptionsExt,
     path::{Path, PathBuf},
@@ -124,6 +125,28 @@ impl PoolFile {
         let mut pools = Self::load(path)?;
         change(&mut pools);
         pools.save(path)
+    }
+
+    /// The finalized bundles of a pool (height > 0), in ledger order: what a party driver needs to rebuild the history.
+    pub fn finalized(&self, asset: Asset) -> Vec<BundleRef> {
+        self.get(asset).bundles.iter().filter(|bundle| bundle.height > 0).cloned().collect()
+    }
+
+    /// Add the finalized bundles another driver listed (`ids`; `heights` may name a height per id) that are not here yet, after the
+    /// ones here. `history()` sorts by the chain's finalized height and trusts only receipts it reads from the chain.
+    pub fn merge_finalized(&mut self, asset: Asset, ids: &[String], heights: &BTreeMap<String, u64>) {
+        let bundles = &mut self.get_mut(asset).bundles;
+        for id in ids {
+            let height = heights.get(id).copied().unwrap_or(0);
+            match bundles.iter().position(|bundle| bundle.id == *id) {
+                Some(known) => {
+                    if bundles[known].height == 0 {
+                        bundles[known].height = height;
+                    }
+                }
+                None => bundles.push(BundleRef { id: id.clone(), height }),
+            }
+        }
     }
 
     pub fn get(&self, asset: Asset) -> &PoolRecord {

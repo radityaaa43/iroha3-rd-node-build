@@ -7,7 +7,7 @@
 //! written to a response: all chain, proving and key work sits behind `ApsBackend`, all calls to another party behind `Peer`.
 
 use std::{
-    collections::HashMap,
+    collections::{BTreeMap, HashMap},
     sync::Mutex,
     time::{Duration, Instant},
 };
@@ -74,6 +74,17 @@ pub struct LegReq {
     pub sponsor_output: SponsorOutput,
 }
 
+/// The finalized bundles of both pools, as the coordinator records them (`GET /aps/bundles`): ids in ledger order, plus their heights.
+/// A party driver rebuilds a pool's history from the chain by bundle id; the coordinator is the only one that records them.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BundleLists {
+    pub rd: Vec<String>,
+    pub dfabi: Vec<String>,
+    /// bundle id -> finalized height, for the wallet's rows; absent = unknown (0).
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub heights: BTreeMap<String, u64>,
+}
+
 /// What `begin_bundle` fixed for the whole bundle (everything the parties need to sign and prove against).
 #[derive(Debug, Clone)]
 pub struct BundleCtx {
@@ -114,6 +125,10 @@ pub trait ApsBackend: Send + Sync {
     fn prove_leg(&self, req: &LegReq) -> Result<String>;
     /// Coordinator side: audit quorum, prepare, commit. `None` = the bundle was aborted (nothing moved).
     fn settle(&self, bundle: &BundleCtx, prepared: &[String; 2]) -> Result<Option<Settled>>;
+    /// Coordinator side: the finalized bundles of both pools (height > 0) from its pools file.
+    fn bundles(&self) -> Result<BundleLists>;
+    /// Party side: merge the coordinator's finalized bundles into the own pools file (no duplicates, own entries kept).
+    fn merge_bundles(&self, lists: &BundleLists) -> Result<()>;
     /// The own `wallet_json`.
     fn wallet(&self) -> Result<serde_json::Value>;
 }
@@ -390,8 +405,9 @@ impl<'a> Aps<'a> {
             ("POST", "/aps/address") => self.address(body),
             ("POST", "/aps/leg") => self.leg(now, body),
             ("GET", "/aps/wallet") => self.wallet(),
+            ("GET", "/aps/bundles") => self.bundles(),
             ("POST", "/aps/submit") => self.submit(now, body),
-            (_, "/aps/intent" | "/aps/address" | "/aps/leg" | "/aps/wallet" | "/aps/submit") => error(405, "method not allowed"),
+            (_, "/aps/intent" | "/aps/address" | "/aps/leg" | "/aps/wallet" | "/aps/bundles" | "/aps/submit") => error(405, "method not allowed"),
             _ => error(404, "not found"),
         }
     }
@@ -438,6 +454,9 @@ impl<'a> Aps<'a> {
         if let Err(reply) = self.consume(now, &req, amount) {
             return reply;
         }
+        if let Err(reply) = self.refresh() {
+            return reply;
+        }
         match self.backend.prove_leg(&req) {
             Ok(prepared) => ok(&Prepared { prepared }),
             Err(e) => fail(e),
@@ -455,10 +474,45 @@ impl<'a> Aps<'a> {
     }
 
     fn wallet(&self) -> Reply {
+        if let Err(reply) = self.refresh() {
+            return reply;
+        }
         match self.backend.wallet() {
             Ok(wallet) => reply(200, wallet),
             Err(e) => fail(e),
         }
+    }
+
+    /// Only the coordinator has the list (a party driver answers 404).
+    fn bundles(&self) -> Reply {
+        if !self.cfg.coordinator {
+            return error(404, "not found");
+        }
+        match self.backend.bundles() {
+            Ok(lists) => ok(&lists),
+            Err(e) => fail(e),
+        }
+    }
+
+    /// A party driver's pool history needs every finalized bundle of the pools, but only the coordinator records them: take its list
+    /// (merged into the own pools file) before proving a leg or reading the wallet. Integrity stays on chain: `history()` trusts only
+    /// bundles whose finalized receipt it reads from the chain. No fresh list = no proving on a stale history.
+    fn refresh(&self) -> Result<(), Reply> {
+        if self.cfg.coordinator {
+            return Ok(());
+        }
+        let Some(url) = &self.cfg.coordinator_url else {
+            return Err(error(503, "this driver has no [aps] coordinator_url to read the finalized bundles from"));
+        };
+        let (status, answer) = self.peer.call(url, "GET", "/aps/bundles", "").map_err(|e| error(502, format!("/aps/bundles: {}", safe(&e))))?;
+        if status != 200 {
+            return Err(error(502, format!("/aps/bundles refused by the coordinator ({status}): {}", peer_error(&answer))));
+        }
+        let lists: BundleLists = serde_json::from_str(&answer).map_err(|e| error(502, format!("/aps/bundles: bad answer: {e}")))?;
+        if !lists.rd.iter().chain(&lists.dfabi).all(|id| hex_n(id, 32)) {
+            return Err(error(502, "/aps/bundles: bad bundle id"));
+        }
+        self.backend.merge_bundles(&lists).map_err(fail)
     }
 
     fn submit(&self, now: Instant, body: &str) -> Reply {
@@ -611,6 +665,27 @@ impl ApsBackend for RealBackend<'_> {
 
     fn settle(&self, _bundle: &BundleCtx, _prepared: &[String; 2]) -> Result<Option<Settled>> {
         Err(not_wired())
+    }
+
+    fn bundles(&self) -> Result<BundleLists> {
+        let cfg = self.cfg.lock().unwrap_or_else(|p| p.into_inner());
+        let file = pools::PoolFile::load(&cfg.pools_file)?;
+        let mut lists = BundleLists::default();
+        for (asset, ids) in [(pools::Asset::Rd, &mut lists.rd), (pools::Asset::Dfabi, &mut lists.dfabi)] {
+            for bundle in file.finalized(asset) {
+                ids.push(bundle.id.clone());
+                lists.heights.insert(bundle.id, bundle.height);
+            }
+        }
+        Ok(lists)
+    }
+
+    fn merge_bundles(&self, lists: &BundleLists) -> Result<()> {
+        let cfg = self.cfg.lock().unwrap_or_else(|p| p.into_inner());
+        pools::PoolFile::update(&cfg.pools_file, |file| {
+            file.merge_finalized(pools::Asset::Rd, &lists.rd, &lists.heights);
+            file.merge_finalized(pools::Asset::Dfabi, &lists.dfabi, &lists.heights);
+        })
     }
 
     fn wallet(&self) -> Result<serde_json::Value> {
