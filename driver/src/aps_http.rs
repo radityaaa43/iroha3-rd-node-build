@@ -1358,4 +1358,30 @@ mod tests {
         assert_eq!(aps.route("GET", "/aps/bundles", "").0, 404);
         assert!(calls(&backend).is_empty());
     }
+
+    #[test]
+    fn a_prepared_answer_may_have_dot_separated_hex_parts_and_nothing_else() {
+        let (to, from) = (account(9), account(8));
+        for (prepared, status) in [("aa.bb.cc", 200), ("cafe", 200), ("zz", 502), ("aa..cc", 502), ("", 502), ("aa.", 502)] {
+            let (backend, answer) = (driver(7), format!(r#"{{"prepared":"{prepared}"}}"#));
+            let peer = FakePeer::with(move |_, path, _| match path {
+                "/aps/leg" => Ok((200, answer.clone())),
+                _ => Ok((200, serde_json::json!({ "authority": id(0x33), "view_public": id(0x44), "authorization": "abcd" }).to_string())),
+            });
+            let aps = Aps::new(&backend, &peer, coordinator());
+            let (got, _) = aps.route("POST", "/aps/submit", &pay_body(&id(1), "rd", &from, &to, "5"));
+            assert_eq!(got, status, "{prepared:?}");
+            assert_eq!(calls(&backend).contains(&"settle"), status == 200, "{prepared:?}");
+        }
+    }
+
+    #[test]
+    fn the_network_id_is_the_canonical_text_literal_not_hex() {
+        let (backend, peer) = (driver(9), FakePeer::standard());
+        let aps = Aps::new(&backend, &peer, bank());
+        let literal = address_body().replace(r#""network_id":"ee""#, r#""network_id":"hash:AB12#34""#);
+        assert_eq!(aps.route("POST", "/aps/address", &literal).0, 200);
+        let empty = address_body().replace(r#""network_id":"ee""#, r#""network_id":"""#);
+        assert_eq!(aps.route("POST", "/aps/address", &empty).0, 400);
+    }
 }

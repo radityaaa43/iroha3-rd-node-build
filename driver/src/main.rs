@@ -32,6 +32,7 @@ mod approval;
 mod balance;
 mod aps;
 mod aps_http;
+mod aps_real;
 mod aps_split;
 mod auditor;
 mod client_toml;
