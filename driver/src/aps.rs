@@ -33,48 +33,35 @@ use iroha::{
         nexus::{
             ATOMIC_PRIVATE_SETTLEMENT_VERSION_V1, AtomicPrivateSettlementV1,
             PRIVATE_SETTLEMENT_MAX_RECEIPT_BYTES_V1, PrivateSettlementAbortReasonV1,
-            PrivateSettlementAuditAadV1, PrivateSettlementAuditEncryptionOpeningV1,
             PrivateSettlementAuditNoteOpeningV1, PrivateSettlementAuditOutputRoleV1,
-            PrivateSettlementAuditOutputV1, PrivateSettlementAuditPayerAuthorizationBodyV1,
+            PrivateSettlementAuditPayerAuthorizationBodyV1,
             PrivateSettlementAuditPayerAuthorizationV1, PrivateSettlementAuditPayerInputV1,
             PrivateSettlementAuditPayerSignatureV1, PrivateSettlementAuditPlaintextV1,
             PrivateSettlementAuditPolicyBodyV1, PrivateSettlementAuditPolicyV1,
-            PrivateSettlementAuditViewKeyAuthorizationBodyV1,
-            PrivateSettlementAuditViewKeyAuthorizationV1, PrivateSettlementAuditViewKeySignatureV1,
-            PrivateSettlementAuditorV1, PrivateSettlementCapsulePaddingV1,
-            PrivateSettlementCommitteeAuthorityV1, PrivateSettlementHybridPublicKeyV1,
+            PrivateSettlementAuditorV1, PrivateSettlementCommitteeAuthorityV1,
+            PrivateSettlementHybridPublicKeyV1,
             PrivateSettlementLegCommitmentV1, PrivateSettlementPoolGovernanceLifecycleV1,
-            PrivateSettlementPoolGovernanceV1, PrivateSettlementProofProfileV1,
-            PrivateSettlementProofStatementV1, PrivateSettlementProvisionalLegMaterialV1,
+            PrivateSettlementPoolGovernanceV1, PrivateSettlementProvisionalLegMaterialV1,
             PrivateSettlementRouteV1,
         },
         privacy::{
             PRIVACY_IVM_PRIVATE_ENCRYPTED_OUTPUT_BYTES_V1, PrivacyCommitmentV1,
             PrivacyEncryptedOutputV1, PrivacyEncryptionKeyV1, PrivacyNullifierV1, PrivacyPoolIdV1,
-            PrivacyProtocolIdV1, PrivacyRecipientIdV1, PrivacyRootV1,
+            PrivacyProtocolIdV1, PrivacyRecipientIdV1,
         },
         transaction::{FeeChargeKind, FeeChargeLimit, FeePaymentIntent},
     },
 };
 use iroha_core::privacy_engines::{
     atomic_private_settlement::{
-        AtomicPrivateSettlementInputSecretV1, AtomicPrivateSettlementPreparedLegV1,
+        AtomicPrivateSettlementPreparedLegV1,
         AtomicPrivateSettlementProvisionalLegInputV1,
-        atomic_private_settlement_audit_input_commitment_v1,
-        complete_atomic_private_settlement_prepared_leg_v1,
-        consume_atomic_private_settlement_wallet_bundle_v1,
-        derive_atomic_private_settlement_input_nullifiers_v1,
-        encode_atomic_private_settlement_wallet_bundle_v1,
         finalize_atomic_private_settlement_provisional_bundle_v1,
         verify_atomic_private_settlement_v1,
-        plan_atomic_private_settlement_bootstrap_v1,
         prepare_atomic_private_settlement_funding_note_v1,
-        prepare_atomic_private_settlement_input_openings_v1,
-        prepare_atomic_private_settlement_outputs_v1,
     },
-    ivm_private_note::{derive_note_authority_v1, ivm_private_recipient_public_key_v1},
+    ivm_private_note::derive_note_authority_v1,
 };
-use iroha_core::private_settlement::seal_private_settlement_audit_capsule_v1_with_rng;
 use iroha_crypto::{Hash, HashOf, KeyPair, PublicKey, SignatureOf};
 use iroha_model_base::{
     metadata::Metadata,
@@ -1178,36 +1165,6 @@ pub(crate) fn placeholder_payer_authorization(
     )
 }
 
-fn placeholder_view_authorization(
-    network_id: NetworkId,
-    route: PrivateSettlementRouteV1,
-    signer: &KeyPair,
-    expiry_height: u64,
-) -> PrivateSettlementAuditViewKeyAuthorizationV1 {
-    let body = PrivateSettlementAuditViewKeyAuthorizationBodyV1 {
-        version: ATOMIC_PRIVATE_SETTLEMENT_VERSION_V1,
-        purpose: hash(0x8A),
-        network_id,
-        bundle_id: hash(0x8B),
-        leg_ordinal: 0,
-        route,
-        output_ordinal: 0,
-        role: PrivateSettlementAuditOutputRoleV1::SettlementRecipient,
-        authorized_account: AccountId::new(signer.public_key().clone()),
-        recipient_view_key: bytes(0x8C),
-        output_active: true,
-        note_spending_authority: bytes(0x8D),
-        expiry_height,
-    };
-    PrivateSettlementAuditViewKeyAuthorizationV1::new(
-        body.clone(),
-        vec![PrivateSettlementAuditViewKeySignatureV1::new(
-            signer.public_key().clone(),
-            SignatureOf::try_new(signer.private_key(), &body).expect("placeholder signature"),
-        )],
-    )
-}
-
 pub(crate) fn placeholder_encrypted_output(seed: u8) -> PrivacyEncryptedOutputV1 {
     let mut ciphertext = vec![seed.max(1); PRIVACY_IVM_PRIVATE_ENCRYPTED_OUTPUT_BYTES_V1];
     ciphertext[..4].copy_from_slice(b"IPNE");
@@ -1263,276 +1220,51 @@ pub(crate) fn prepare_leg_to(
     sponsor_key: &KeyPair,
     reimbursement_salt: [u8; 32],
 ) -> Result<AtomicPrivateSettlementPreparedLegV1> {
-    let mut output_rng = iroha_crypto::rng_from_seed_slice(&rnd());
-    let mut capsule_rng = iroha_crypto::rng_from_seed_slice(&rnd());
     let leg_ordinal = u8::try_from(ordinal)?;
-    let profile = PrivateSettlementProofProfileV1::IvmPrivateNoteFixed2In3Out;
-    let placeholders = [
-        placeholder_encrypted_output(0x11 + leg_ordinal * 6),
-        placeholder_encrypted_output(0x13 + leg_ordinal * 6),
-        placeholder_encrypted_output(0x15 + leg_ordinal * 6),
-    ];
-    let mut statement = PrivateSettlementProofStatementV1 {
-        version: ATOMIC_PRIVATE_SETTLEMENT_VERSION_V1,
-        profile,
-        proof_profile_digest: profile.digest(),
+    let ctx = crate::aps_split::OutputCtx {
         network_id: manifest.network_id,
         bundle_id: manifest.bundle_id,
         leg_ordinal,
         route: governed.route,
-        authority_context_height: manifest.authority_context_height,
-        pool_id: governed.governance.body.pool_id,
-        asset_binding_commitment: governed.governance.body.asset_binding_commitment,
-        old_root: PrivacyRootV1::new(bytes(0x20 + leg_ordinal)),
-        new_root: PrivacyRootV1::new(bytes(0x24 + leg_ordinal)),
-        old_epoch: 1,
-        new_epoch: 2,
-        nullifiers: vec![
-            PrivacyNullifierV1::new(bytes(0x30 + leg_ordinal * 2)),
-            PrivacyNullifierV1::new(bytes(0x31 + leg_ordinal * 2)),
-        ],
-        output_commitments: placeholders.iter().map(|output| output.commitment).collect(),
-        encrypted_outputs: placeholders.to_vec(),
-        audit_plaintext_commitment: hash(0x40 + leg_ordinal),
-        audit_input_commitment: [0x48 + leg_ordinal; 32],
-        audit_capsule_digest: hash(0x50 + leg_ordinal),
-        audit_policy_digest: governed.policy.policy_digest,
-        audit_key_epoch: governed.policy.body.key_epoch,
-        fee_intent_digest: manifest.fee_intent_digest,
-        reimbursement_terms_commitment: manifest.reimbursement_terms_commitment,
-        reimbursement_leg_ordinal: manifest.reimbursement_leg_ordinal,
         expiry_height: manifest.expiry_height,
     };
-    statement.validate()?;
-
-    let payer = &leg.payer;
-    let recipient = &leg.recipient;
-    let (positive_input, positive_secret) = match &spend {
-        Spend::Bootstrap(funding) => (funding.opening.clone(), funding.spending_secret),
-        Spend::Continue { opening, secret, .. } => (opening.clone(), *secret),
+    // Single process: all three owners' keys are at hand, so sign their outputs here and hand the leg to the
+    // payer-only path. The sponsor output is never spent: random keys, as before.
+    let recipient_role = PrivateSettlementAuditOutputRoleV1::SettlementRecipient;
+    let recipient_output = match recipient_public {
+        Some((authority, view_public)) => {
+            crate::aps_split::sign_output_public(&leg.recipient, &ctx, 0, recipient_role, authority, view_public, true)?
+        }
+        None => crate::aps_split::sign_output_key(&leg.recipient, &ctx, 0, recipient_role, &notes.recipient, true)?,
     };
-    let input_secrets = [positive_secret, rnd()];
-    let output_secrets = [notes.recipient.spend, notes.change.spend, rnd()];
-    let view_secrets = [notes.recipient.view, notes.change.view, rnd()];
-    let ephemeral_secrets = [rnd(), rnd(), rnd()];
-    let reimbursement = if ordinal == 0 { SPONSOR_REIMBURSEMENT } else { 0 };
-    let change = spend
-        .value()
-        .checked_sub(leg.amount + reimbursement)
-        .ok_or_else(|| eyre!("leg {ordinal}: insufficient payer note"))?;
-    let output = |role, signer: &KeyPair, view_secret, ephemeral_secret, active, value| {
-        Ok::<_, eyre::Report>(PrivateSettlementAuditOutputV1 {
-            role,
-            recipient_view_key: ivm_private_recipient_public_key_v1(view_secret)?,
-            view_key_authorization: placeholder_view_authorization(
-                manifest.network_id,
-                governed.route,
-                signer,
-                manifest.expiry_height,
-            ),
-            encryption_opening: PrivateSettlementAuditEncryptionOpeningV1 { ephemeral_secret },
-            note: note_opening(active, value),
-        })
-    };
-    let mut plaintext = PrivateSettlementAuditPlaintextV1 {
-        version: ATOMIC_PRIVATE_SETTLEMENT_VERSION_V1,
-        network_id: manifest.network_id,
-        bundle_id: manifest.bundle_id,
-        leg_ordinal,
-        route: governed.route,
-        pool_id: governed.governance.body.pool_id,
-        payer: AccountId::new(payer.public_key().clone()),
-        payer_authorization: placeholder_payer_authorization(
-            manifest.network_id,
-            governed.route,
-            payer,
-            manifest.expiry_height,
-        ),
-        recipient: AccountId::new(recipient.public_key().clone()),
-        sponsor: manifest.sponsor.clone(),
-        asset_definition_id: governed.governance.body.asset_definition_id.clone(),
-        asset_binding_salt: governed.governance.body.asset_binding_salt,
+    let sponsor_output = crate::aps_split::sign_output_key(
+        sponsor_key,
+        &ctx,
+        2,
+        PrivateSettlementAuditOutputRoleV1::SponsorReimbursement,
+        &NoteKeys::random(),
+        ordinal == 0,
+    )?;
+    let payer = crate::aps_split::LegPayer {
+        lane: leg.lane,
+        asset: leg.asset.clone(),
+        payer: leg.payer.clone(),
+        recipient: leg.recipient.public_key().clone(),
         amount: leg.amount,
-        sponsor_reimbursement_amount: reimbursement,
-        fee_intent_digest: manifest.fee_intent_digest,
-        settlement_expiry_height: manifest.expiry_height,
-        reimbursement_terms_salt: reimbursement_salt,
-        memo: format!("rd-dfabi-leg-{ordinal}").into_bytes(),
-        policy_references: vec![governed.governance.governance_digest],
-        inputs: vec![positive_input.clone(), note_opening(false, 0)],
-        outputs: vec![
-            output(
-                PrivateSettlementAuditOutputRoleV1::SettlementRecipient,
-                recipient,
-                &view_secrets[0],
-                ephemeral_secrets[0],
-                true,
-                leg.amount,
-            )?,
-            output(
-                PrivateSettlementAuditOutputRoleV1::PayerChange,
-                payer,
-                &view_secrets[1],
-                ephemeral_secrets[1],
-                true,
-                change,
-            )?,
-            output(
-                PrivateSettlementAuditOutputRoleV1::SponsorReimbursement,
-                sponsor_key,
-                &view_secrets[2],
-                ephemeral_secrets[2],
-                ordinal == 0,
-                reimbursement,
-            )?,
-        ],
     };
-    for (opening, secret) in plaintext.inputs.iter_mut().zip(input_secrets) {
-        opening.spending_authority = derive_note_authority_v1(&secret)?;
-    }
-    for (index, (output, secret)) in plaintext.outputs.iter_mut().zip(output_secrets).enumerate() {
-        output.note.spending_authority = match recipient_public {
-            Some((authority, _)) if index == 0 => authority,
-            _ => derive_note_authority_v1(&secret)?,
-        };
-    }
-    if let Some((_, view_key)) = recipient_public {
-        plaintext.outputs[0].recipient_view_key = view_key;
-    }
-    prepare_atomic_private_settlement_input_openings_v1(manifest, &statement, &mut plaintext.inputs)?;
-    ensure!(
-        plaintext.inputs[0].commitment == positive_input.commitment,
-        "settlement changed its already-funded positive input"
-    );
-    statement.nullifiers = derive_atomic_private_settlement_input_nullifiers_v1(
+    crate::aps_split::prepare_leg_split(
+        ordinal,
+        &payer,
+        governed,
+        spend,
+        &notes.change,
+        &recipient_output,
+        &sponsor_output,
+        sponsor_key.public_key(),
         manifest,
-        &statement,
-        &plaintext.inputs,
-        &input_secrets,
-    )?
-    .to_vec();
-    let payer_body = plaintext.payer_authorization_body(&statement.nullifiers)?;
-    plaintext.payer_authorization = PrivateSettlementAuditPayerAuthorizationV1::new(
-        payer_body.clone(),
-        vec![PrivateSettlementAuditPayerSignatureV1::new(
-            payer.public_key().clone(),
-            SignatureOf::try_new(payer.private_key(), &payer_body)?,
-        )],
-    );
-    for (index, signer) in [recipient, payer, sponsor_key].into_iter().enumerate() {
-        let body = plaintext.output_view_key_authorization_body(index)?;
-        plaintext.outputs[index].view_key_authorization =
-            PrivateSettlementAuditViewKeyAuthorizationV1::new(
-                body.clone(),
-                vec![PrivateSettlementAuditViewKeySignatureV1::new(
-                    signer.public_key().clone(),
-                    SignatureOf::try_new(signer.private_key(), &body)?,
-                )],
-            );
-    }
-    statement.audit_plaintext_commitment = plaintext.commitment()?;
-    statement.audit_input_commitment =
-        atomic_private_settlement_audit_input_commitment_v1(&plaintext.inputs)?;
-    statement.encrypted_outputs = prepare_atomic_private_settlement_outputs_v1(
-        &mut output_rng,
-        manifest,
-        &statement,
-        &mut plaintext.outputs,
-    )?;
-    statement.output_commitments = plaintext
-        .outputs
-        .iter()
-        .map(|output| output.note.commitment)
-        .collect();
-    let canonical_plaintext = norito::encode_canonical(&plaintext)?;
-    let aad = PrivateSettlementAuditAadV1 {
-        network_id: manifest.network_id,
-        bundle_id: manifest.bundle_id,
-        leg_ordinal,
-        route: governed.route,
         authority_digest,
-        authority_context_height: manifest.authority_context_height,
-        audit_policy_digest: governed.policy.policy_digest,
-        audit_key_epoch: governed.policy.body.key_epoch,
-        plaintext_commitment: statement.audit_plaintext_commitment,
-    };
-    let capsule = seal_private_settlement_audit_capsule_v1_with_rng(
-        &canonical_plaintext,
-        aad,
-        PrivateSettlementCapsulePaddingV1::KiB16,
-        &governed.policy,
-        &mut capsule_rng,
-    )?;
-    statement.audit_capsule_digest = capsule.digest()?;
-    let outputs: [PrivacyCommitmentV1; 3] = statement
-        .output_commitments
-        .as_slice()
-        .try_into()
-        .map_err(|_| eyre!("output commitment shape changed"))?;
-    let input_witnesses = match spend {
-        Spend::Bootstrap(funding) => {
-            let bootstrap = plan_atomic_private_settlement_bootstrap_v1(
-                statement.pool_id,
-                funding.input_commitments,
-                outputs,
-                input_secrets,
-            )?;
-            ensure!(
-                bootstrap.initial_commitments == funding.activation_commitments(),
-                "bootstrap origin differs from the activated funding"
-            );
-            statement.old_root = bootstrap.old_root;
-            statement.new_root = bootstrap.new_root;
-            statement.old_epoch = bootstrap.old_epoch;
-            statement.new_epoch = bootstrap.new_epoch;
-            bootstrap.into_input_secrets()
-        }
-        Spend::Continue { opening, tree, epoch, .. } => {
-            let position = tree
-                .position(opening.commitment)
-                .ok_or_else(|| eyre!("leg {ordinal}: payer note is not in the pool"))?;
-            let mut successor = tree.clone();
-            successor.append(&outputs)?;
-            statement.old_root = tree.root();
-            statement.new_root = successor.root();
-            statement.old_epoch = epoch;
-            statement.new_epoch = epoch + 1;
-            // Input 1 is a virtual dummy: never inserted, any non-zero path (upstream relation.rs
-            // wallet_continues_settlement_with_fresh_virtual_dummy_without_bootstrap).
-            [
-                AtomicPrivateSettlementInputSecretV1::new(input_secrets[0], u32::try_from(position)?, tree.path(position)?)?,
-                AtomicPrivateSettlementInputSecretV1::new(
-                    input_secrets[1],
-                    u32::try_from(position ^ 1)?,
-                    [[0xED; 32]; crate::tree::DEPTH],
-                )?,
-            ]
-        }
-    };
-    statement.validate()?;
-    let wallet_id = format!("rd-dfabi-leg-{ordinal}");
-    let owner_bundle = encode_atomic_private_settlement_wallet_bundle_v1(
-        &wallet_id,
-        manifest,
-        &statement,
-        &capsule,
-        &governed.policy,
-        &plaintext,
-        &input_witnesses,
-    )?;
-    let mut owner_material = owner_bundle.to_vec();
-    let prepared = consume_atomic_private_settlement_wallet_bundle_v1(
-        &mut owner_material,
-        &wallet_id,
-        manifest,
-        &statement,
-        &capsule,
-        &governed.policy,
-        *manifest.network_id.as_genesis_hash().as_ref(),
-        manifest.authority_context_height,
-    )?;
-    ensure!(owner_material.iter().all(|byte| *byte == 0), "owner bundle was not wiped");
-    Ok(complete_atomic_private_settlement_prepared_leg_v1(prepared)?)
+        reimbursement_salt,
+    )
 }
 
 fn provisional_materials(
@@ -1674,7 +1406,7 @@ mod output_authority_tests {
         };
         // The recipient keeps its secrets; the payer is given the public values and a placeholder it never uses.
         let recipient = NoteKeys::random();
-        let public = (recipient.authority().unwrap(), ivm_private_recipient_public_key_v1(&recipient.view).unwrap());
+        let public = (recipient.authority().unwrap(), recipient.view_public().unwrap());
         let notes = LegNotes { recipient: NoteKeys::random(), change: NoteKeys::random() };
         let prepared = on_big_stack(|| {
             prepare_leg_to(0, &leg, &governed[0], Spend::Bootstrap(funding), &notes, Some(public), &manifest, authority_digest, &sponsor_key, salt)
