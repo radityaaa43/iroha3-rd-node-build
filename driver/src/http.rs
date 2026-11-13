@@ -69,6 +69,29 @@ pub fn serve(addr: &str, handler: impl Fn(&str, &str, &str) -> (u16, String)) ->
     Ok(())
 }
 
+/// `serve`, but every connection runs on its own thread (std only). Needed where a handler waits on another driver that calls back
+/// into this one: a bank blocks in its forwarded `/aps/submit` while BI asks the same bank for `/aps/leg`.
+/// ponytail: no cap on threads; only parties holding a gateway-issued client certificate reach this port. Add a pool if that changes.
+pub fn serve_threaded(addr: &str, handler: impl Fn(&str, &str, &str) -> (u16, String) + Sync) -> Result<()> {
+    let listener = TcpListener::bind(addr).wrap_err_with(|| format!("bind {addr}"))?;
+    eprintln!("listening on {addr}");
+    serve_listener_threaded(&listener, &handler);
+    Ok(())
+}
+
+fn serve_listener_threaded(listener: &TcpListener, handler: &(impl Fn(&str, &str, &str) -> (u16, String) + Sync)) {
+    std::thread::scope(|scope| {
+        for stream in listener.incoming() {
+            let Ok(stream) = stream else { continue };
+            scope.spawn(move || {
+                if let Err(error) = serve_one(stream, handler) {
+                    eprintln!("request failed: {error}");
+                }
+            });
+        }
+    });
+}
+
 fn serve_one(
     mut stream: TcpStream,
     handler: &impl Fn(&str, &str, &str) -> (u16, String),

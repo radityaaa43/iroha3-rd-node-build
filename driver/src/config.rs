@@ -51,6 +51,23 @@ pub struct Config {
     /// Only the BI driver sets this (S18, K6): enables `mint` / `POST /mint` for RD and DFABI. Absent = refused.
     #[serde(default)]
     pub mint_enabled: bool,
+    /// `[aps]`: this driver's part in the all-flows APS HTTP endpoints (plan 2026-11-13-04 T2). Absent = a party driver.
+    #[serde(default)]
+    pub aps: ApsConfig,
+}
+
+/// `[aps]`: who runs `POST /aps/submit` and where the other drivers send theirs.
+#[derive(Clone, Debug, Default, Deserialize)]
+pub struct ApsConfig {
+    /// Only the BI driver: it coordinates bundles itself (one at a time).
+    #[serde(default)]
+    pub coordinator: bool,
+    /// Every other driver: the BI gateway (`https://gateway.rd-iroha3-bi.svc...:8443`, mutual TLS via `[tls]`) its `/aps/submit` goes to.
+    #[serde(default)]
+    pub coordinator_url: Option<String>,
+    /// Coordinator only: account public key (`ed0120...`) -> gateway URL of the party that holds that account.
+    #[serde(default)]
+    pub peers: BTreeMap<String, String>,
 }
 
 /// `[tls]`: mutual TLS to other parties' gateways (iroha3 S13 transport A). Only used for `https://` auditor URLs.

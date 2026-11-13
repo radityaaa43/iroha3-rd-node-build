@@ -442,6 +442,12 @@ fn record_end(pools: &mut PoolFile, id: &str, end: &BundleEnd) {
 
 /// `wallet --party P`: balances and per-bundle movements read from both pools on chain.
 pub fn wallet(cfg: &Config, party: &str) -> Result<()> {
+    println!("wallet_json={}", wallet_json(cfg, party)?);
+    Ok(())
+}
+
+/// The wallet of `party` as JSON: the `wallet_json=` line of the CLI and `GET /aps/wallet`.
+pub fn wallet_json(cfg: &Config, party: &str) -> Result<serde_json::Value> {
     let pools = PoolFile::load(&cfg.pools_file)?;
     let (client, _) = cfg.sponsor(party)?;
     let keys = cfg.note_keys(party)?;
@@ -464,8 +470,7 @@ pub fn wallet(cfg: &Config, party: &str) -> Result<()> {
         }
     }
     items.sort_by_key(|i| std::cmp::Reverse(i["height"].as_u64()));
-    println!("wallet_json={}", serde_json::json!({ "party": party, "balances": balances, "items": items }));
-    Ok(())
+    Ok(serde_json::json!({ "party": party, "balances": balances, "items": items }))
 }
 
 /// One wallet row for a bundle, or None when nothing visible moved. The payer of the RD leg (leg 0) also

@@ -1,3 +1,636 @@
+//! APS HTTP side of a per-org driver (plan 2026-11-13-04, task T2).
+//!
+//! `POST /aps/intent`, `POST /aps/address`, `POST /aps/leg`, `GET /aps/wallet` and `POST /aps/submit`. A leg is split per key holder: the
+//! recipient signs its own output authorization (`/aps/address`), the payer proves its own leg (`/aps/leg`, only after the one-shot
+//! intent that its Lensa registered with `/aps/intent`), and BI (`[aps] coordinator`) walks the parties through one bundle at a time
+//! (`/aps/submit`). Every other driver forwards its `/aps/submit` to BI over the mTLS client. Nothing secret is read from a request or
+//! written to a response: all chain, proving and key work sits behind `ApsBackend`, all calls to another party behind `Peer`.
+
+use std::{
+    collections::HashMap,
+    sync::Mutex,
+    time::{Duration, Instant},
+};
+
+use eyre::{Result, WrapErr, bail, ensure};
+use serde::{Deserialize, Serialize, de::DeserializeOwned};
+
+use crate::{
+    config::{ApsConfig, Config, TlsConfig, signing_key},
+    dvp_native, http, pools,
+};
+
+/// How long a registered intent stays usable (a restart forgets all of them: Lensa repeats the flow).
+pub const INTENT_TTL: Duration = Duration::from_secs(15 * 60);
+
+/// Body of `POST /aps/address` (coordinator -> recipient). Also the context of the sponsor's output 2.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AddressReq {
+    pub bundle_id: String,
+    pub pool_id: String,
+    pub leg_ordinal: u8,
+    /// norito hex (`aps::enc`).
+    pub route: String,
+    pub expiry_height: u64,
+    /// norito hex (`aps::enc`).
+    pub network_id: String,
+}
+
+/// An output's key material: the answer of `/aps/address`, and the recipient output inside a `/aps/leg` body.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct OutputKey {
+    pub authority: String,
+    pub view_public: String,
+    /// norito hex of `PrivateSettlementAuditViewKeyAuthorizationV1`.
+    pub authorization: String,
+}
+
+/// The sponsor's output 2 inside a `/aps/leg` body; `active` only on the leg that pays the reimbursement (leg 0).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SponsorOutput {
+    pub authority: String,
+    pub view_public: String,
+    pub authorization: String,
+    pub active: bool,
+}
+
+/// Body of `POST /aps/leg` (coordinator -> payer). The backend gets it after the intent was matched and consumed.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct LegReq {
+    pub intent: String,
+    /// 0 = the RD leg, 1 = the DFABI leg (bundles are always [rd, dfabi]).
+    pub ordinal: u8,
+    /// norito hex of `AtomicPrivateSettlementV1`.
+    pub manifest: String,
+    pub authority_digest: String,
+    pub salt: String,
+    pub recipient: String,
+    pub amount: String,
+    pub recipient_output: OutputKey,
+    pub sponsor_output: SponsorOutput,
+}
+
+/// What `begin_bundle` fixed for the whole bundle (everything the parties need to sign and prove against).
+#[derive(Debug, Clone)]
+pub struct BundleCtx {
+    pub bundle_id: String,
+    /// norito hex of `AtomicPrivateSettlementV1`.
+    pub manifest: String,
+    pub salt: String,
+    pub expiry_height: u64,
+    pub network_id: String,
+    pub legs: [LegCtx; 2],
+}
+
+#[derive(Debug, Clone)]
+pub struct LegCtx {
+    pub pool_id: String,
+    pub route: String,
+    pub authority_digest: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Settled {
+    pub carrier_tx: String,
+    pub height: u64,
+}
+
+/// Everything that touches keys, the chain or the prover. The real one calls the split-leg API of `aps_split` (T1); tests inject a fake.
+pub trait ApsBackend: Send + Sync {
+    /// The own account's public key (`ed0120...`), from the own seed.
+    fn own_key(&self) -> Result<String>;
+    /// Recipient side: sign the output-0 authorization with the own seed.
+    fn address(&self, req: &AddressReq) -> Result<OutputKey>;
+    /// Coordinator side: the sponsor's output 2 for this leg (`ctx` as for `address`).
+    fn sponsor_output(&self, ctx: &AddressReq, active: bool) -> Result<SponsorOutput>;
+    /// Coordinator side: build the bundle manifest over the two pools.
+    fn begin_bundle(&self) -> Result<BundleCtx>;
+    /// Payer side: scan the own notes, pick one, prove the leg; returns norito hex of `AtomicPrivateSettlementPreparedLegV1`.
+    /// The intent is already consumed; `req.intent` is empty for the coordinator's own BI -> BI companion leg.
+    fn prove_leg(&self, req: &LegReq) -> Result<String>;
+    /// Coordinator side: audit quorum, prepare, commit. `None` = the bundle was aborted (nothing moved).
+    fn settle(&self, bundle: &BundleCtx, prepared: &[String; 2]) -> Result<Option<Settled>>;
+    /// The own `wallet_json`.
+    fn wallet(&self) -> Result<serde_json::Value>;
+}
+
+/// One HTTP call to another party's gateway; `target` is a base URL, the answer `(status, body)`.
+pub trait Peer: Send + Sync {
+    fn call(&self, target: &str, method: &str, path: &str, body: &str) -> Result<(u16, String)>;
+}
+
+/// Public terms a driver approved for one leg it pays. `to` is lower-cased, `asset` is "rd" or "dfabi".
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct IntentTerms {
+    asset: String,
+    to: String,
+    amount: u128,
+}
+
+enum Slot {
+    Open(IntentTerms),
+    Used,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Take {
+    Taken,
+    Missing,
+    Mismatch,
+}
+
+/// In-memory one-shot intents. A used intent stays listed (as `Used`) until its TTL ends, so it cannot be registered again.
+#[derive(Default)]
+struct IntentStore {
+    slots: Mutex<HashMap<String, (Slot, Instant)>>,
+}
+
+impl IntentStore {
+    /// `false` = the intent is known with other terms, or already used.
+    fn put(&self, now: Instant, intent: &str, terms: IntentTerms) -> bool {
+        let mut slots = self.slots.lock().unwrap_or_else(|p| p.into_inner());
+        slots.retain(|_, (_, expires)| *expires > now);
+        let known = match slots.get(intent) {
+            Some((Slot::Open(old), _)) => Some(*old == terms),
+            Some((Slot::Used, _)) => Some(false),
+            None => None,
+        };
+        match known {
+            Some(same) => same,
+            None => {
+                slots.insert(intent.to_owned(), (Slot::Open(terms), now + INTENT_TTL));
+                true
+            }
+        }
+    }
+
+    /// Spend the intent when its terms are exactly `expected`; a refused leg does not spend it.
+    fn take(&self, now: Instant, intent: &str, expected: &IntentTerms) -> Take {
+        let mut slots = self.slots.lock().unwrap_or_else(|p| p.into_inner());
+        slots.retain(|_, (_, expires)| *expires > now);
+        let outcome = match slots.get(intent) {
+            Some((Slot::Open(terms), _)) if terms == expected => Take::Taken,
+            Some((Slot::Open(_), _)) => Take::Mismatch,
+            _ => Take::Missing,
+        };
+        if outcome == Take::Taken {
+            if let Some(entry) = slots.get_mut(intent) {
+                entry.0 = Slot::Used;
+            }
+        }
+        outcome
+    }
+}
+
+/// Body of `POST /aps/intent`.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct IntentReq {
+    intent: String,
+    asset: String,
+    to: String,
+    amount: String,
+}
+
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct Prepared {
+    prepared: String,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct PayReq {
+    #[serde(rename = "kind")]
+    _kind: String,
+    intent: String,
+    asset: String,
+    from: String,
+    to: String,
+    amount: String,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct DvpReq {
+    #[serde(rename = "kind")]
+    _kind: String,
+    intent_rd: String,
+    intent_dfabi: String,
+    buyer: String,
+    seller: String,
+    rd: String,
+    dfabi: String,
+}
+
+/// One leg of a submit. `None` payer/recipient = the coordinator's own account (the BI -> BI companion leg of a `pay`).
+struct LegSpec {
+    payer: Option<String>,
+    recipient: Option<String>,
+    amount: u128,
+    /// `None` only for the companion leg, which the coordinator pays itself.
+    intent: Option<String>,
+}
+
+/// `(HTTP status, JSON body)`.
+type Reply = (u16, String);
+
+fn reply(status: u16, value: serde_json::Value) -> Reply {
+    (status, value.to_string())
+}
+
+fn error(status: u16, message: impl Into<String>) -> Reply {
+    let message: String = message.into();
+    reply(status, serde_json::json!({ "error": message }))
+}
+
+fn ok<T: Serialize>(value: &T) -> Reply {
+    (200, serde_json::to_string(value).unwrap_or_else(|_| "{}".to_owned()))
+}
+
+/// A backend error for a response: never a key file name (a missing `<party>.seed` or `.note` error names its path).
+fn safe(e: &eyre::Report) -> String {
+    let text = format!("{e:#}");
+    if [".seed", ".note", ".hybrid", "client.toml"].iter().any(|name| text.contains(*name)) {
+        eprintln!("aps error (not sent to the caller): {text}");
+        return "key material unavailable".to_owned();
+    }
+    text
+}
+
+fn fail(e: eyre::Report) -> Reply {
+    error(502, safe(&e))
+}
+
+fn parse<T: DeserializeOwned>(body: &str) -> Result<T, Reply> {
+    serde_json::from_str(body).map_err(|e| error(400, format!("bad request body: {e}")))
+}
+
+fn hex_n(text: &str, bytes: usize) -> bool {
+    text.len() == 2 * bytes && text.bytes().all(|b| b.is_ascii_hexdigit())
+}
+
+fn hex_any(text: &str) -> bool {
+    !text.is_empty() && text.len() % 2 == 0 && text.bytes().all(|b| b.is_ascii_hexdigit())
+}
+
+/// Public keys and ids are hex: compare them case-insensitively.
+fn norm(text: &str) -> String {
+    text.to_ascii_lowercase()
+}
+
+/// Bundles are always [rd, dfabi] (`pools::run_bundle`).
+fn asset_of(ordinal: u8) -> &'static str {
+    if ordinal == 0 { "rd" } else { "dfabi" }
+}
+
+fn check_key(authority: &str, view_public: &str, authorization: &str) -> Result<()> {
+    ensure!(
+        hex_n(authority, 32) && hex_n(view_public, 32) && hex_any(authorization),
+        "authority and view_public are 64 hex characters, authorization is hex"
+    );
+    Ok(())
+}
+
+fn check_intent(req: &IntentReq) -> Result<(String, IntentTerms)> {
+    ensure!(hex_n(&req.intent, 32), "intent must be 64 hex characters");
+    ensure!(matches!(req.asset.as_str(), "rd" | "dfabi"), "asset must be rd or dfabi");
+    dvp_native::parse_account(&req.to)?;
+    let amount = dvp_native::parse_amount(&req.amount)?;
+    Ok((norm(&req.intent), IntentTerms { asset: req.asset.clone(), to: norm(&req.to), amount }))
+}
+
+fn check_address(req: &AddressReq) -> Result<()> {
+    ensure!(hex_n(&req.bundle_id, 32) && hex_n(&req.pool_id, 32), "bundle_id and pool_id must be 64 hex characters");
+    ensure!(req.leg_ordinal < 2, "leg_ordinal must be 0 or 1");
+    ensure!(hex_any(&req.route) && hex_any(&req.network_id), "route and network_id must be hex");
+    Ok(())
+}
+
+/// Returns the amount.
+fn check_leg(req: &LegReq) -> Result<u128> {
+    ensure!(hex_n(&req.intent, 32), "intent must be 64 hex characters");
+    ensure!(req.ordinal < 2, "ordinal must be 0 or 1");
+    ensure!(hex_any(&req.manifest), "manifest must be hex");
+    ensure!(hex_n(&req.authority_digest, 32) && hex_n(&req.salt, 32), "authority_digest and salt must be 64 hex characters");
+    dvp_native::parse_account(&req.recipient)?;
+    let amount = dvp_native::parse_amount(&req.amount)?;
+    check_key(&req.recipient_output.authority, &req.recipient_output.view_public, &req.recipient_output.authorization)?;
+    check_key(&req.sponsor_output.authority, &req.sponsor_output.view_public, &req.sponsor_output.authorization)?;
+    Ok(amount)
+}
+
+/// The two legs of a submit body, [rd, dfabi]. A `pay` pairs its leg with BI -> BI 1 in the other pool (APS needs two dataspaces).
+fn parse_submit(body: &str) -> Result<[LegSpec; 2]> {
+    let value: serde_json::Value = serde_json::from_str(body).wrap_err("bad request body")?;
+    let kind = value.get("kind").and_then(|kind| kind.as_str()).map(str::to_owned);
+    match kind.as_deref() {
+        Some("pay") => {
+            let req: PayReq = serde_json::from_value(value).wrap_err("bad pay body")?;
+            ensure!(hex_n(&req.intent, 32), "intent must be 64 hex characters");
+            ensure!(matches!(req.asset.as_str(), "rd" | "dfabi"), "asset must be rd or dfabi");
+            dvp_native::parse_account(&req.from)?;
+            dvp_native::parse_account(&req.to)?;
+            ensure!(norm(&req.from) != norm(&req.to), "from and to must differ");
+            let amount = dvp_native::parse_amount(&req.amount)?;
+            let main = LegSpec { payer: Some(req.from), recipient: Some(req.to), amount, intent: Some(norm(&req.intent)) };
+            let companion = LegSpec { payer: None, recipient: None, amount: 1, intent: None };
+            Ok(if req.asset == "rd" { [main, companion] } else { [companion, main] })
+        }
+        Some("dvp") => {
+            let req: DvpReq = serde_json::from_value(value).wrap_err("bad dvp body")?;
+            ensure!(hex_n(&req.intent_rd, 32) && hex_n(&req.intent_dfabi, 32), "intent_rd and intent_dfabi must be 64 hex characters");
+            dvp_native::parse_account(&req.buyer)?;
+            dvp_native::parse_account(&req.seller)?;
+            ensure!(norm(&req.buyer) != norm(&req.seller), "buyer and seller must differ");
+            let (rd, dfabi) = (dvp_native::parse_amount(&req.rd)?, dvp_native::parse_amount(&req.dfabi)?);
+            Ok([
+                LegSpec { payer: Some(req.buyer.clone()), recipient: Some(req.seller.clone()), amount: rd, intent: Some(norm(&req.intent_rd)) },
+                LegSpec { payer: Some(req.seller), recipient: Some(req.buyer), amount: dfabi, intent: Some(norm(&req.intent_dfabi)) },
+            ])
+        }
+        _ => bail!("kind must be pay or dvp"),
+    }
+}
+
+/// The text of a peer's `{"error": ...}` answer, short; empty when it has none.
+fn peer_error(body: &str) -> String {
+    let text = serde_json::from_str::<serde_json::Value>(body).ok().and_then(|v| v.get("error").and_then(|e| e.as_str()).map(str::to_owned));
+    text.unwrap_or_default().chars().take(200).collect()
+}
+
+/// The `/aps/*` handlers of one driver.
+pub struct Aps<'a> {
+    backend: &'a dyn ApsBackend,
+    peer: &'a dyn Peer,
+    cfg: ApsConfig,
+    intents: IntentStore,
+    /// The coordinator's global mutex: the pool is serial (`old_root` must be the current root), so one bundle at a time.
+    submit_lock: Mutex<()>,
+}
+
+impl<'a> Aps<'a> {
+    pub fn new(backend: &'a dyn ApsBackend, peer: &'a dyn Peer, cfg: ApsConfig) -> Self {
+        Self { backend, peer, cfg, intents: IntentStore::default(), submit_lock: Mutex::new(()) }
+    }
+
+    /// Answer one `/aps/*` request: `(HTTP status, JSON body)`.
+    pub fn route(&self, method: &str, path: &str, body: &str) -> Reply {
+        self.route_at(Instant::now(), method, path, body)
+    }
+
+    /// `route` with the clock injected (intent TTL).
+    pub fn route_at(&self, now: Instant, method: &str, path: &str, body: &str) -> Reply {
+        match (method, path) {
+            ("POST", "/aps/intent") => self.intent(now, body),
+            ("POST", "/aps/address") => self.address(body),
+            ("POST", "/aps/leg") => self.leg(now, body),
+            ("GET", "/aps/wallet") => self.wallet(),
+            ("POST", "/aps/submit") => self.submit(now, body),
+            (_, "/aps/intent" | "/aps/address" | "/aps/leg" | "/aps/wallet" | "/aps/submit") => error(405, "method not allowed"),
+            _ => error(404, "not found"),
+        }
+    }
+
+    fn intent(&self, now: Instant, body: &str) -> Reply {
+        let req: IntentReq = match parse(body) {
+            Ok(req) => req,
+            Err(reply) => return reply,
+        };
+        let (intent, terms) = match check_intent(&req) {
+            Ok(checked) => checked,
+            Err(e) => return error(400, format!("{e:#}")),
+        };
+        if self.intents.put(now, &intent, terms) {
+            reply(200, serde_json::json!({ "intent": intent }))
+        } else {
+            error(409, "this intent is already registered with other terms, or already used")
+        }
+    }
+
+    fn address(&self, body: &str) -> Reply {
+        let req: AddressReq = match parse(body) {
+            Ok(req) => req,
+            Err(reply) => return reply,
+        };
+        if let Err(e) = check_address(&req) {
+            return error(400, format!("{e:#}"));
+        }
+        match self.backend.address(&req) {
+            Ok(key) => ok(&key),
+            Err(e) => fail(e),
+        }
+    }
+
+    fn leg(&self, now: Instant, body: &str) -> Reply {
+        let req: LegReq = match parse(body) {
+            Ok(req) => req,
+            Err(reply) => return reply,
+        };
+        let amount = match check_leg(&req) {
+            Ok(amount) => amount,
+            Err(e) => return error(400, format!("{e:#}")),
+        };
+        if let Err(reply) = self.consume(now, &req, amount) {
+            return reply;
+        }
+        match self.backend.prove_leg(&req) {
+            Ok(prepared) => ok(&Prepared { prepared }),
+            Err(e) => fail(e),
+        }
+    }
+
+    /// Match the leg against the intent this driver registered and spend it, before any proving.
+    fn consume(&self, now: Instant, req: &LegReq, amount: u128) -> Result<(), Reply> {
+        let terms = IntentTerms { asset: asset_of(req.ordinal).to_owned(), to: norm(&req.recipient), amount };
+        match self.intents.take(now, &norm(&req.intent), &terms) {
+            Take::Taken => Ok(()),
+            Take::Missing => Err(error(403, "no open intent for this leg (unknown, already used or expired)")),
+            Take::Mismatch => Err(error(403, "the intent's terms do not match this leg")),
+        }
+    }
+
+    fn wallet(&self) -> Reply {
+        match self.backend.wallet() {
+            Ok(wallet) => reply(200, wallet),
+            Err(e) => fail(e),
+        }
+    }
+
+    fn submit(&self, now: Instant, body: &str) -> Reply {
+        let legs = match parse_submit(body) {
+            Ok(legs) => legs,
+            Err(e) => return error(400, format!("{e:#}")),
+        };
+        if !self.cfg.coordinator {
+            return self.forward(body);
+        }
+        let _one_bundle_at_a_time = self.submit_lock.lock().unwrap_or_else(|p| p.into_inner());
+        match self.coordinate(now, &legs) {
+            Ok(reply) | Err(reply) => reply,
+        }
+    }
+
+    /// A non-coordinator hands the body, unchanged, to BI and returns BI's answer.
+    fn forward(&self, body: &str) -> Reply {
+        let Some(url) = &self.cfg.coordinator_url else {
+            return error(503, "this driver is not the coordinator and has no [aps] coordinator_url");
+        };
+        match self.peer.call(url, "POST", "/aps/submit", body) {
+            Ok(answer) => answer,
+            Err(e) => fail(e),
+        }
+    }
+
+    /// The gateway of the party holding `key`.
+    fn gateway(&self, key: &str) -> Result<&str, Reply> {
+        let known = self.cfg.peers.iter().find(|(peer, _)| norm(peer) == norm(key));
+        known.map(|(_, url)| url.as_str()).ok_or_else(|| error(400, format!("no [aps.peers] gateway for account {key}")))
+    }
+
+    /// POST to a party's gateway and read its 200 answer; a refusal (403) is passed on as 403, anything else is 502.
+    fn ask<T: DeserializeOwned, B: Serialize>(&self, key: &str, path: &str, body: &B) -> Result<T, Reply> {
+        let target = self.gateway(key)?;
+        let text = serde_json::to_string(body).map_err(|e| error(500, e.to_string()))?;
+        let (status, answer) = self.peer.call(target, "POST", path, &text).map_err(|e| error(502, format!("{path}: {}", safe(&e))))?;
+        if status != 200 {
+            let code = if status == 403 { 403 } else { 502 };
+            return Err(error(code, format!("{path} refused by the party ({status}): {}", peer_error(&answer))));
+        }
+        serde_json::from_str(&answer).map_err(|e| error(502, format!("{path}: bad answer: {e}")))
+    }
+
+    /// One bundle: manifest, then per leg the recipient's address, the sponsor's output and the payer's proof, then settle.
+    fn coordinate(&self, now: Instant, legs: &[LegSpec; 2]) -> Result<Reply, Reply> {
+        let me = self.backend.own_key().map_err(fail)?;
+        let is_me = |key: &str| norm(key) == norm(&me);
+        let party = |key: &Option<String>| key.clone().unwrap_or_else(|| me.clone());
+        // Unknown parties are refused before anything is prepared.
+        for spec in legs {
+            for key in [party(&spec.payer), party(&spec.recipient)] {
+                if !is_me(&key) {
+                    self.gateway(&key)?;
+                }
+            }
+        }
+        let bundle = self.backend.begin_bundle().map_err(fail)?;
+        let mut prepared = Vec::new();
+        for (index, spec) in legs.iter().enumerate() {
+            let ordinal = index as u8;
+            let ctx = AddressReq {
+                bundle_id: bundle.bundle_id.clone(),
+                pool_id: bundle.legs[index].pool_id.clone(),
+                leg_ordinal: ordinal,
+                route: bundle.legs[index].route.clone(),
+                expiry_height: bundle.expiry_height,
+                network_id: bundle.network_id.clone(),
+            };
+            let (payer, recipient) = (party(&spec.payer), party(&spec.recipient));
+            let recipient_output = if is_me(&recipient) {
+                self.backend.address(&ctx).map_err(fail)?
+            } else {
+                let key: OutputKey = self.ask(&recipient, "/aps/address", &ctx)?;
+                check_key(&key.authority, &key.view_public, &key.authorization).map_err(|e| error(502, format!("/aps/address: bad answer: {e:#}")))?;
+                key
+            };
+            let sponsor_output = self.backend.sponsor_output(&ctx, ordinal == 0).map_err(fail)?;
+            let req = LegReq {
+                intent: spec.intent.clone().unwrap_or_default(),
+                ordinal,
+                manifest: bundle.manifest.clone(),
+                authority_digest: bundle.legs[index].authority_digest.clone(),
+                salt: bundle.salt.clone(),
+                recipient,
+                amount: spec.amount.to_string(),
+                recipient_output,
+                sponsor_output,
+            };
+            let leg = if is_me(&payer) {
+                // A leg BI pays itself needs BI's own intent like any other payer's; only the companion has none.
+                if spec.intent.is_some() {
+                    self.consume(now, &req, spec.amount)?;
+                }
+                self.backend.prove_leg(&req).map_err(fail)?
+            } else {
+                let answer: Prepared = self.ask(&payer, "/aps/leg", &req)?;
+                if !hex_any(&answer.prepared) {
+                    return Err(error(502, "/aps/leg: bad answer"));
+                }
+                answer.prepared
+            };
+            prepared.push(leg);
+        }
+        let settled = self.backend.settle(&bundle, &[prepared[0].clone(), prepared[1].clone()]).map_err(fail)?;
+        Ok(match settled {
+            Some(done) => reply(200, serde_json::json!({ "outcome": "finalized", "bundle_id": bundle.bundle_id, "carrier_tx": done.carrier_tx, "height": done.height })),
+            None => reply(200, serde_json::json!({ "outcome": "aborted", "bundle_id": bundle.bundle_id, "carrier_tx": null, "height": null })),
+        })
+    }
+}
+
+/// The real backend, on the driver's own config. The calls that need the split-leg API (T1, `aps_split`) are not wired yet.
+pub struct RealBackend<'a> {
+    cfg: &'a Mutex<Config>,
+}
+
+impl<'a> RealBackend<'a> {
+    pub fn new(cfg: &'a Mutex<Config>) -> Self {
+        Self { cfg }
+    }
+}
+
+fn not_wired() -> eyre::Report {
+    eyre::eyre!("split leg not wired")
+}
+
+impl ApsBackend for RealBackend<'_> {
+    fn own_key(&self) -> Result<String> {
+        let cfg = self.cfg.lock().unwrap_or_else(|p| p.into_inner());
+        Ok(signing_key(&cfg.seed(&cfg.party)?).public_key().to_string())
+    }
+
+    fn address(&self, _req: &AddressReq) -> Result<OutputKey> {
+        Err(not_wired())
+    }
+
+    fn sponsor_output(&self, _ctx: &AddressReq, _active: bool) -> Result<SponsorOutput> {
+        Err(not_wired())
+    }
+
+    fn begin_bundle(&self) -> Result<BundleCtx> {
+        Err(not_wired())
+    }
+
+    fn prove_leg(&self, _req: &LegReq) -> Result<String> {
+        Err(not_wired())
+    }
+
+    fn settle(&self, _bundle: &BundleCtx, _prepared: &[String; 2]) -> Result<Option<Settled>> {
+        Err(not_wired())
+    }
+
+    fn wallet(&self) -> Result<serde_json::Value> {
+        let cfg = self.cfg.lock().unwrap_or_else(|p| p.into_inner());
+        pools::wallet_json(&cfg, &cfg.party)
+    }
+}
+
+/// The real peer: `https://gateway...` over mutual TLS with the driver's leaf certificate (`tls_http`).
+pub struct RealPeer {
+    pub tls: Option<TlsConfig>,
+}
+
+impl Peer for RealPeer {
+    fn call(&self, target: &str, method: &str, path: &str, body: &str) -> Result<(u16, String)> {
+        // A bank waits for the whole bundle (about 100-200 s, route timeout 600 s), BI for a payer's proof.
+        http::send(self.tls.as_ref(), target, method, path, body, None, Duration::from_secs(660))
+    }
+}
+
 /// Fakes for the APS HTTP tests (this file's and `server.rs`'s): no chain, no proving, no network.
 #[cfg(test)]
 pub(crate) mod testkit {

@@ -1,7 +1,7 @@
 //! Per-bank driver server mode (iroha3 PLAN S17, ARCHITECTURE-iroha3 row 10a, docs/server-mode.md).
 //!
 //! A thin HTTP wrapper over the two D-native commands of `dvp_native.rs`, running in ONE bank's namespace with that bank's own
-//! client.toml (own key, own Torii). It exposes exactly: `GET /healthz`, `POST /settle-grant`, `POST /dvp-native`, `POST /mint` (403 unless the config sets `mint_enabled`: BI only), `POST /transfer` (RD/DFABI from the own account) and `GET /tx/{hash}` (a signed query with the own key). Request bodies
+//! client.toml (own key, own Torii). It exposes exactly: `GET /healthz`, `POST /settle-grant`, `POST /dvp-native`, `POST /mint` (403 unless the config sets `mint_enabled`: BI only), `POST /transfer` (RD/DFABI from the own account) and `GET /tx/{hash}` (a signed query with the own key), plus the APS endpoints `/aps/*` of `aps_http.rs`. Request bodies
 //! carry public terms only; nothing secret is read from a request, written to a response or logged.
 
 use std::sync::Mutex;
@@ -10,6 +10,7 @@ use eyre::Result;
 use serde::Deserialize;
 
 use crate::{
+    aps_http,
     config::Config,
     dvp_native, http,
     mint::{self, MintPolicy, MintTerms},
@@ -124,6 +125,11 @@ pub fn route(method: &str, path: &str, body: &str, submitter: &dyn Submitter) ->
     }
 }
 
+/// `/aps/*` goes to the APS handlers (`aps_http`), everything else to `route`.
+fn dispatch(method: &str, path: &str, body: &str, submitter: &dyn Submitter, aps: &aps_http::Aps) -> (u16, String) {
+    if path.starts_with("/aps/") { aps.route(method, path, body) } else { route(method, path, body, submitter) }
+}
+
 struct Real {
     // One submission at a time per bank (serialised like the auditor mode); `Mutex` keeps `Real: Sync`.
     cfg: Mutex<Config>,
@@ -173,9 +179,14 @@ impl Submitter for Real {
 
 /// `rd-dfabi server <config> --listen <addr>`.
 pub fn run(cfg: Config, listen: &str) -> Result<()> {
+    let peer = aps_http::RealPeer { tls: cfg.tls.clone() };
+    let aps_cfg = cfg.aps.clone();
     let real = Real { cfg: Mutex::new(cfg) };
-    http::serve(listen, |method, path, body| {
-        let (status, response) = route(method, path, body, &real);
+    let backend = aps_http::RealBackend::new(&real.cfg);
+    let aps = aps_http::Aps::new(&backend, &peer, aps_cfg);
+    // One thread per connection: a bank's forwarded `/aps/submit` waits on BI while BI calls back into the same bank.
+    http::serve_threaded(listen, |method, path, body| {
+        let (status, response) = dispatch(method, path, body, &real, &aps);
         eprintln!("{method} {path} -> {status}");
         (status, response)
     })
