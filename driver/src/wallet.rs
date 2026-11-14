@@ -252,7 +252,7 @@ mod tests {
     /// The award case live 2026-11-14: bank A held 1_000_000 + 897_995 and had to pay 1_000_001.
     #[test]
     fn pick_notes_takes_two_when_no_single_note_covers() {
-        let picked = pick_notes(&[note(1_000_000), note(897_995), note(3)], 1_000_001).unwrap();
+        let picked = pick_notes(&[note(1_000_000), note(897_995), note(1)], 1_000_001).unwrap();
         let mut got = values(&picked);
         got.sort_unstable();
         assert_eq!(got, vec![897_995, 1_000_000]);

@@ -660,7 +660,9 @@ mod tests {
         let mut tree = PoolTree::new(pool_id).unwrap();
         tree.append(&funding.activation_commitments()).unwrap();
         let bob_account = fixture_key(0x33);
-        let first_recipient = sign_output_key(&bob_account, &world.ctx, 0, ROLES[0], &bob, true).unwrap();
+        // One-time keys per (bundle, pool, role), as the live driver addresses them: every output of a leg needs its own view key.
+        let one_time = |role| bob.one_time(world.manifest.bundle_id.as_ref(), pool_id.as_ref(), role);
+        let first_recipient = sign_output_key(&bob_account, &world.ctx, 0, ROLES[0], &one_time(0), true).unwrap();
         let first_sponsor = sign_output_key(&world.sponsor, &world.ctx, 2, ROLES[2], &NoteKeys::random(), true).unwrap();
         let first = on_big_stack(|| {
             prepare_leg_split(
@@ -668,7 +670,7 @@ mod tests {
                 &payer_leg(&world, &bob_account),
                 &world.governed,
                 Spend::Bootstrap(funding),
-                &bob,
+                &one_time(1),
                 &first_recipient,
                 &first_sponsor,
                 world.sponsor.public_key(),
@@ -684,7 +686,9 @@ mod tests {
             .output_commitments
             .iter()
             .zip(&first.statement.encrypted_outputs)
-            .filter_map(|(commitment, encrypted)| open_output(pool_id, *commitment, encrypted, &bob).unwrap())
+            .filter_map(|(commitment, encrypted)| {
+                [0, 1].into_iter().find_map(|role| open_output(pool_id, *commitment, encrypted, &one_time(role)).unwrap())
+            })
             .collect();
         owned.sort_by_key(|note| note.value);
         assert_eq!(owned.iter().map(|note| note.value).collect::<Vec<_>>(), vec![100, 899]);
