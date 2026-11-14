@@ -122,6 +122,7 @@ pub struct Options {
     pub replay: bool,
 }
 
+#[derive(Clone)]
 pub(crate) struct Governed {
     pub route: PrivateSettlementRouteV1,
     pub policy: PrivateSettlementAuditPolicyV1,
@@ -148,8 +149,15 @@ pub enum Spend {
     /// Origin note of a pool activated for this bundle (fresh two-note tree).
     Bootstrap(Funding),
     /// A note already in a live pool: `tree` holds every commitment in ledger order, the pool
-    /// is at `epoch`, and `secret` is the spend secret behind `opening.spending_authority`.
-    Continue { opening: PrivateSettlementAuditNoteOpeningV1, secret: [u8; 32], tree: PoolTree, epoch: u64 },
+    /// is at `epoch`, and `secret` is the spend secret behind `opening.spending_authority`. `extra`: a second unspent
+    /// note of the same owner (same `secret`) spent in input slot 1 when no single note covers the leg.
+    Continue {
+        opening: PrivateSettlementAuditNoteOpeningV1,
+        secret: [u8; 32],
+        tree: PoolTree,
+        epoch: u64,
+        extra: Option<PrivateSettlementAuditNoteOpeningV1>,
+    },
 }
 
 impl Spend {
@@ -882,7 +890,7 @@ pub fn prove_continuation_selftest(peers_json: &Path) -> Result<()> {
     let leg2 = Leg { lane: 1, asset, payer: fixture_key(0x33), recipient: fixture_key(0x34), funding: received.value, amount: 40 };
     let notes2 = LegNotes { recipient: carol, change: bob.one_time(manifest2.bundle_id.as_ref(), pool_id.as_ref(), 1) };
     let expected_nullifier = crate::wallet::note_nullifier(pool_id, &bob.spend, &received)?;
-    let spend = Spend::Continue { opening: received, secret: bob.spend, tree, epoch: 2 };
+    let spend = Spend::Continue { opening: received, secret: bob.spend, tree, epoch: 2, extra: None };
     let second = on_big_stack(|| {
         prepare_leg(0, &leg2, &governed[0], spend, &notes2, &manifest2, authority_digest, &sponsor_key, salt2)
     })?;
