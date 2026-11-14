@@ -196,11 +196,12 @@ pub(crate) fn prepare_leg_split(
     statement.validate()?;
 
     let payer = &leg.payer;
-    let (positive_input, positive_secret) = match &spend {
-        Spend::Bootstrap(funding) => (funding.opening.clone(), funding.spending_secret),
-        Spend::Continue { opening, secret, .. } => (opening.clone(), *secret),
+    let (positive_input, positive_secret, extra_input) = match &spend {
+        Spend::Bootstrap(funding) => (funding.opening.clone(), funding.spending_secret, None),
+        Spend::Continue { opening, secret, extra, .. } => (opening.clone(), *secret, extra.clone()),
     };
-    let input_secrets = [positive_secret, rnd()];
+    // Input 1: the second real note (same owner, same spend secret), else a fresh inactive dummy.
+    let input_secrets = [positive_secret, if extra_input.is_some() { positive_secret } else { rnd() }];
     let ephemeral_secrets = [rnd(), rnd(), rnd()];
     let reimbursement = if ordinal == 0 { SPONSOR_REIMBURSEMENT } else { 0 };
     let value = spend
@@ -251,7 +252,7 @@ pub(crate) fn prepare_leg_split(
         reimbursement_terms_salt: reimbursement_salt,
         memo: format!("rd-dfabi-leg-{ordinal}").into_bytes(),
         policy_references: vec![governed.governance.governance_digest],
-        inputs: vec![positive_input.clone(), note_opening(false, 0)],
+        inputs: vec![positive_input.clone(), extra_input.clone().unwrap_or_else(|| note_opening(false, 0))],
         outputs: vec![
             output(PrivateSettlementAuditOutputRoleV1::SettlementRecipient, recipient_output, ephemeral_secrets[0], leg.amount),
             output(PrivateSettlementAuditOutputRoleV1::PayerChange, &change_output, ephemeral_secrets[1], value),
@@ -270,6 +271,9 @@ pub(crate) fn prepare_leg_split(
         plaintext.inputs[0].commitment == positive_input.commitment,
         "settlement changed its already-funded positive input"
     );
+    if let Some(extra) = &extra_input {
+        ensure!(plaintext.inputs[1].commitment == extra.commitment, "settlement changed its second funded input");
+    }
     statement.nullifiers = derive_atomic_private_settlement_input_nullifiers_v1(
         manifest,
         &statement,
@@ -342,25 +346,29 @@ pub(crate) fn prepare_leg_split(
             statement.new_epoch = bootstrap.new_epoch;
             bootstrap.into_input_secrets()
         }
-        Spend::Continue { opening, tree, epoch, .. } => {
+        Spend::Continue { opening, tree, epoch, extra, .. } => {
             let position = tree
                 .position(opening.commitment)
                 .ok_or_else(|| eyre!("leg {ordinal}: payer note is not in the pool"))?;
+            let second = match &extra {
+                Some(note) => {
+                    let at = tree.position(note.commitment).ok_or_else(|| eyre!("leg {ordinal}: second payer note is not in the pool"))?;
+                    Some((at, tree.path(at)?))
+                }
+                None => None,
+            };
             let mut successor = tree.clone();
             successor.append(&outputs)?;
             statement.old_root = tree.root();
             statement.new_root = successor.root();
             statement.old_epoch = epoch;
             statement.new_epoch = epoch + 1;
-            // Input 1 is a virtual dummy: never inserted, any non-zero path (upstream relation.rs
-            // wallet_continues_settlement_with_fresh_virtual_dummy_without_bootstrap).
+            // Input 1: the second real note with its own path, else a virtual dummy: never inserted, any non-zero path
+            // (upstream relation.rs wallet_continues_settlement_with_fresh_virtual_dummy_without_bootstrap).
+            let (position1, path1) = second.unwrap_or((position ^ 1, [[0xED; 32]; crate::tree::DEPTH]));
             [
                 AtomicPrivateSettlementInputSecretV1::new(input_secrets[0], u32::try_from(position)?, tree.path(position)?)?,
-                AtomicPrivateSettlementInputSecretV1::new(
-                    input_secrets[1],
-                    u32::try_from(position ^ 1)?,
-                    [[0xED; 32]; crate::tree::DEPTH],
-                )?,
+                AtomicPrivateSettlementInputSecretV1::new(input_secrets[1], u32::try_from(position1)?, path1)?,
             ]
         }
     };

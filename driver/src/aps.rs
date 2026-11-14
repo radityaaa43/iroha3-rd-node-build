@@ -164,7 +164,7 @@ impl Spend {
     pub(crate) fn value(&self) -> u128 {
         match self {
             Self::Bootstrap(funding) => funding.opening.value,
-            Self::Continue { opening, .. } => opening.value,
+            Self::Continue { opening, extra, .. } => opening.value + extra.as_ref().map_or(0, |note| note.value),
         }
     }
 }

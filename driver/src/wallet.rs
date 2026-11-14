@@ -175,9 +175,25 @@ pub fn pick_note(notes: &[OwnedNote], need: u128) -> Result<OwnedNote> {
         .ok_or_else(|| eyre!("no single note covers the amount plus change"))
 }
 
-/// One note, or two when no single note covers `need` (upstream proves 2 inputs per leg). RED stub: one note only.
+/// One note, or two when no single note covers `need` (upstream proves 2 inputs per leg): the pair with the smallest
+/// sum strictly larger than `need`. The larger note goes first (input 0).
+// ponytail: O(n^2) pair scan; a party holds a handful of notes. Sort + two pointers if wallets grow large.
 pub fn pick_notes(notes: &[OwnedNote], need: u128) -> Result<Vec<OwnedNote>> {
-    Ok(vec![pick_note(notes, need)?])
+    if let Ok(note) = pick_note(notes, need) {
+        return Ok(vec![note]);
+    }
+    let mut best: Option<(u128, usize, usize)> = None;
+    for i in 0..notes.len() {
+        for j in i + 1..notes.len() {
+            let sum = notes[i].opening.value + notes[j].opening.value;
+            if sum > need && best.is_none_or(|(b, _, _)| sum < b) {
+                best = Some((sum, i, j));
+            }
+        }
+    }
+    let (_, i, j) = best.ok_or_else(|| eyre!("no one or two notes cover the amount plus change"))?;
+    let (a, b) = (notes[i].clone(), notes[j].clone());
+    Ok(if a.opening.value >= b.opening.value { vec![a, b] } else { vec![b, a] })
 }
 
 #[cfg(test)]
