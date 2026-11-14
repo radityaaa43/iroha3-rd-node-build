@@ -175,6 +175,27 @@ pub fn pick_note(notes: &[OwnedNote], need: u128) -> Result<OwnedNote> {
         .ok_or_else(|| eyre!("no single note covers the amount plus change"))
 }
 
+/// One note, or two when no single note covers `need` (upstream proves 2 inputs per leg): the pair with the smallest
+/// sum strictly larger than `need`. The larger note goes first (input 0).
+// ponytail: O(n^2) pair scan; a party holds a handful of notes. Sort + two pointers if wallets grow large.
+pub fn pick_notes(notes: &[OwnedNote], need: u128) -> Result<Vec<OwnedNote>> {
+    if let Ok(note) = pick_note(notes, need) {
+        return Ok(vec![note]);
+    }
+    let mut best: Option<(u128, usize, usize)> = None;
+    for i in 0..notes.len() {
+        for j in i + 1..notes.len() {
+            let sum = notes[i].opening.value + notes[j].opening.value;
+            if sum > need && best.is_none_or(|(b, _, _)| sum < b) {
+                best = Some((sum, i, j));
+            }
+        }
+    }
+    let (_, i, j) = best.ok_or_else(|| eyre!("no one or two notes cover the amount plus change"))?;
+    let (a, b) = (notes[i].clone(), notes[j].clone());
+    Ok(if a.opening.value >= b.opening.value { vec![a, b] } else { vec![b, a] })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -217,5 +238,34 @@ mod tests {
     fn pick_note_requires_change() {
         assert!(pick_note(&[note(5)], 5).is_err());
         assert_eq!(pick_note(&[note(9), note(6), note(50)], 5).unwrap().opening.value, 6);
+    }
+
+    fn values(picked: &[OwnedNote]) -> Vec<u128> {
+        picked.iter().map(|n| n.opening.value).collect()
+    }
+
+    #[test]
+    fn pick_notes_prefers_one_note() {
+        assert_eq!(values(&pick_notes(&[note(9), note(6), note(50)], 5).unwrap()), vec![6]);
+    }
+
+    /// The award case live 2026-11-14: bank A held 1_000_000 + 897_995 and had to pay 1_000_001.
+    #[test]
+    fn pick_notes_takes_two_when_no_single_note_covers() {
+        let picked = pick_notes(&[note(1_000_000), note(897_995), note(1)], 1_000_001).unwrap();
+        let mut got = values(&picked);
+        got.sort_unstable();
+        assert_eq!(got, vec![897_995, 1_000_000]);
+        // the smallest pair whose sum still leaves change
+        let mut got = values(&pick_notes(&[note(4), note(5), note(7)], 10).unwrap());
+        got.sort_unstable();
+        assert_eq!(got, vec![4, 7]);
+    }
+
+    #[test]
+    fn pick_notes_refuses_when_two_notes_do_not_leave_change() {
+        assert!(pick_notes(&[note(4), note(5), note(1)], 9).is_err());
+        assert!(pick_notes(&[note(4), note(5)], 10).is_err());
+        assert!(pick_notes(&[], 1).is_err());
     }
 }

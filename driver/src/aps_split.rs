@@ -196,11 +196,12 @@ pub(crate) fn prepare_leg_split(
     statement.validate()?;
 
     let payer = &leg.payer;
-    let (positive_input, positive_secret) = match &spend {
-        Spend::Bootstrap(funding) => (funding.opening.clone(), funding.spending_secret),
-        Spend::Continue { opening, secret, .. } => (opening.clone(), *secret),
+    let (positive_input, positive_secret, extra_input) = match &spend {
+        Spend::Bootstrap(funding) => (funding.opening.clone(), funding.spending_secret, None),
+        Spend::Continue { opening, secret, extra, .. } => (opening.clone(), *secret, extra.clone()),
     };
-    let input_secrets = [positive_secret, rnd()];
+    // Input 1: the second real note (same owner, same spend secret), else a fresh inactive dummy.
+    let input_secrets = [positive_secret, if extra_input.is_some() { positive_secret } else { rnd() }];
     let ephemeral_secrets = [rnd(), rnd(), rnd()];
     let reimbursement = if ordinal == 0 { SPONSOR_REIMBURSEMENT } else { 0 };
     let value = spend
@@ -251,7 +252,7 @@ pub(crate) fn prepare_leg_split(
         reimbursement_terms_salt: reimbursement_salt,
         memo: format!("rd-dfabi-leg-{ordinal}").into_bytes(),
         policy_references: vec![governed.governance.governance_digest],
-        inputs: vec![positive_input.clone(), note_opening(false, 0)],
+        inputs: vec![positive_input.clone(), extra_input.clone().unwrap_or_else(|| note_opening(false, 0))],
         outputs: vec![
             output(PrivateSettlementAuditOutputRoleV1::SettlementRecipient, recipient_output, ephemeral_secrets[0], leg.amount),
             output(PrivateSettlementAuditOutputRoleV1::PayerChange, &change_output, ephemeral_secrets[1], value),
@@ -270,6 +271,9 @@ pub(crate) fn prepare_leg_split(
         plaintext.inputs[0].commitment == positive_input.commitment,
         "settlement changed its already-funded positive input"
     );
+    if let Some(extra) = &extra_input {
+        ensure!(plaintext.inputs[1].commitment == extra.commitment, "settlement changed its second funded input");
+    }
     statement.nullifiers = derive_atomic_private_settlement_input_nullifiers_v1(
         manifest,
         &statement,
@@ -342,25 +346,29 @@ pub(crate) fn prepare_leg_split(
             statement.new_epoch = bootstrap.new_epoch;
             bootstrap.into_input_secrets()
         }
-        Spend::Continue { opening, tree, epoch, .. } => {
+        Spend::Continue { opening, tree, epoch, extra, .. } => {
             let position = tree
                 .position(opening.commitment)
                 .ok_or_else(|| eyre!("leg {ordinal}: payer note is not in the pool"))?;
+            let second = match &extra {
+                Some(note) => {
+                    let at = tree.position(note.commitment).ok_or_else(|| eyre!("leg {ordinal}: second payer note is not in the pool"))?;
+                    Some((at, tree.path(at)?))
+                }
+                None => None,
+            };
             let mut successor = tree.clone();
             successor.append(&outputs)?;
             statement.old_root = tree.root();
             statement.new_root = successor.root();
             statement.old_epoch = epoch;
             statement.new_epoch = epoch + 1;
-            // Input 1 is a virtual dummy: never inserted, any non-zero path (upstream relation.rs
-            // wallet_continues_settlement_with_fresh_virtual_dummy_without_bootstrap).
+            // Input 1: the second real note with its own path, else a virtual dummy: never inserted, any non-zero path
+            // (upstream relation.rs wallet_continues_settlement_with_fresh_virtual_dummy_without_bootstrap).
+            let (position1, path1) = second.unwrap_or((position ^ 1, [[0xED; 32]; crate::tree::DEPTH]));
             [
                 AtomicPrivateSettlementInputSecretV1::new(input_secrets[0], u32::try_from(position)?, tree.path(position)?)?,
-                AtomicPrivateSettlementInputSecretV1::new(
-                    input_secrets[1],
-                    u32::try_from(position ^ 1)?,
-                    [[0xED; 32]; crate::tree::DEPTH],
-                )?,
+                AtomicPrivateSettlementInputSecretV1::new(input_secrets[1], u32::try_from(position1)?, path1)?,
             ]
         }
     };
@@ -416,7 +424,8 @@ mod tests {
             EXPIRY_BLOCKS, Governed, Spend, bounded_fee_for, bytes, committee_authority, fixture_key, funding, govern, hash,
             note_opening, on_big_stack, placeholder_payer_authorization, proof_manifest, rnd,
         },
-        wallet::{NoteKeys, open_output},
+        tree::PoolTree,
+        wallet::{NoteKeys, note_nullifier, open_output},
     };
 
     const ROLES: [PrivateSettlementAuditOutputRoleV1; 3] = [
@@ -433,6 +442,7 @@ mod tests {
         ctx: OutputCtx,
         salt: [u8; 32],
         sponsor: KeyPair,
+        all_governed: Vec<Governed>,
     }
 
     /// Same synthetic network the offline selftests use; nobody's secret here is shared between the parties.
@@ -474,6 +484,7 @@ mod tests {
             expiry_height: manifest.expiry_height,
         };
         World {
+            all_governed: governed.clone(),
             governed: governed.into_iter().next().unwrap(),
             authority_digest: authority.digest().unwrap(),
             genesis: *network_id.as_genesis_hash().as_ref(),
@@ -636,5 +647,99 @@ mod tests {
             let expected = format!("output {}", index * 2);
             assert!(refused.to_string().contains(&expected), "unexpected error: {refused}");
         }
+    }
+    /// Bank A (live 2026-11-14) held two notes, 1_000_000 and 897_995, and had to pay 1_000_001: no single note covers it.
+    /// Here bob owns two notes (100 received, 899 change) and pays carol 950: input slot 1 carries the second REAL note.
+    #[test]
+    fn two_notes_pay_more_than_either() {
+        let world = world();
+        let pool_id = world.governed.governance.body.pool_id;
+        let bob = NoteKeys::random();
+        // Settlement 1 (bootstrap): the payer pays bob 100 and its change (899) is addressed to bob too.
+        let funding = funding(1_000).unwrap();
+        let mut tree = PoolTree::new(pool_id).unwrap();
+        tree.append(&funding.activation_commitments()).unwrap();
+        let bob_account = fixture_key(0x33);
+        // One-time keys per (bundle, pool, role), as the live driver addresses them: every output of a leg needs its own view key.
+        let one_time = |role| bob.one_time(world.manifest.bundle_id.as_ref(), pool_id.as_ref(), role);
+        let first_recipient = sign_output_key(&bob_account, &world.ctx, 0, ROLES[0], &one_time(0), true).unwrap();
+        let first_sponsor = sign_output_key(&world.sponsor, &world.ctx, 2, ROLES[2], &NoteKeys::random(), true).unwrap();
+        let first = on_big_stack(|| {
+            prepare_leg_split(
+                0,
+                &payer_leg(&world, &bob_account),
+                &world.governed,
+                Spend::Bootstrap(funding),
+                &one_time(1),
+                &first_recipient,
+                &first_sponsor,
+                world.sponsor.public_key(),
+                &world.manifest,
+                world.authority_digest,
+                world.salt,
+            )
+        })
+        .unwrap();
+        tree.append(&first.statement.output_commitments).unwrap();
+        let mut owned: Vec<_> = first
+            .statement
+            .output_commitments
+            .iter()
+            .zip(&first.statement.encrypted_outputs)
+            .filter_map(|(commitment, encrypted)| {
+                [0, 1].into_iter().find_map(|role| open_output(pool_id, *commitment, encrypted, &one_time(role)).unwrap())
+            })
+            .collect();
+        owned.sort_by_key(|note| note.value);
+        assert_eq!(owned.iter().map(|note| note.value).collect::<Vec<_>>(), vec![100, 899]);
+
+        // Settlement 2: bob pays carol 950 + 1 reimbursement from 100 + 899 (change 48).
+        let salt = rnd();
+        let manifest = proof_manifest(
+            world.ctx.network_id,
+            102,
+            100 + EXPIRY_BLOCKS,
+            AccountId::new(world.sponsor.public_key().clone()),
+            bounded_fee_for("6TEAJqbb8oEPmLncoNiMRbLEK6tw").unwrap(),
+            &world.all_governed,
+            salt,
+        )
+        .unwrap();
+        let ctx = OutputCtx { bundle_id: manifest.bundle_id, ..world.ctx };
+        let carol_account = fixture_key(0x34);
+        let carol = NoteKeys::random();
+        let recipient_output = sign_output_key(&carol_account, &ctx, 0, ROLES[0], &carol, true).unwrap();
+        let sponsor_output = sign_output_key(&world.sponsor, &ctx, 2, ROLES[2], &NoteKeys::random(), true).unwrap();
+        let leg = LegPayer { payer: bob_account, recipient: carol_account.public_key().clone(), amount: 950, ..payer_leg(&world, &carol_account) };
+        let (small, large) = (owned[0].clone(), owned[1].clone());
+        let expected = [note_nullifier(pool_id, &bob.spend, &large).unwrap(), note_nullifier(pool_id, &bob.spend, &small).unwrap()];
+        let spend = Spend::Continue { opening: large, secret: bob.spend, tree, epoch: first.statement.new_epoch, extra: Some(small) };
+        let second = on_big_stack(|| {
+            prepare_leg_split(
+                0,
+                &leg,
+                &world.governed,
+                spend,
+                &NoteKeys::random(),
+                &recipient_output,
+                &sponsor_output,
+                world.sponsor.public_key(),
+                &manifest,
+                world.authority_digest,
+                salt,
+            )
+        })
+        .unwrap();
+        verify_atomic_private_settlement_v1(&manifest, &second.statement, world.genesis, 102, &second.proof)
+            .unwrap_or_else(|e| panic!("two-note proof rejected: {e:?}"));
+        assert_eq!(second.statement.nullifiers, expected.to_vec(), "both real notes are spent (input 0 and input 1)");
+        let paid = second
+            .statement
+            .output_commitments
+            .iter()
+            .zip(&second.statement.encrypted_outputs)
+            .find_map(|(commitment, encrypted)| open_output(pool_id, *commitment, encrypted, &carol).unwrap())
+            .expect("carol found no note");
+        assert_eq!(paid.value, 950);
     }
 }

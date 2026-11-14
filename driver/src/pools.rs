@@ -47,7 +47,7 @@ use crate::{
     auditor::Keys,
     config::{Config, signing_key},
     history::PoolHistory,
-    wallet::{pick_note, scan},
+    wallet::{pick_note, pick_notes, scan},
 };
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -407,7 +407,7 @@ fn run_bundle(cfg: &Config, legs: [LegSpec; 2], options: &Options, kind: &str) -
         };
         let (bundle, pool) = (*manifest.bundle_id.as_ref(), *governed[ordinal].governance.body.pool_id.as_ref());
         let notes = LegNotes { recipient: cfg.note_keys(&leg.recipient)?.one_time(&bundle, &pool, 0), change: keys.one_time(&bundle, &pool, 1) };
-        let spend = Spend::Continue { opening: note.opening, secret: keys.spend, tree: history.tree, epoch: history.epoch };
+        let spend = Spend::Continue { opening: note.opening, secret: keys.spend, tree: history.tree, epoch: history.epoch, extra: None };
         let authority_digest = committees[ordinal].authority.digest()?;
         prepared.push(on_big_stack(|| {
             prepare_leg(ordinal, &spec, &governed[ordinal], spend, &notes, &manifest, authority_digest, &sponsor_key, salt)
@@ -524,8 +524,10 @@ pub(crate) fn prove_split_leg(cfg: &Config, payer: &str, asset: Asset, leg: &Spl
     let (unspent, _) = scan(&history, &keys, &origin_notes(cfg, payer, asset)?)?;
     let reimbursement = if leg.ordinal == 0 { SPONSOR_REIMBURSEMENT } else { 0 };
     // Refused before any proving; no amounts in the message (logs).
-    let note = pick_note(&unspent, leg.amount + reimbursement)
-        .wrap_err_with(|| format!("leg {}: insufficient payer note (rejected before proving)", leg.ordinal))?;
+    let mut notes = pick_notes(&unspent, leg.amount + reimbursement)
+        .wrap_err_with(|| format!("leg {}: insufficient payer note (rejected before proving)", leg.ordinal))?
+        .into_iter();
+    let (note, extra) = (notes.next().ok_or_else(|| eyre!("no note picked"))?, notes.next().map(|n| n.opening));
     let governed = record.governed()?;
     let (bundle, pool) = (*leg.manifest.bundle_id.as_ref(), *governed.governance.body.pool_id.as_ref());
     let change = keys.one_time(&bundle, &pool, 1);
@@ -537,7 +539,7 @@ pub(crate) fn prove_split_leg(cfg: &Config, payer: &str, asset: Asset, leg: &Spl
         recipient: leg.recipient.clone(),
         amount: leg.amount,
     };
-    let spend = Spend::Continue { opening: note.opening, secret: keys.spend, tree: history.tree, epoch: history.epoch };
+    let spend = Spend::Continue { opening: note.opening, secret: keys.spend, tree: history.tree, epoch: history.epoch, extra };
     on_big_stack(|| {
         prepare_leg_split(
             leg.ordinal,
