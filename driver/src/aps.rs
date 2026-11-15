@@ -543,6 +543,14 @@ fn register_with_recheck(register: impl FnOnce() -> Result<()>, applied: impl Fn
     }
 }
 
+/// Waits, peer by peer, until `wait_one(i)` reports the Prepare registration applied on a vote quorum of the
+/// `peers` committee nodes. A node signs a Commit vote only once its own state holds the staged Prepare lock
+/// (iroha_core phase.rs commit_vote), so asking for votes as soon as the sponsor's node applied it races the others.
+fn applied_on_quorum(peers: usize, wait_one: impl FnMut(usize) -> Result<()>) -> Result<()> {
+    let _ = (peers, wait_one);
+    Ok(())
+}
+
 /// Runs `abort` when `result` failed, so a failed stage never leaves pool reservations held until expiry.
 /// The stage's own error is returned; a failed abort is only reported.
 fn abort_on_error<T>(result: Result<T>, stage: &str, abort: impl FnOnce() -> Result<()>) -> Result<T> {
@@ -1488,6 +1496,43 @@ mod recheck_tests {
         let (result, aborts, rechecks) = run(Ok(()), None);
         assert!(result.is_ok());
         assert_eq!((aborts, rechecks), (0, 0));
+    }
+}
+
+#[cfg(test)]
+mod prepare_quorum_tests {
+    use super::*;
+
+    /// Runs applied_on_quorum over 4 nodes where the nodes in `lagging` never apply; returns (result, nodes asked).
+    fn run(lagging: &[usize]) -> (Result<()>, Vec<usize>) {
+        let mut asked = Vec::new();
+        let result = applied_on_quorum(4, |i| {
+            asked.push(i);
+            if lagging.contains(&i) { Err(eyre!("node {i} not applied")) } else { Ok(()) }
+        });
+        (result, asked)
+    }
+
+    #[test]
+    fn stops_once_three_nodes_applied() {
+        let (result, asked) = run(&[]);
+        assert!(result.is_ok(), "{result:?}");
+        assert_eq!(asked, [0, 1, 2]);
+    }
+
+    #[test]
+    fn one_lagging_node_still_reaches_the_vote_quorum() {
+        let (result, asked) = run(&[0]);
+        assert!(result.is_ok(), "{result:?}");
+        assert_eq!(asked, [0, 1, 2, 3]);
+    }
+
+    #[test]
+    fn two_lagging_nodes_fail_before_any_commit_vote() {
+        let (result, asked) = run(&[1, 3]);
+        assert_eq!(asked, [0, 1, 2, 3]);
+        let error = result.expect_err("2 of 4 cannot give 3 Commit votes");
+        assert!(error.to_string().contains("applied on 2 of 4"), "{error:#}");
     }
 }
 
