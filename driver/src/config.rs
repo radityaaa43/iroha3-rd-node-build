@@ -204,9 +204,14 @@ impl Config {
 
     /// Sponsor client (operator client.toml) bound to `party`'s Torii, plus its key.
     pub fn sponsor(&self, party: &str) -> Result<(Client, KeyPair)> {
+        self.sponsor_at(self.torii(party)?)
+    }
+
+    /// Sponsor client bound to one Torii URL (a committee node), plus its key.
+    pub fn sponsor_at(&self, torii: &Url) -> Result<(Client, KeyPair)> {
         let mut config = iroha::config::Config::load_file(&self.client_toml)
             .map_err(|e| eyre!("load {}: {e:?}", self.client_toml.display()))?;
-        config.torii_api_url = self.torii(party)?.clone();
+        config.torii_api_url = torii.clone();
         let key = config.key_pair.clone();
         Ok((Client::new(config)?, key))
     }
