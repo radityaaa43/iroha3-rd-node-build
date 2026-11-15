@@ -32,7 +32,8 @@ use iroha::{
         isi::private_settlement::ActivatePrivateSettlementPoolV1,
         nexus::{
             ATOMIC_PRIVATE_SETTLEMENT_VERSION_V1, AtomicPrivateSettlementV1,
-            PRIVATE_SETTLEMENT_MAX_RECEIPT_BYTES_V1, PrivateSettlementAbortReasonV1,
+            PRIVATE_SETTLEMENT_COMMITTEE_QUORUM_V1, PRIVATE_SETTLEMENT_MAX_RECEIPT_BYTES_V1,
+            PrivateSettlementAbortReasonV1,
             PrivateSettlementAuditNoteOpeningV1, PrivateSettlementAuditOutputRoleV1,
             PrivateSettlementAuditPayerAuthorizationBodyV1,
             PrivateSettlementAuditPayerAuthorizationV1, PrivateSettlementAuditPayerInputV1,
@@ -96,6 +97,8 @@ pub(crate) const SPONSOR_REIMBURSEMENT: u128 = 1;
 const PROVER_STACK_BYTES: usize = 64 * 1024 * 1024;
 const POLL_INTERVAL: Duration = Duration::from_millis(500);
 const FINALITY_TIMEOUT: Duration = Duration::from_secs(300);
+/// Per committee node: the Prepare block reaches every node within seconds once the sponsor's node applied it.
+const PREPARE_APPLIED_TIMEOUT: Duration = Duration::from_secs(20);
 
 /// One payment inside the bundle.
 pub struct Leg {
@@ -437,17 +440,27 @@ pub(crate) fn settle(
                 Ok(matches!(fresh.client().get_transaction_status(hash)?, Some(TxConfirmationStatus::Applied)))
             },
         )?;
-        Ok(barrier)
+        Ok((barrier, hash))
     })();
     let abort = || -> Result<()> {
         abort_bundle(cfg, client, &final_manifest)?;
         aborted.set(true);
         Ok(())
     };
-    let barrier = abort_on_error(prepared_phase, "prepare", abort)?;
+    let (barrier, prepare_tx) = abort_on_error(prepared_phase, "prepare", abort)?;
     println!("prepare registered");
     // Past this point the pools are reserved too: any failure before a terminal receipt aborts the bundle.
     let finalization = (|| -> Result<_> {
+        // Every leg's committee is the same four validators (committee()), in authority order.
+        applied_on_quorum(endpoints[0].len(), |node| {
+            let (peer, _) = cfg.sponsor_at(&endpoints[0][node])?;
+            peer.client().wait_for_transaction_applied(
+                prepare_tx,
+                TransactionWaitOptions { timeout: PREPARE_APPLIED_TIMEOUT, poll_interval: POLL_INTERVAL },
+            )?;
+            Ok(())
+        })
+        .wrap_err("commit votes")?;
         let commits = client
             .recover_or_commit_private_settlement_bundle_v1(&endpoints, &barrier)
             .wrap_err("commit votes")?;
@@ -541,6 +554,24 @@ fn register_with_recheck(register: impl FnOnce() -> Result<()>, applied: impl Fn
             }
         },
     }
+}
+
+/// Waits, peer by peer, until `wait_one(i)` reports the Prepare registration applied on a vote quorum of the
+/// `peers` committee nodes. A node signs a Commit vote only once its own state holds the staged Prepare lock
+/// (iroha_core phase.rs commit_vote), so asking for votes as soon as the sponsor's node applied it races the others.
+fn applied_on_quorum(peers: usize, mut wait_one: impl FnMut(usize) -> Result<()>) -> Result<()> {
+    let quorum = usize::from(PRIVATE_SETTLEMENT_COMMITTEE_QUORUM_V1);
+    let mut applied = 0;
+    for node in 0..peers {
+        match wait_one(node) {
+            Ok(()) => applied += 1,
+            Err(error) => eprintln!("prepare registration not applied on committee node {node}: {error:#}"),
+        }
+        if applied >= quorum {
+            return Ok(());
+        }
+    }
+    Err(eyre!("prepare registration applied on {applied} of {peers} committee nodes, {quorum} needed for Commit votes"))
 }
 
 /// Runs `abort` when `result` failed, so a failed stage never leaves pool reservations held until expiry.
@@ -1488,6 +1519,43 @@ mod recheck_tests {
         let (result, aborts, rechecks) = run(Ok(()), None);
         assert!(result.is_ok());
         assert_eq!((aborts, rechecks), (0, 0));
+    }
+}
+
+#[cfg(test)]
+mod prepare_quorum_tests {
+    use super::*;
+
+    /// Runs applied_on_quorum over 4 nodes where the nodes in `lagging` never apply; returns (result, nodes asked).
+    fn run(lagging: &[usize]) -> (Result<()>, Vec<usize>) {
+        let mut asked = Vec::new();
+        let result = applied_on_quorum(4, |i| {
+            asked.push(i);
+            if lagging.contains(&i) { Err(eyre!("node {i} not applied")) } else { Ok(()) }
+        });
+        (result, asked)
+    }
+
+    #[test]
+    fn stops_once_three_nodes_applied() {
+        let (result, asked) = run(&[]);
+        assert!(result.is_ok(), "{result:?}");
+        assert_eq!(asked, [0, 1, 2]);
+    }
+
+    #[test]
+    fn one_lagging_node_still_reaches_the_vote_quorum() {
+        let (result, asked) = run(&[0]);
+        assert!(result.is_ok(), "{result:?}");
+        assert_eq!(asked, [0, 1, 2, 3]);
+    }
+
+    #[test]
+    fn two_lagging_nodes_fail_before_any_commit_vote() {
+        let (result, asked) = run(&[1, 3]);
+        assert_eq!(asked, [0, 1, 2, 3]);
+        let error = result.expect_err("2 of 4 cannot give 3 Commit votes");
+        assert!(error.to_string().contains("applied on 2 of 4"), "{error:#}");
     }
 }
 
