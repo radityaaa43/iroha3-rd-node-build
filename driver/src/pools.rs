@@ -153,11 +153,46 @@ impl PoolFile {
 
     /// Ids still at height 0 in either pool: in flight, or kept after the coordinator stopped waiting for every node's receipt.
     pub fn kept(&self) -> Vec<String> {
-        vec![]
+        let mut ids = Vec::new();
+        for bundle in self.rd.bundles.iter().chain(&self.dfabi.bundles) {
+            if bundle.height == 0 && !ids.contains(&bundle.id) {
+                ids.push(bundle.id.clone());
+            }
+        }
+        ids
     }
 
     /// Set the height of the height-0 bundles that `heights` names (the chain finalized them after the coordinator stopped waiting).
-    pub fn fill_heights(&mut self, _heights: &BTreeMap<String, u64>) {}
+    pub fn fill_heights(&mut self, heights: &BTreeMap<String, u64>) {
+        for bundle in self.rd.bundles.iter_mut().chain(&mut self.dfabi.bundles) {
+            if bundle.height == 0 {
+                bundle.height = heights.get(&bundle.id).copied().unwrap_or(0);
+            }
+        }
+    }
+}
+
+/// Coordinator: give every height-0 bundle the chain has finalized its height, so `GET /aps/bundles` lists it. Receipts are read
+/// outside the pools-file lock; a bundle still in flight has no finalized receipt and stays 0.
+pub fn fill_kept_heights(cfg: &Config) -> Result<()> {
+    let kept = PoolFile::load(&cfg.pools_file)?.kept();
+    if kept.is_empty() {
+        return Ok(());
+    }
+    let (client, _) = cfg.acting_sponsor()?;
+    let mut heights = BTreeMap::new();
+    for id in kept {
+        if let Some(receipt) = finalized_receipt(&client, &receipt_cache(cfg), &id)? {
+            heights.insert(id, receipt.finalized_height);
+        }
+    }
+    if heights.is_empty() {
+        return Ok(());
+    }
+    PoolFile::update(&cfg.pools_file, |file| file.fill_heights(&heights))
+}
+
+impl PoolFile {
 
     pub fn get(&self, asset: Asset) -> &PoolRecord {
         match asset {
