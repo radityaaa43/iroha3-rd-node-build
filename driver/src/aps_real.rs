@@ -152,7 +152,7 @@ impl ApsBackend for RealBackend<'_> {
 
     fn bundles(&self) -> Result<BundleLists> {
         let cfg = self.cfg();
-        pools::fill_kept_heights(cfg)?;
+        pools::fill_kept_heights(&cfg)?;
         let file = pools::PoolFile::load(&cfg.pools_file)?;
         let mut lists = BundleLists::default();
         for (asset, ids) in [(Asset::Rd, &mut lists.rd), (Asset::Dfabi, &mut lists.dfabi)] {
