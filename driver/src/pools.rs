@@ -103,6 +103,10 @@ pub struct PoolRecord {
 pub struct PoolFile {
     pub rd: PoolRecord,
     pub dfabi: PoolRecord,
+    /// bundle id -> its finalization carrier tx hash (the tx the chain knows; the bundle id is not a tx). Known only for bundles
+    /// finalized since this field exists; the coordinator records it and party drivers merge it from `GET /aps/bundles`.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub carriers: BTreeMap<String, String>,
 }
 
 impl PoolFile {
@@ -136,6 +140,13 @@ impl PoolFile {
 
     /// Add the finalized bundles another driver listed (`ids`; `heights` may name a height per id) that are not here yet, after the
     /// ones here. `history()` sorts by the chain's finalized height and trusts only receipts it reads from the chain.
+    /// Add the carrier tx of bundles another driver listed; a carrier already known here is kept.
+    pub fn merge_carriers(&mut self, carriers: &BTreeMap<String, String>) {
+        for (id, carrier_tx) in carriers {
+            self.carriers.entry(id.clone()).or_insert_with(|| carrier_tx.clone());
+        }
+    }
+
     pub fn merge_finalized(&mut self, asset: Asset, ids: &[String], heights: &BTreeMap<String, u64>) {
         let bundles = &mut self.get_mut(asset).bundles;
         for id in ids {
@@ -368,7 +379,7 @@ pub fn pool_init(cfg: &Config, rd_reserve: u128, dfabi_reserve: u128) -> Result<
     }
     let dfabi = records.pop().expect("two pools");
     let rd = records.pop().expect("two pools");
-    let file = PoolFile { rd, dfabi };
+    let file = PoolFile { rd, dfabi, carriers: BTreeMap::new() };
     file.save(&cfg.pools_file)?;
     println!("pool_init_json={}", serde_json::json!({ "rd": file.rd.pool_id, "dfabi": file.dfabi.pool_id }));
     Ok(())
@@ -602,7 +613,8 @@ pub(crate) fn prove_split_leg(cfg: &Config, payer: &str, asset: Asset, leg: &Spl
 
 /// How a bundle ended, for pools.json.
 enum BundleEnd {
-    Finalized(u64),
+    /// Finalized height and the carrier tx hash.
+    Finalized(u64, String),
     /// It moved nothing (aborted): no entry.
     Dropped,
     /// A failure whose abort also failed stays listed; history() reads its final state from the chain.
@@ -612,7 +624,7 @@ enum BundleEnd {
 /// `aborted`: a failed stage was aborted successfully, so the bundle moved nothing.
 fn bundle_end(outcome: &Result<Option<(String, u64)>>, aborted: bool) -> BundleEnd {
     match outcome {
-        Ok(Some((_, height))) => BundleEnd::Finalized(*height),
+        Ok(Some((carrier_tx, height))) => BundleEnd::Finalized(*height, carrier_tx.clone()),
         Ok(None) => BundleEnd::Dropped,
         Err(_) if aborted => BundleEnd::Dropped,
         Err(_) => BundleEnd::Kept,
@@ -620,10 +632,13 @@ fn bundle_end(outcome: &Result<Option<(String, u64)>>, aborted: bool) -> BundleE
 }
 
 fn record_end(pools: &mut PoolFile, id: &str, end: &BundleEnd) {
+    if let BundleEnd::Finalized(_, carrier_tx) = end {
+        pools.carriers.insert(id.to_owned(), carrier_tx.clone());
+    }
     for asset in [Asset::Rd, Asset::Dfabi] {
         let bundles = &mut pools.get_mut(asset).bundles;
         match end {
-            BundleEnd::Finalized(height) => bundles.iter_mut().filter(|b| b.id == id).for_each(|b| b.height = *height),
+            BundleEnd::Finalized(height, _) => bundles.iter_mut().filter(|b| b.id == id).for_each(|b| b.height = *height),
             BundleEnd::Dropped => bundles.retain(|b| b.id != id),
             BundleEnd::Kept => {}
         }
@@ -656,7 +671,7 @@ pub fn wallet_json(cfg: &Config, party: &str) -> Result<serde_json::Value> {
                 .map(|n| n.opening.value)
                 .sum();
             let paid: u128 = spent.iter().filter(|(_, by)| *by == bundle.id).map(|(n, _)| n.opening.value).sum();
-            items.extend(item_json(asset, bundle, received, paid));
+            items.extend(item_json(asset, bundle, received, paid, pools.carriers.get(&bundle.id).map(String::as_str)));
         }
     }
     items.sort_by_key(|i| std::cmp::Reverse(i["height"].as_u64()));
@@ -665,13 +680,13 @@ pub fn wallet_json(cfg: &Config, party: &str) -> Result<serde_json::Value> {
 
 /// One wallet row for a bundle, or None when nothing visible moved. The payer of the RD leg (leg 0) also
 /// reimbursed the sponsor 1 RD: `amount` is the leg without it.
-fn item_json(asset: Asset, bundle: &BundleRef, received: u128, paid: u128) -> Option<serde_json::Value> {
+fn item_json(asset: Asset, bundle: &BundleRef, received: u128, paid: u128, carrier_tx: Option<&str>) -> Option<serde_json::Value> {
     let fee = if asset == Asset::Rd && paid > 0 { SPONSOR_REIMBURSEMENT } else { 0 };
     let (direction, amount) = if paid > received { ("out", paid - received - fee) } else { ("in", received - paid) };
     (amount > 0).then(|| {
         serde_json::json!({
             "bundle_id": bundle.id, "height": bundle.height, "asset": asset.name(),
-            "direction": direction, "amount": amount.to_string(), "fee": fee.to_string(),
+            "direction": direction, "amount": amount.to_string(), "fee": fee.to_string(), "carrier_tx": carrier_tx,
         })
     })
 }
@@ -752,7 +767,7 @@ mod tests {
     /// chain's receipt names its height; a bundle still in flight stays 0 and a known height is never overwritten.
     #[test]
     fn kept_bundle_gets_its_finalized_height() {
-        let mut file = PoolFile { rd: record(), dfabi: record() };
+        let mut file = PoolFile { rd: record(), dfabi: record(), carriers: BTreeMap::new() };
         for asset in [Asset::Rd, Asset::Dfabi] {
             file.get_mut(asset).bundles = vec![
                 BundleRef { id: "a".into(), height: 5 },
@@ -777,16 +792,16 @@ mod tests {
     fn wallet_item_carries_sponsor_fee() {
         let bundle = BundleRef { id: "b".into(), height: 7 };
         // RD payer: spent a note of 2000, got 999 change back, paid 1000 + 1 reimbursement.
-        let rd_out = item_json(Asset::Rd, &bundle, 999, 2000).unwrap();
+        let rd_out = item_json(Asset::Rd, &bundle, 999, 2000, None).unwrap();
         assert_eq!((rd_out["direction"].as_str(), rd_out["amount"].as_str(), rd_out["fee"].as_str()), (Some("out"), Some("1000"), Some("1")));
         // RD recipient pays no fee.
-        let rd_in = item_json(Asset::Rd, &bundle, 1000, 0).unwrap();
+        let rd_in = item_json(Asset::Rd, &bundle, 1000, 0, None).unwrap();
         assert_eq!((rd_in["direction"].as_str(), rd_in["fee"].as_str()), (Some("in"), Some("0")));
         // Only leg 0 (RD) carries the reimbursement.
-        let dfabi_out = item_json(Asset::Dfabi, &bundle, 49, 50).unwrap();
+        let dfabi_out = item_json(Asset::Dfabi, &bundle, 49, 50, None).unwrap();
         assert_eq!((dfabi_out["amount"].as_str(), dfabi_out["fee"].as_str()), (Some("1"), Some("0")));
         // BI's companion RD leg (BI -> BI 1): only the fee left, so no row.
-        assert!(item_json(Asset::Rd, &bundle, 1999, 2000).is_none());
+        assert!(item_json(Asset::Rd, &bundle, 1999, 2000, None).is_none());
     }
 
     /// Lensa runs several driver containers on one pools.json; each finishing bundle must keep the others' entries.
@@ -795,7 +810,7 @@ mod tests {
         let dir = temp_dir();
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("pools.json");
-        PoolFile { rd: record(), dfabi: record() }.save(&path).unwrap();
+        PoolFile { rd: record(), dfabi: record(), carriers: BTreeMap::new() }.save(&path).unwrap();
         let writers: Vec<_> = (0..4)
             .map(|t| {
                 let path = path.clone();
@@ -816,7 +831,7 @@ mod tests {
     /// A party driver starts with no bundles and learns BI's finalized list: no duplicates, its own order kept, heights filled in.
     #[test]
     fn merging_the_coordinators_finalized_bundles_adds_the_missing_ones_once() {
-        let mut pools = PoolFile { rd: record(), dfabi: record() };
+        let mut pools = PoolFile { rd: record(), dfabi: record(), carriers: BTreeMap::new() };
         pools.rd.bundles = vec![BundleRef { id: "a".into(), height: 3 }, BundleRef { id: "p".into(), height: 0 }];
         let ids: Vec<String> = ["a", "b", "p"].iter().map(|id| id.to_string()).collect();
         let heights = std::collections::BTreeMap::from([("a".to_owned(), 3), ("b".to_owned(), 5), ("p".to_owned(), 7)]);
@@ -831,14 +846,14 @@ mod tests {
 
     #[test]
     fn only_finalized_bundles_are_listed() {
-        let mut pools = PoolFile { rd: record(), dfabi: record() };
+        let mut pools = PoolFile { rd: record(), dfabi: record(), carriers: BTreeMap::new() };
         pools.rd.bundles = vec![BundleRef { id: "a".into(), height: 3 }, BundleRef { id: "inflight".into(), height: 0 }, BundleRef { id: "b".into(), height: 4 }];
         let ids: Vec<_> = pools.finalized(Asset::Rd).into_iter().map(|b| b.id).collect();
         assert_eq!(ids, ["a", "b"]);
     }
 
     fn listed(id: &str) -> PoolFile {
-        let mut pools = PoolFile { rd: record(), dfabi: record() };
+        let mut pools = PoolFile { rd: record(), dfabi: record(), carriers: BTreeMap::new() };
         for pool in [&mut pools.rd, &mut pools.dfabi] {
             pool.bundles.push(BundleRef { id: id.into(), height: 0 });
         }
@@ -863,5 +878,35 @@ mod tests {
         let done: Result<Option<(String, u64)>> = Ok(Some(("b".into(), 42)));
         record_end(&mut pools, "b", &bundle_end(&done, false));
         assert_eq!((pools.rd.bundles[0].height, pools.dfabi.bundles[0].height), (42, 42));
+    }
+
+    /// The chain knows a bundle only by its carrier tx (status, receipt view); the bundle id is not a tx hash.
+    #[test]
+    fn a_finalized_bundle_records_its_carrier_tx() {
+        let mut pools = listed("b");
+        let done: Result<Option<(String, u64)>> = Ok(Some(("c0ffee".into(), 42)));
+        record_end(&mut pools, "b", &bundle_end(&done, false));
+        assert_eq!(pools.carriers.get("b").map(String::as_str), Some("c0ffee"));
+        let failed: Result<Option<(String, u64)>> = Err(eyre!("register prepare"));
+        let mut kept = listed("k");
+        record_end(&mut kept, "k", &bundle_end(&failed, false));
+        assert!(kept.carriers.is_empty());
+    }
+
+    #[test]
+    fn wallet_item_names_its_carrier_tx() {
+        let bundle = BundleRef { id: "b".into(), height: 7 };
+        let known = item_json(Asset::Rd, &bundle, 1000, 0, Some("c0ffee")).unwrap();
+        assert_eq!(known["carrier_tx"].as_str(), Some("c0ffee"));
+        let unknown = item_json(Asset::Rd, &bundle, 1000, 0, None).unwrap();
+        assert!(unknown["carrier_tx"].is_null(), "{unknown}");
+    }
+
+    #[test]
+    fn merged_carriers_fill_only_unknown_ids() {
+        let mut pools = listed("a");
+        pools.carriers.insert("a".into(), "x".into());
+        pools.merge_carriers(&BTreeMap::from([("a".to_owned(), "y".to_owned()), ("b".to_owned(), "z".to_owned())]));
+        assert_eq!(pools.carriers, BTreeMap::from([("a".to_owned(), "x".to_owned()), ("b".to_owned(), "z".to_owned())]));
     }
 }

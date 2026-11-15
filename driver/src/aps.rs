@@ -491,7 +491,8 @@ pub(crate) fn settle(
             }
         }
     }
-    Ok((outcome == "finalized").then(|| (hex::encode(final_manifest.bundle_id.as_ref()), height)))
+    // The carrier tx, not the bundle id: the chain knows a bundle only by this tx (POST /aps/submit replies it as `carrier_tx`).
+    Ok((outcome == "finalized").then(|| (request.transaction.hash().to_string(), height)))
 }
 
 /// Abort a bundle that has not finalized (sponsor-signed carrier, before expiry) and wait until
