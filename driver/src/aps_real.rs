@@ -161,6 +161,7 @@ impl ApsBackend for RealBackend<'_> {
                 lists.heights.insert(bundle.id, bundle.height);
             }
         }
+        lists.carriers = file.carriers;
         Ok(lists)
     }
 
@@ -169,6 +170,7 @@ impl ApsBackend for RealBackend<'_> {
         pools::PoolFile::update(&cfg.pools_file, |file| {
             file.merge_finalized(Asset::Rd, &lists.rd, &lists.heights);
             file.merge_finalized(Asset::Dfabi, &lists.dfabi, &lists.heights);
+            file.merge_carriers(&lists.carriers);
         })
     }
 

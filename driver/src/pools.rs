@@ -142,7 +142,9 @@ impl PoolFile {
     /// ones here. `history()` sorts by the chain's finalized height and trusts only receipts it reads from the chain.
     /// Add the carrier tx of bundles another driver listed; a carrier already known here is kept.
     pub fn merge_carriers(&mut self, carriers: &BTreeMap<String, String>) {
-        let _ = carriers;
+        for (id, carrier_tx) in carriers {
+            self.carriers.entry(id.clone()).or_insert_with(|| carrier_tx.clone());
+        }
     }
 
     pub fn merge_finalized(&mut self, asset: Asset, ids: &[String], heights: &BTreeMap<String, u64>) {
@@ -611,7 +613,8 @@ pub(crate) fn prove_split_leg(cfg: &Config, payer: &str, asset: Asset, leg: &Spl
 
 /// How a bundle ended, for pools.json.
 enum BundleEnd {
-    Finalized(u64),
+    /// Finalized height and the carrier tx hash.
+    Finalized(u64, String),
     /// It moved nothing (aborted): no entry.
     Dropped,
     /// A failure whose abort also failed stays listed; history() reads its final state from the chain.
@@ -621,7 +624,7 @@ enum BundleEnd {
 /// `aborted`: a failed stage was aborted successfully, so the bundle moved nothing.
 fn bundle_end(outcome: &Result<Option<(String, u64)>>, aborted: bool) -> BundleEnd {
     match outcome {
-        Ok(Some((_, height))) => BundleEnd::Finalized(*height),
+        Ok(Some((carrier_tx, height))) => BundleEnd::Finalized(*height, carrier_tx.clone()),
         Ok(None) => BundleEnd::Dropped,
         Err(_) if aborted => BundleEnd::Dropped,
         Err(_) => BundleEnd::Kept,
@@ -629,10 +632,13 @@ fn bundle_end(outcome: &Result<Option<(String, u64)>>, aborted: bool) -> BundleE
 }
 
 fn record_end(pools: &mut PoolFile, id: &str, end: &BundleEnd) {
+    if let BundleEnd::Finalized(_, carrier_tx) = end {
+        pools.carriers.insert(id.to_owned(), carrier_tx.clone());
+    }
     for asset in [Asset::Rd, Asset::Dfabi] {
         let bundles = &mut pools.get_mut(asset).bundles;
         match end {
-            BundleEnd::Finalized(height) => bundles.iter_mut().filter(|b| b.id == id).for_each(|b| b.height = *height),
+            BundleEnd::Finalized(height, _) => bundles.iter_mut().filter(|b| b.id == id).for_each(|b| b.height = *height),
             BundleEnd::Dropped => bundles.retain(|b| b.id != id),
             BundleEnd::Kept => {}
         }
@@ -675,13 +681,12 @@ pub fn wallet_json(cfg: &Config, party: &str) -> Result<serde_json::Value> {
 /// One wallet row for a bundle, or None when nothing visible moved. The payer of the RD leg (leg 0) also
 /// reimbursed the sponsor 1 RD: `amount` is the leg without it.
 fn item_json(asset: Asset, bundle: &BundleRef, received: u128, paid: u128, carrier_tx: Option<&str>) -> Option<serde_json::Value> {
-    let _ = carrier_tx;
     let fee = if asset == Asset::Rd && paid > 0 { SPONSOR_REIMBURSEMENT } else { 0 };
     let (direction, amount) = if paid > received { ("out", paid - received - fee) } else { ("in", received - paid) };
     (amount > 0).then(|| {
         serde_json::json!({
             "bundle_id": bundle.id, "height": bundle.height, "asset": asset.name(),
-            "direction": direction, "amount": amount.to_string(), "fee": fee.to_string(),
+            "direction": direction, "amount": amount.to_string(), "fee": fee.to_string(), "carrier_tx": carrier_tx,
         })
     })
 }

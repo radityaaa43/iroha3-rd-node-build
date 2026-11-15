@@ -83,6 +83,9 @@ pub struct BundleLists {
     /// bundle id -> finalized height, for the wallet's rows; absent = unknown (0).
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub heights: BTreeMap<String, u64>,
+    /// bundle id -> its finalization carrier tx, where the coordinator recorded it.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub carriers: BTreeMap<String, String>,
 }
 
 /// What `begin_bundle` fixed for the whole bundle (everything the parties need to sign and prove against).
@@ -666,7 +669,7 @@ pub(crate) mod testkit {
 
     /// What the coordinator lists as finalized: two RD bundles, one of them also in the DFABI pool.
     pub(crate) fn lists() -> BundleLists {
-        BundleLists { rd: vec![id(0xa1), id(0xa2)], dfabi: vec![id(0xa1)], heights: BTreeMap::from([(id(0xa1), 5), (id(0xa2), 9)]) }
+        BundleLists { rd: vec![id(0xa1), id(0xa2)], dfabi: vec![id(0xa1)], heights: BTreeMap::from([(id(0xa1), 5), (id(0xa2), 9)]), ..Default::default() }
     }
 
     #[derive(Default)]
