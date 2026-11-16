@@ -449,9 +449,47 @@ fn pending_path(cfg: &Config, lane: u32) -> PathBuf {
     cfg.pools_file.with_extension(format!("json.pending-{lane}"))
 }
 
-/// RED stub: persist, submit, record.
-fn commit_pools(cfg: &Config, lane: u32, pending: Vec<Pending>, _submit: impl FnOnce() -> Result<String>) -> Result<Vec<PoolKey>> {
-    todo!("RED: {} {lane} {}", cfg.pools_file.display(), pending.len())
+/// Persist, submit, record. Everything unrecoverable is on disk BEFORE the submit: the reserve openings hold random values that
+/// cannot be rebuilt, and a submit that errors (wait timeout, network drop) may still commit. A failed or ambiguous submit
+/// therefore leaves the note files (`create_new`, 0600) and the public records in `pools.json.pending-<lane>`; `pool_add`
+/// refuses to run while either exists, so a blind retry cannot activate a second pool for the same key. After a submit that
+/// succeeded, the records move into the pools file and the pending file goes.
+fn commit_pools(cfg: &Config, lane: u32, pending: Vec<Pending>, submit: impl FnOnce() -> Result<String>) -> Result<Vec<PoolKey>> {
+    let mut written: Vec<PathBuf> = Vec::new();
+    let staged = (|| -> Result<()> {
+        for pool in &pending {
+            let path = origin_note_path(cfg, PoolKey { lane, asset: pool.asset });
+            write_secret(&path, &pool.opening)?;
+            written.push(path);
+        }
+        let entries: Vec<_> = pending.iter().map(|pool| PoolEntry { lane, asset: pool.asset, record: pool.record.clone() }).collect();
+        let file = pending_path(cfg, lane);
+        let tmp = file.with_extension(format!("{:016x}.tmp", rand::random::<u64>()));
+        std::fs::write(&tmp, serde_json::to_string_pretty(&entries)?)?;
+        std::fs::rename(&tmp, &file).wrap_err_with(|| format!("write {}", file.display()))
+    })();
+    if let Err(err) = staged {
+        // Nothing was submitted: take our notes back so a retry is not blocked by them.
+        for path in &written {
+            let _ = std::fs::remove_file(path);
+        }
+        return Err(err);
+    }
+    let hash = submit().wrap_err_with(|| {
+        format!(
+            "activate pools of lane {lane}: the submit failed and the transaction may still have committed; the origin notes and {} stay, check the chain before retrying",
+            pending_path(cfg, lane).display()
+        )
+    })?;
+    println!("pool_activation_tx={hash} lane={lane}");
+    let entries: Vec<_> = pending.into_iter().map(|pool| PoolEntry { lane, asset: pool.asset, record: pool.record }).collect();
+    for entry in &entries {
+        println!("pool_json={}", serde_json::json!({ "lane": lane, "asset": entry.asset.name(), "pool_id": entry.record.pool_id }));
+    }
+    let keys = entries.iter().map(PoolEntry::key).collect();
+    PoolFile::add(&cfg.pools_file, entries).wrap_err_with(|| format!("the pools are active; their records stay in {}", pending_path(cfg, lane).display()))?;
+    std::fs::remove_file(pending_path(cfg, lane))?;
+    Ok(keys)
 }
 
 /// Activate pools in ONE dataspace (`lane`), one per `(asset, reserve)`, each holding a BI reserve note: ONE transaction with
@@ -460,7 +498,8 @@ fn commit_pools(cfg: &Config, lane: u32, pending: Vec<Pending>, _submit: impl Fn
 /// (queue/router.rs `ActivatePrivateSettlementPoolV1 => route.dataspace_id`), and two dataspaces in one transaction become a
 /// cross-dataspace NativeAmx plan that never got a lane payload on this cluster: queued forever, no block, 300 s timeout
 /// (see `aps.rs`, the same reason it activates one transaction per pool). Hence one call per lane.
-/// Refuses a key already in the pools file, and an origin note file that exists, before any network call.
+/// Refuses a key already in the pools file, an origin note file that exists, and a pending file of the lane, before any network call
+/// (the last two are what a failed or ambiguous submit leaves: see `commit_pools`).
 pub fn pool_add(cfg: &Config, lane: u32, reserves: &[(Asset, u128)], rng: &mut impl rand::Rng) -> Result<Vec<PoolKey>> {
     ensure!(!reserves.is_empty(), "pool-add: no reserve given for lane {lane}");
     let assets: BTreeSet<_> = reserves.iter().map(|(asset, _)| *asset).collect();
@@ -475,6 +514,8 @@ pub fn pool_add(cfg: &Config, lane: u32, reserves: &[(Asset, u128)], rng: &mut i
         let note = origin_note_path(cfg, PoolKey { lane, asset: *asset });
         ensure!(!note.exists(), "{} exists: no pool is recorded for it, move it away first", note.display());
     }
+    let left_over = pending_path(cfg, lane);
+    ensure!(!left_over.exists(), "{} exists: an earlier activation of lane {lane} did not finish; check the chain, then resolve it by hand", left_over.display());
     let (sponsor, _) = cfg.acting_sponsor()?;
     let caps = sponsor.client().get_privacy_capabilities()?;
     ensure!(
@@ -491,18 +532,6 @@ pub fn pool_add(cfg: &Config, lane: u32, reserves: &[(Asset, u128)], rng: &mut i
         let governed = crate::aps::govern_with(lane_route, asset_id(cfg, asset).parse()?, caps.committed_height, None, &auditors, min_approvals)?;
         let funding = funding_with_secret(reserve, bi.spend)?;
         activations.push(ActivatePrivateSettlementPoolV1::from_restricted(&governed.governance, funding.activation_commitments().to_vec())?);
-        pending.push((asset, governed, funding));
-    }
-    let account = sponsor.account_client();
-    let tx = account
-        .prepare_transaction(AccountTransactionDraft::new(activations, fee, Metadata::default()))
-        .and_then(|payload| account.sign_transaction(payload))
-        .wrap_err("build pool activation")?;
-    let hash = sponsor.submit_transaction_and_wait(&tx).wrap_err_with(|| format!("activate pools of lane {lane}"))?;
-    println!("pool_activation_tx={hash} lane={lane}");
-    let mut entries = Vec::new();
-    for (asset, governed, funding) in pending {
-        write_secret(&origin_note_path(cfg, PoolKey { lane, asset }), &enc(&funding.opening)?)?;
         let record = PoolRecord {
             pool_id: hex::encode(governed.governance.body.pool_id.as_ref()),
             route: enc(&governed.route)?,
@@ -511,12 +540,14 @@ pub fn pool_add(cfg: &Config, lane: u32, reserves: &[(Asset, u128)], rng: &mut i
             origin: funding.input_commitments.iter().map(|c| hex::encode(c.as_bytes())).collect(),
             bundles: Vec::new(),
         };
-        println!("pool_json={}", serde_json::json!({ "lane": lane, "asset": asset.name(), "pool_id": record.pool_id }));
-        entries.push(PoolEntry { lane, asset, record });
+        pending.push(Pending { asset, record, opening: enc(&funding.opening)? });
     }
-    let keys = entries.iter().map(PoolEntry::key).collect();
-    PoolFile::add(&cfg.pools_file, entries)?;
-    Ok(keys)
+    let account = sponsor.account_client();
+    let tx = account
+        .prepare_transaction(AccountTransactionDraft::new(activations, fee, Metadata::default()))
+        .and_then(|payload| account.sign_transaction(payload))
+        .wrap_err("build pool activation")?;
+    commit_pools(cfg, lane, pending, || Ok(sponsor.submit_transaction_and_wait(&tx)?.to_string()))
 }
 
 /// One-time: activate the pools of every lane in `plan` (one `pool_add` per lane, lanes in shuffled order). Needs no pools file.
