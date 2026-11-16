@@ -45,7 +45,6 @@ pub fn dir(cfg: &Config) -> PathBuf {
 
 /// Write through a temp file + rename: a crash leaves the previous phase, never half a file.
 pub fn save(dir: &Path, f: &Inflight) -> Result<()> {
-    eyre::bail!("RED stub");
     std::fs::create_dir_all(dir)?;
     let file = dir.join(format!("{}.json", f.bundle_id));
     let tmp = file.with_extension("json.tmp");
@@ -194,11 +193,13 @@ mod tests {
         status: Option<PrivateSettlementLifecycleDtoV1>,
         calls: RefCell<Vec<&'static str>>,
         carriers: Cell<usize>,
+        /// The nodes no longer hold a Prepare certificate and the bundle is past its expiry.
+        expired: bool,
     }
 
     impl FakeNodes {
         fn new(status: Option<PrivateSettlementLifecycleDtoV1>) -> Self {
-            Self { status, calls: RefCell::default(), carriers: Cell::new(0) }
+            Self { status, calls: RefCell::default(), carriers: Cell::new(0), expired: false }
         }
 
         fn call(&self, name: &'static str) {
@@ -231,7 +232,7 @@ mod tests {
 
         fn prepare(&self, _manifest: &AtomicPrivateSettlementV1) -> Result<()> {
             self.call("prepare");
-            Ok(())
+            if self.expired { Err(eyre::eyre!("no Prepare quorum")) } else { Ok(()) }
         }
 
         fn register(&self, _barrier: &()) -> Result<()> {
@@ -249,13 +250,17 @@ mod tests {
             Ok("finalize-tx".to_owned())
         }
 
-        fn abort(&self, _manifest: &AtomicPrivateSettlementV1, _reason: PrivateSettlementAbortReasonV1) -> Result<String> {
+        fn abort(&self, _manifest: &AtomicPrivateSettlementV1, reason: PrivateSettlementAbortReasonV1) -> Result<String> {
+            if self.expired && reason != PrivateSettlementAbortReasonV1::Expired {
+                self.call("abort refused");
+                eyre::bail!("past expiry");
+            }
             self.carrier("abort");
             Ok("abort-tx".to_owned())
         }
 
         fn receipt(&self, _manifest: &AtomicPrivateSettlementV1) -> Result<(&'static str, u64)> {
-            Ok(("finalized", 7))
+            Ok((if self.calls.borrow().contains(&"abort") { "aborted" } else { "finalized" }, 7))
         }
     }
 
@@ -280,6 +285,17 @@ mod tests {
         assert_eq!(*nodes.calls.borrow(), ["prepare", "commit", "finalize"]);
         assert_eq!(saved, [Phase::Committed]);
         assert_eq!(ended, Some(("finalized", "finalize-tx".to_owned(), 7)));
+    }
+
+    /// A bundle resumed after its expiry (no Prepare quorum left) still gets a terminal record: the `Expired` abort marker.
+    #[test]
+    fn a_bundle_resumed_past_its_expiry_is_aborted_as_expired() {
+        let nodes = FakeNodes { expired: true, ..FakeNodes::new(Some(PrivateSettlementLifecycleDtoV1::Prepared)) };
+        let aborted = Cell::new(false);
+        let error = continue_bundle(&nodes, test_manifest(), Phase::Registered, &aborted, &mut |_, _| Ok(())).err().unwrap();
+        assert!(error.to_string().contains("no Prepare quorum"), "{error:#}");
+        assert!(aborted.get(), "the bundle ended aborted: nothing moved, nothing stays reserved");
+        assert_eq!(*nodes.calls.borrow(), ["prepare", "abort refused", "abort"]);
     }
 
     #[test]

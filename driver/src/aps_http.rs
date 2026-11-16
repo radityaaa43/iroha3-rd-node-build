@@ -439,7 +439,8 @@ impl<'a> Aps<'a> {
     /// Coordinator start: the bundles a previous run left in flight finish before any new submit (`submit_lock`). `locked` runs
     /// once the lock is held, so the caller starts serving only then (`/healthz` answers meanwhile).
     pub fn resume(&self, locked: impl FnOnce()) {
-        locked(); // RED stub: no lock
+        let _one_bundle_at_a_time = self.submit_lock.lock().unwrap_or_else(|p| p.into_inner());
+        locked();
         if let Err(e) = self.backend.resume_all() {
             eprintln!("resume failed: {}", safe(&e));
         }

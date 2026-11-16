@@ -234,7 +234,6 @@ impl Config {
     /// The keys a leg's reimbursement output (role 2) is addressed to: the one-time keys of the `[aps.sponsor]` note keys, which
     /// `wallet sponsor` scans. Without that section nobody owns it (random keys, as before the conformance chain).
     pub fn reimbursement_keys(&self, bundle: &[u8; 32], pool: &[u8; 32]) -> Result<crate::wallet::NoteKeys> {
-        if true { let _ = (bundle, pool); return Ok(crate::wallet::NoteKeys::random()); } // RED stub
         Ok(match &self.aps.sponsor {
             Some(_) => self.sponsor_note_keys()?.one_time(bundle, pool, 2),
             None => crate::wallet::NoteKeys::random(),
@@ -244,7 +243,6 @@ impl Config {
     /// The signer of a bundle's carriers: the key that is its `manifest.sponsor`. That is the `[aps.sponsor]` key, or the
     /// governance key for a bundle prepared before that section was set (it can still be aborted or finished).
     pub fn signer_for(&self, sponsor: &AccountId) -> Result<(Client, KeyPair)> {
-        if true { let _ = sponsor; return self.acting_sponsor(); } // RED stub
         let acting = self.acting_sponsor()?;
         if AccountId::new(acting.1.public_key().clone()) == *sponsor {
             return Ok(acting);
@@ -260,7 +258,12 @@ impl Config {
     /// max_carrier_bytes` (Torii exposes no read of it). Every carrier is measured against it, so a coordinator refuses to start or
     /// settle without it.
     pub fn max_carrier_bytes(&self) -> Result<u64> {
-        Ok(self.aps.max_carrier_bytes.unwrap_or(1)) // RED stub
+        // Above the V1 ceiling every carrier builder refuses it, and only once Prepare reserved the pools.
+        let ceiling = iroha::data_model::nexus::PRIVATE_SETTLEMENT_MAX_RECEIPT_BYTES_V1 as u64;
+        self.aps
+            .max_carrier_bytes
+            .filter(|bytes| (1..=ceiling).contains(bytes))
+            .ok_or_else(|| eyre!("[aps] max_carrier_bytes is missing, 0 or above the V1 ceiling: set the deployment's governed carrier limit"))
     }
 
     /// Operator client (BI's client.toml, read-only use) bound to `party`'s Torii, plus its key.
@@ -455,7 +458,8 @@ dfabi = 2
     #[test]
     fn the_governed_carrier_limit_is_required_and_not_zero() {
         assert_eq!(config("[aps]\nmax_carrier_bytes = 262144\n").max_carrier_bytes().unwrap(), 262_144);
-        for missing in ["", "[aps]\nmax_carrier_bytes = 0\n"] {
+        let above = format!("[aps]\nmax_carrier_bytes = {}\n", iroha::data_model::nexus::PRIVATE_SETTLEMENT_MAX_RECEIPT_BYTES_V1 + 1);
+        for missing in ["", "[aps]\nmax_carrier_bytes = 0\n", above.as_str()] {
             let error = config(missing).max_carrier_bytes().unwrap_err();
             assert!(error.to_string().contains("max_carrier_bytes"), "{error}");
         }

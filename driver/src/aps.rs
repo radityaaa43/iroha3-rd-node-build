@@ -423,8 +423,16 @@ pub(crate) fn continue_bundle<N: Nodes>(
     aborted: &Cell<bool>,
     save: &mut dyn FnMut(Phase, &AtomicPrivateSettlementV1) -> Result<()>,
 ) -> Result<Option<Settlement>> {
-    let _ = phase; // RED stub
-    drive(nodes, manifest, Phase::Proved, aborted, save).map(Some)
+    use PrivateSettlementLifecycleDtoV1::{Aborted, Expired, Finalized};
+    if matches!(nodes.status(&manifest), Some(Finalized | Aborted | Expired)) {
+        // The carrier tx of an earlier run is not known here.
+        let (outcome, height) = nodes.receipt(&manifest)?;
+        return Ok(Some(Settlement { manifest, carrier_tx: String::new(), outcome, height }));
+    }
+    if phase == Phase::Proved {
+        return Ok(None);
+    }
+    drive(nodes, manifest, phase, aborted, save).map(Some)
 }
 
 /// Run the phases after `from` (a fresh bundle: `Proved`) and `save` each one the nodes made durable. Prepare and Commit
@@ -480,10 +488,13 @@ fn drive<N: Nodes>(
     Ok(Settlement { manifest, carrier_tx, outcome, height })
 }
 
-/// Abort a bundle that has not finalized (before expiry) and wait until all four validators report it aborted; this releases its
+/// Abort a bundle that has not finalized and wait until all four validators report it aborted; this releases its
 /// pool/nullifier/output reservations.
 fn abort_and_wait<N: Nodes>(nodes: &N, manifest: &AtomicPrivateSettlementV1) -> Result<()> {
-    nodes.abort(manifest, PrivateSettlementAbortReasonV1::ParticipantRejected)?;
+    // Past its expiry only the `Expired` marker is admissible (Torii's authoritative-height rule): a bundle resumed late still ends.
+    nodes
+        .abort(manifest, PrivateSettlementAbortReasonV1::ParticipantRejected)
+        .or_else(|first| nodes.abort(manifest, PrivateSettlementAbortReasonV1::Expired).map_err(|_| first))?;
     let (outcome, _) = nodes.receipt(manifest)?;
     if outcome == "finalized" {
         return Err(eyre::Report::new(FinalizedSeen("abort ended as finalized".into())));
@@ -663,7 +674,6 @@ impl Nodes for RealNodes<'_> {
 
 /// `manifest` is `provisional` with every availability certificate digest filled in, and nothing else changed.
 fn is_final_of(manifest: &AtomicPrivateSettlementV1, provisional: &AtomicPrivateSettlementV1) -> bool {
-    if true { return true; } // RED stub
     let mut unfilled = manifest.clone();
     for (leg, sent) in unfilled.legs.iter_mut().zip(&provisional.legs) {
         if leg.availability_certificate_digest == sent.availability_certificate_digest {
@@ -843,7 +853,7 @@ pub(crate) fn wait_receipt(cfg: &Config, manifest: &AtomicPrivateSettlementV1) -
 
 /// The height of one node's finalized receipt, which must be this bundle's exact manifest and name its legs.
 fn finalized_height(party: &str, receipt: &PrivateSettlementReceiptV1, manifest: &AtomicPrivateSettlementV1) -> Result<u64> {
-    let _ = manifest; // RED stub
+    ensure!(receipt.manifest == *manifest, "{party}: receipt manifest differs");
     if receipt.legs.is_empty() {
         return Err(eyre::Report::new(FinalizedSeen(format!("{party}: empty finalized receipt"))));
     }

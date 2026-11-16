@@ -350,8 +350,7 @@ fn finalized_receipt(client: &Client, cache: &Path, id: &str, height: u64) -> Re
 fn read_cached(file: &Path, id: &str, height: u64) -> Result<Option<PrivateSettlementReceiptV1>> {
     // A missing, damaged or foreign file is a miss: the caller refetches and rewrites it.
     let cached = std::fs::read_to_string(file).ok().and_then(|text| dec::<PrivateSettlementReceiptV1>(text.trim()).ok());
-    let _ = (id, height);
-    Ok(cached) // RED stub
+    Ok(cached.filter(|receipt| height > 0 && receipt.finalized_height == height && hex::encode(receipt.manifest.bundle_id.as_ref()) == id))
 }
 
 /// Write via a temp file and rename, so a reader never sees half a file. The temp name is random:
