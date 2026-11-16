@@ -138,6 +138,8 @@ pub trait ApsBackend: Send + Sync {
     /// `AtomicPrivateSettlementPreparedLegV1` has no norito codec upstream).
     /// The intent is already consumed; `req.intent` is empty for the coordinator's own BI -> BI companion leg.
     fn prove_leg(&self, req: &LegReq) -> Result<String>;
+    /// Payer side, before the intent is spent: whether `req.lane`/`req.asset` name the pool the manifest has at `req.ordinal`.
+    fn is_leg_pool(&self, req: &LegReq) -> Result<bool>;
     /// Coordinator side: audit quorum, prepare, commit. `None` = the bundle was aborted (nothing moved).
     fn settle(&self, bundle: &BundleCtx, prepared: &[String; 2]) -> Result<Option<Settled>>;
     /// Coordinator side: the finalized bundles of both pools (height > 0) from its pools file.
@@ -757,7 +759,7 @@ pub(crate) mod testkit {
         collections::BTreeMap,
         sync::{
             Mutex,
-            atomic::{AtomicUsize, Ordering},
+            atomic::{AtomicBool, AtomicUsize, Ordering},
         },
         time::Duration,
     };
@@ -802,6 +804,8 @@ pub(crate) mod testkit {
         pub max_active: AtomicUsize,
         /// What `capacity` answers for either asset; empty = 1000 in lanes 1 and 2.
         pub caps: Vec<(u32, Capacity)>,
+        /// `is_leg_pool` answers false: the leg's lane/asset are not the manifest's pool.
+        pub foreign_pool: AtomicBool,
     }
 
     impl FakeBackend {
@@ -854,6 +858,11 @@ pub(crate) mod testkit {
             self.proving.fetch_sub(1, Ordering::SeqCst);
             self.note("prove")?;
             Ok("beef".to_owned())
+        }
+
+        /// Not listed in `calls`: a check, not work.
+        fn is_leg_pool(&self, _req: &LegReq) -> Result<bool> {
+            Ok(!self.foreign_pool.load(Ordering::SeqCst))
         }
 
         fn settle(&self, _bundle: &BundleCtx, _prepared: &[String; 2]) -> Result<Option<Settled>> {
@@ -1576,6 +1585,22 @@ mod tests {
         assert_eq!(aps.route("POST", "/aps/leg", &leg_at(&id(2), &to, "10", 0, 1)).0, 403);
         assert_eq!(aps.route("POST", "/aps/leg", &leg_at(&id(2), &to, "9", 0, 1)).0, 200, "the refusal spent nothing");
         assert_eq!(aps.route("POST", "/aps/leg", &leg_at(&id(2), &to, "1", 1, 2)).0, 403, "the intent is spent");
+    }
+
+    /// The coordinator names the leg's pool twice: `lane`/`asset`, and the manifest's pool at `ordinal`. A leg where the two disagree
+    /// is refused before the intent is spent or anything is refreshed or proved.
+    #[test]
+    fn a_leg_outside_the_manifests_pool_is_400_and_spends_nothing() {
+        let (backend, peer) = (driver(8), FakePeer::standard());
+        backend.foreign_pool.store(true, Ordering::SeqCst);
+        let aps = Aps::new(&backend, &peer, bank());
+        let (to, intent) = (account(9), id(1));
+        assert_eq!(aps.route("POST", "/aps/intent", &intent_body(&intent, "rd", &to, "5")).0, 200);
+        let (status, response) = aps.route("POST", "/aps/leg", &leg_body(&intent, "rd", &to, "5"));
+        assert_eq!(status, 400, "{response}");
+        assert!(calls(&backend).is_empty(), "nothing refreshed or proved");
+        backend.foreign_pool.store(false, Ordering::SeqCst);
+        assert_eq!(aps.route("POST", "/aps/leg", &leg_body(&intent, "rd", &to, "5")).0, 200, "the refused leg spent nothing");
     }
 
     #[test]

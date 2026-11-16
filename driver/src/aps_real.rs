@@ -159,6 +159,14 @@ impl ApsBackend for RealBackend<'_> {
         encode_prepared(&pools::prove_split_leg(&cfg, &cfg.party, asset, &leg)?)
     }
 
+    fn is_leg_pool(&self, req: &LegReq) -> Result<bool> {
+        let Ok(manifest) = dec::<AtomicPrivateSettlementV1>(&req.manifest) else {
+            return Ok(false);
+        };
+        let pools = pools::PoolFile::load(&self.cfg().pools_file)?;
+        Ok(pools::is_leg_pool(&pools, PoolKey { lane: req.lane, asset: Asset::parse(&req.asset)? }, &manifest, usize::from(req.ordinal)))
+    }
+
     fn settle(&self, bundle: &BundleCtx, prepared: &[String; 2]) -> Result<Option<Settled>> {
         let manifest = dec::<AtomicPrivateSettlementV1>(&bundle.manifest)?;
         let legs = [decode_prepared(&prepared[0])?, decode_prepared(&prepared[1])?];

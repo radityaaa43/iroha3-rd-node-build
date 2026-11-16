@@ -735,6 +735,21 @@ fn settle_recorded(
     outcome
 }
 
+/// List the bundle at height 0 in the two pools it touches, and only there.
+fn record_start(pools: &mut PoolFile, keys: [PoolKey; 2], id: &str) -> Result<()> {
+    todo!("{:?} {id} {}", keys, pools.pools.len())
+}
+
+/// The governed pools of a bundle's two legs, in leg order: `keys` sorted by lane (leg 0 = the lowest lane).
+fn leg_pools(pools: &PoolFile, keys: [PoolKey; 2]) -> Result<[Governed; 2]> {
+    todo!("{:?} {}", keys, pools.pools.len())
+}
+
+/// Whether `key` names the pool the manifest has at leg `ordinal` (a key this pools file does not know never does).
+pub(crate) fn is_leg_pool(pools: &PoolFile, key: PoolKey, manifest: &AtomicPrivateSettlementV1, ordinal: usize) -> bool {
+    todo!("{key:?} {ordinal} {} {}", pools.pools.len(), manifest.legs.len())
+}
+
 /// What the coordinator fixes before any party signs or proves: the manifest and, per leg (by lane), its pool key, route, pool id
 /// and committee digest.
 pub(crate) struct BundleStart {
@@ -909,6 +924,26 @@ pub fn wallet_json(cfg: &Config, party: &str) -> Result<serde_json::Value> {
     }
     items.sort_by_key(|i| std::cmp::Reverse(i["height"].as_u64()));
     Ok(serde_json::json!({ "party": party, "balances": balances, "items": items }))
+}
+
+/// What a party holds in one pool and moved there per bundle, read from the pool's history.
+struct PoolView {
+    asset: Asset,
+    balance: u128,
+    moved: Vec<Moved>,
+}
+
+/// `leg0`: the pool carried leg 0 of the bundle (its payer also paid the sponsor's reimbursement).
+struct Moved {
+    bundle: BundleRef,
+    received: u128,
+    paid: u128,
+    leg0: bool,
+}
+
+/// The wallet JSON from the views of every pool: balances summed per asset, one row per (bundle, asset).
+fn wallet_value(party: &str, views: &[PoolView], carriers: &BTreeMap<String, String>) -> serde_json::Value {
+    todo!("{party} {} {}", views.len(), carriers.len())
 }
 
 /// One wallet row for a bundle, or None when nothing visible moved. The payer of the RD leg (leg 0) also
@@ -1519,5 +1554,152 @@ dfabi = 2
         assert_eq!(std::fs::read_to_string(dir.join("bi.origin-1-dfabi.note")).unwrap(), "stale", "a file that was not ours stays");
         assert!(!pending_path(&cfg, 1).exists() && !cfg.pools_file.exists());
         std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    fn key(lane: u32, asset: Asset) -> PoolKey {
+        PoolKey { lane, asset }
+    }
+
+    /// The four pools of spec 4.2 with real governance records (no chain): RD and DFABI in lanes 1 and 2.
+    fn governed_file() -> PoolFile {
+        let mut rng = iroha_crypto::rng_from_seed_slice(&[7; 32]);
+        let hybrid = iroha_crypto::HybridKeyPair::generate(&mut rng).unwrap();
+        let auditors = [(crate::aps::fixture_key(0x30).public_key().clone(), PrivateSettlementHybridPublicKeyV1::from_hybrid(hybrid.public()))];
+        let pools = [(1, Asset::Rd), (1, Asset::Dfabi), (2, Asset::Rd), (2, Asset::Dfabi)]
+            .into_iter()
+            .map(|(lane, asset)| {
+                let definition = match asset {
+                    Asset::Rd => "7onbjg2gRXveoAAUFsohCZyGW98t",
+                    Asset::Dfabi => "4mBWK1JCwQdHLDPpuVKc56eLsXka",
+                };
+                let g = crate::aps::govern_with(dec(&route_hex(lane)).unwrap(), definition.parse().unwrap(), 100, None, &auditors, 1).unwrap();
+                let record = PoolRecord {
+                    pool_id: hex::encode(g.governance.body.pool_id.as_ref()),
+                    route: enc(&g.route).unwrap(),
+                    policy: enc(&g.policy).unwrap(),
+                    governance: enc(&g.governance).unwrap(),
+                    origin: vec![],
+                    bundles: vec![],
+                };
+                PoolEntry { lane, asset, record }
+            })
+            .collect();
+        PoolFile { pools, carriers: BTreeMap::new() }
+    }
+
+    /// The manifest `begin_bundle` builds over `governed`, with a fixture network, sponsor and fee.
+    fn manifest_over(governed: &[Governed]) -> AtomicPrivateSettlementV1 {
+        let network_id = iroha::data_model::NetworkId::from_genesis_hash(iroha_crypto::HashOf::from_untyped_unchecked(Hash::new(b"pools-test")));
+        let sponsor = AccountId::new(crate::aps::fixture_key(0x31).public_key().clone());
+        let fee = crate::aps::bounded_fee_for("6TEAJqbb8oEPmLncoNiMRbLEK6tw").unwrap();
+        proof_manifest(network_id, 101, 100 + EXPIRY_BLOCKS, sponsor, fee, governed, [9; 32]).unwrap()
+    }
+
+    /// `begin_bundle` builds the manifest legs from exactly the two planned pools, in lane order (the HTTP fake backend hides this).
+    #[test]
+    fn begin_bundle_uses_given_pools() {
+        let file = governed_file();
+        for keys in [[key(1, Asset::Dfabi), key(2, Asset::Rd)], [key(1, Asset::Rd), key(2, Asset::Rd)], [key(1, Asset::Dfabi), key(2, Asset::Dfabi)]] {
+            let manifest = manifest_over(&leg_pools(&file, keys).unwrap());
+            let got: Vec<String> = manifest.legs.iter().map(|leg| hex::encode(leg.pool_id.as_ref())).collect();
+            let want: Vec<String> = keys.iter().map(|k| file.get(*k).unwrap().pool_id.clone()).collect();
+            assert_eq!(got, want, "{keys:?}");
+        }
+        assert!(leg_pools(&file, [key(2, Asset::Rd), key(1, Asset::Dfabi)]).is_err(), "legs are sorted by lane");
+        assert!(leg_pools(&file, [key(1, Asset::Rd), key(1, Asset::Dfabi)]).is_err(), "one leg per lane");
+        assert!(leg_pools(&file, [key(1, Asset::Rd), key(3, Asset::Rd)]).is_err(), "a pool the file does not know");
+    }
+
+    /// `/aps/leg` proves only in the pool the manifest has at the leg's ordinal: `lane`/`asset` must name that pool.
+    #[test]
+    fn a_leg_matches_only_the_manifests_pool_at_its_ordinal() {
+        let file = governed_file();
+        let keys = [key(1, Asset::Dfabi), key(2, Asset::Rd)];
+        let manifest = manifest_over(&leg_pools(&file, keys).unwrap());
+        assert!(is_leg_pool(&file, keys[0], &manifest, 0));
+        assert!(is_leg_pool(&file, keys[1], &manifest, 1));
+        for (other, ordinal) in [(keys[1], 0), (keys[0], 1), (key(1, Asset::Rd), 0), (key(2, Asset::Dfabi), 1), (key(9, Asset::Rd), 0), (keys[0], 2)] {
+            assert!(!is_leg_pool(&file, other, &manifest, ordinal), "{other:?} at {ordinal}");
+        }
+    }
+
+    /// A bundle is listed in the two pools it touches only, and its end is recorded there only.
+    #[test]
+    fn bundle_is_recorded_only_in_its_two_pools() {
+        let mut file = PoolFile {
+            pools: vec![entry(1, Asset::Rd, &[]), entry(1, Asset::Dfabi, &[]), entry(2, Asset::Rd, &[]), entry(2, Asset::Dfabi, &[])],
+            carriers: BTreeMap::new(),
+        };
+        record_start(&mut file, [key(1, Asset::Rd), key(2, Asset::Rd)], "s").unwrap();
+        record_end(&mut file, "s", &BundleEnd::Finalized(8, "c0ffee".into()));
+        let listed = |k| ids(file.get(k).unwrap().bundles.clone());
+        assert_eq!(listed(key(1, Asset::Rd)), [("s".to_string(), 8)]);
+        assert_eq!(listed(key(2, Asset::Rd)), [("s".to_string(), 8)]);
+        assert!(listed(key(1, Asset::Dfabi)).is_empty() && listed(key(2, Asset::Dfabi)).is_empty());
+        assert_eq!(ids(file.finalized(Asset::Rd)), [("s".to_string(), 8)]);
+        assert!(file.finalized(Asset::Dfabi).is_empty());
+        assert!(record_start(&mut file, [key(1, Asset::Rd), key(9, Asset::Rd)], "t").is_err(), "a pool the file does not know");
+    }
+
+    fn moved(id: &str, received: u128, paid: u128, leg0: bool) -> Moved {
+        Moved { bundle: BundleRef { id: id.into(), height: 7 }, received, paid, leg0 }
+    }
+
+    /// `(bundle, asset, direction, amount, fee)` of every row, sorted.
+    fn rows(wallet: &serde_json::Value) -> Vec<[String; 5]> {
+        let text = |item: &serde_json::Value, field: &str| item[field].as_str().unwrap().to_owned();
+        let mut rows: Vec<_> = wallet["items"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|i| [text(i, "bundle_id"), text(i, "asset"), text(i, "direction"), text(i, "amount"), text(i, "fee")])
+            .collect();
+        rows.sort();
+        rows
+    }
+
+    fn row(fields: [&str; 5]) -> [String; 5] {
+        fields.map(str::to_owned)
+    }
+
+    /// Balances add up over the asset's pools; a split pay (one bundle in both RD pools) is one row, not two.
+    #[test]
+    fn wallet_sums_pools_per_asset() {
+        // P pays 9 RD split 5 + 4: leg 0 in lane 1 from a note of 10 (change 4, fee 1), leg 1 in lane 2 from a note of 6 (change 2).
+        let views = [
+            PoolView { asset: Asset::Rd, balance: 3, moved: vec![moved("s", 4, 10, true)] },
+            PoolView { asset: Asset::Rd, balance: 4, moved: vec![moved("s", 2, 6, false)] },
+            PoolView { asset: Asset::Dfabi, balance: 0, moved: vec![moved("s", 0, 0, false)] },
+        ];
+        let wallet = wallet_value("bank-a", &views, &BTreeMap::from([("s".to_owned(), "c0ffee".to_owned())]));
+        assert_eq!(wallet["party"], "bank-a");
+        assert_eq!(wallet["balances"], serde_json::json!({ "rd": "7", "dfabi": "0" }));
+        assert_eq!(rows(&wallet), [row(["s", "rd", "out", "9", "1"])]);
+        assert_eq!(wallet["items"][0]["carrier_tx"], "c0ffee");
+        assert_eq!(wallet["items"][0]["height"], 7);
+    }
+
+    /// The payer of leg 0 pays the sponsor's reimbursement in leg 0's asset, whichever asset that is.
+    #[test]
+    fn fee_marks_leg0_payer_any_asset() {
+        let none = BTreeMap::new();
+        // A DvP with DFABI in leg 0: the seller pays 7 DFABI (+1) from a note of 50 and receives 5 RD in leg 1.
+        let seller = [
+            PoolView { asset: Asset::Dfabi, balance: 42, moved: vec![moved("d", 42, 50, true)] },
+            PoolView { asset: Asset::Rd, balance: 5, moved: vec![moved("d", 5, 0, false)] },
+        ];
+        assert_eq!(rows(&wallet_value("q", &seller, &none)), [row(["d", "dfabi", "out", "7", "1"]), row(["d", "rd", "in", "5", "0"])]);
+        // The buyer pays 5 RD in leg 1 (no fee) and receives the 7 DFABI in the leg-0 pool (a recipient pays no fee).
+        let buyer = [
+            PoolView { asset: Asset::Rd, balance: 15, moved: vec![moved("d", 15, 20, false)] },
+            PoolView { asset: Asset::Dfabi, balance: 7, moved: vec![moved("d", 7, 0, true)] },
+        ];
+        assert_eq!(rows(&wallet_value("p", &buyer, &none)), [row(["d", "dfabi", "in", "7", "0"]), row(["d", "rd", "out", "5", "0"])]);
+        // The same with RD in leg 0: the buyer's RD row carries the fee.
+        let buyer = [PoolView { asset: Asset::Rd, balance: 14, moved: vec![moved("e", 14, 20, true)] }];
+        assert_eq!(rows(&wallet_value("p", &buyer, &none)), [row(["e", "rd", "out", "5", "1"])]);
+        // BI's companion as leg 0 (BI -> BI 1, plus the fee): only the fee moved, so no row.
+        let bi = [PoolView { asset: Asset::Dfabi, balance: 99, moved: vec![moved("c", 99, 100, true)] }];
+        assert!(rows(&wallet_value("bi", &bi, &none)).is_empty());
     }
 }
