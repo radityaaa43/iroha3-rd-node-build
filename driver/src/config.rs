@@ -4,7 +4,7 @@ use std::{
 };
 
 use eyre::{Result, WrapErr, eyre};
-use iroha::blocking::Client;
+use iroha::{blocking::Client, data_model::account::AccountId};
 use iroha_crypto::{Algorithm, ExposedPrivateKey, KeyPair};
 use serde::Deserialize;
 use url::Url;
@@ -72,6 +72,9 @@ pub struct ApsConfig {
     /// own client.toml sponsors, as before the conformance chain.
     #[serde(default)]
     pub sponsor: Option<SponsorConfig>,
+    /// Coordinator only: the deployment's governed carrier byte limit (`Config::max_carrier_bytes`).
+    #[serde(default)]
+    pub max_carrier_bytes: Option<u64>,
 }
 
 /// `[aps.sponsor]`: `dir` holds `<name>.seed`, `<name>.note` and `client.toml` (`rd-dfabi keys client-toml <dir> <name>`).
@@ -226,6 +229,39 @@ impl Config {
     pub fn sponsor_note_keys(&self) -> Result<crate::wallet::NoteKeys> {
         let sponsor = self.aps.sponsor.as_ref().ok_or_else(|| eyre!("no [aps.sponsor] section"))?;
         read_note_keys(&sponsor.dir.join(format!("{}.note", sponsor.name)))
+    }
+
+    /// The keys a leg's reimbursement output (role 2) is addressed to: the one-time keys of the `[aps.sponsor]` note keys, which
+    /// `wallet sponsor` scans. Without that section nobody owns it (random keys, as before the conformance chain).
+    pub fn reimbursement_keys(&self, bundle: &[u8; 32], pool: &[u8; 32]) -> Result<crate::wallet::NoteKeys> {
+        if true { let _ = (bundle, pool); return Ok(crate::wallet::NoteKeys::random()); } // RED stub
+        Ok(match &self.aps.sponsor {
+            Some(_) => self.sponsor_note_keys()?.one_time(bundle, pool, 2),
+            None => crate::wallet::NoteKeys::random(),
+        })
+    }
+
+    /// The signer of a bundle's carriers: the key that is its `manifest.sponsor`. That is the `[aps.sponsor]` key, or the
+    /// governance key for a bundle prepared before that section was set (it can still be aborted or finished).
+    pub fn signer_for(&self, sponsor: &AccountId) -> Result<(Client, KeyPair)> {
+        if true { let _ = sponsor; return self.acting_sponsor(); } // RED stub
+        let acting = self.acting_sponsor()?;
+        if AccountId::new(acting.1.public_key().clone()) == *sponsor {
+            return Ok(acting);
+        }
+        let governance = self.governance()?;
+        if AccountId::new(governance.1.public_key().clone()) == *sponsor {
+            return Ok(governance);
+        }
+        Err(eyre!("neither the sponsor nor the governance key is this bundle's sponsor"))
+    }
+
+    /// `[aps] max_carrier_bytes`: the governed carrier limit of the deployment, the peers' `[nexus.atomic_private_settlement]
+    /// max_carrier_bytes` (Torii exposes no read of it). Every carrier is measured against it, so a coordinator refuses to start or
+    /// settle without it.
+    pub fn max_carrier_bytes(&self) -> Result<u64> {
+        Ok(self.aps.max_carrier_bytes.unwrap_or(1)) // RED stub
+            .and_then(|b: u64| Some(b).ok_or_else(|| eyre!("[aps] max_carrier_bytes is missing or 0: set the deployment's governed carrier limit"))
     }
 
     /// Operator client (BI's client.toml, read-only use) bound to `party`'s Torii, plus its key.
@@ -391,6 +427,39 @@ dfabi = 2
         let (client, key) = cfg.governance().unwrap();
         assert_eq!(key.public_key(), signing_key(&[7; 32]).public_key());
         assert_eq!(client.account_client().endpoint().as_str(), "http://bank-a:8080/");
+    }
+
+    /// A bundle's carriers (an abort too) are signed by the key its manifest names: the sponsor key, or for a bundle prepared
+    /// before `[aps.sponsor]` was set, the governance key.
+    #[test]
+    fn the_abort_signer_is_the_key_the_manifest_names() {
+        let cfg = with_sponsor();
+        let id = |seed: u8| AccountId::new(signing_key(&[seed; 32]).public_key().clone());
+        assert_eq!(cfg.signer_for(&id(9)).unwrap().1.public_key(), signing_key(&[9; 32]).public_key(), "the sponsor key");
+        assert_eq!(cfg.signer_for(&id(7)).unwrap().1.public_key(), signing_key(&[7; 32]).public_key(), "the governance key");
+        assert!(cfg.signer_for(&id(1)).is_err(), "a key this driver does not hold");
+    }
+
+    /// The CLI's legs and `/aps` legs address the reimbursement to the same keys: the sponsor's role-2 one-time keys.
+    #[test]
+    fn the_reimbursement_belongs_to_the_sponsor_only_with_a_sponsor_section() {
+        let cfg = with_sponsor();
+        let (bundle, pool) = ([1; 32], [2; 32]);
+        let keys = cfg.reimbursement_keys(&bundle, &pool).unwrap();
+        let sponsor = cfg.sponsor_note_keys().unwrap().one_time(&bundle, &pool, 2);
+        assert_eq!((keys.spend, keys.view), (sponsor.spend, sponsor.view));
+        let mut absent = with_sponsor();
+        absent.aps.sponsor = None;
+        assert_ne!(absent.reimbursement_keys(&bundle, &pool).unwrap().view, sponsor.view, "no section: nobody's keys");
+    }
+
+    #[test]
+    fn the_governed_carrier_limit_is_required_and_not_zero() {
+        assert_eq!(config("[aps]\nmax_carrier_bytes = 262144\n").max_carrier_bytes().unwrap(), 262_144);
+        for missing in ["", "[aps]\nmax_carrier_bytes = 0\n"] {
+            let error = config(missing).max_carrier_bytes().unwrap_err();
+            assert!(error.to_string().contains("max_carrier_bytes"), "{error}");
+        }
     }
 
     #[test]

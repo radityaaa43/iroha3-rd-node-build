@@ -148,6 +148,8 @@ pub trait ApsBackend: Send + Sync {
     fn merge_bundles(&self, lists: &BundleLists) -> Result<()>;
     /// The own `wallet_json`.
     fn wallet(&self) -> Result<serde_json::Value>;
+    /// Coordinator start: carry every bundle a previous run left in flight to its end (`pools::resume_all`).
+    fn resume_all(&self) -> Result<()>;
 }
 
 /// One HTTP call to another party's gateway; `target` is a base URL, the answer `(status, body)`.
@@ -432,6 +434,15 @@ pub struct Aps<'a> {
 impl<'a> Aps<'a> {
     pub fn new(backend: &'a dyn ApsBackend, peer: &'a dyn Peer, cfg: ApsConfig) -> Self {
         Self { backend, peer, cfg, intents: IntentStore::default(), submit_lock: Mutex::new(()), prove_lock: Mutex::new(()) }
+    }
+
+    /// Coordinator start: the bundles a previous run left in flight finish before any new submit (`submit_lock`). `locked` runs
+    /// once the lock is held, so the caller starts serving only then (`/healthz` answers meanwhile).
+    pub fn resume(&self, locked: impl FnOnce()) {
+        locked(); // RED stub: no lock
+        if let Err(e) = self.backend.resume_all() {
+            eprintln!("resume failed: {}", safe(&e));
+        }
     }
 
     /// Answer one `/aps/*` request: `(HTTP status, JSON body)`.
@@ -811,6 +822,8 @@ pub(crate) mod testkit {
         pub caps: Vec<(u32, Capacity)>,
         /// `is_leg_pool` answers false: the leg's lane/asset are not the manifest's pool.
         pub foreign_pool: AtomicBool,
+        /// How long `resume_all` takes.
+        pub resume_delay: Duration,
     }
 
     impl FakeBackend {
@@ -894,6 +907,12 @@ pub(crate) mod testkit {
         fn wallet(&self) -> Result<serde_json::Value> {
             self.note("wallet")?;
             Ok(serde_json::json!({ "party": "fake", "balances": { "rd": "5", "dfabi": "6" }, "items": [] }))
+        }
+
+        /// Listed when it ends.
+        fn resume_all(&self) -> Result<()> {
+            std::thread::sleep(self.resume_delay);
+            self.note("resume_all")
         }
     }
 
@@ -1266,6 +1285,25 @@ mod tests {
         let aps = Aps::new(&backend, &peer, coordinator());
         let (status, response) = aps.route("POST", "/aps/submit", &pay_body(&id(1), "rd", &account(8), &account(9), "5"));
         assert_eq!((status, json(&response)), (200, serde_json::json!({ "outcome": "aborted", "bundle_id": id(0xbb), "carrier_tx": null, "height": null })));
+    }
+
+    /// A restarted coordinator finishes the bundle it left in flight before it starts a new one.
+    #[test]
+    fn submit_waits_for_resumed_bundle() {
+        let backend = FakeBackend { resume_delay: Duration::from_millis(300), ..driver(7) };
+        let peer = FakePeer::standard();
+        let aps = Aps::new(&backend, &peer, coordinator());
+        let started = std::time::Instant::now();
+        std::thread::scope(|scope| {
+            let (locked, held) = std::sync::mpsc::channel();
+            scope.spawn(|| aps.resume(|| locked.send(()).unwrap()));
+            held.recv().unwrap();
+            std::thread::sleep(Duration::from_millis(50));
+            let (status, _) = aps.route("POST", "/aps/submit", &pay_body(&id(1), "rd", &account(8), &account(9), "5"));
+            assert_eq!(status, 200);
+            assert!(started.elapsed() >= Duration::from_millis(300), "the submit ran during the resume: {:?}", started.elapsed());
+        });
+        assert_eq!(calls(&backend).first().copied(), Some("resume_all"), "{:?}", calls(&backend));
     }
 
     #[test]

@@ -44,10 +44,12 @@ use crate::{
         bounded_fee, committee, dec, enc, funding_with_secret, govern_until, on_big_stack, peak_rss, prepare_leg,
         proof_manifest, rnd, settle,
     },
+    aps_real::{decode_prepared, encode_prepared},
     aps_split::{LegPayer, OutputKey, prepare_leg_split},
     auditor::Keys,
     config::{Config, signing_key},
     history::PoolHistory,
+    inflight::{self, Inflight, Phase},
     plan::{self, Capacity, PlanError, PlannedLeg, Request},
     wallet::{pick_notes, scan},
 };
@@ -285,7 +287,7 @@ pub fn fill_kept_heights(cfg: &Config) -> Result<()> {
     let (client, _) = cfg.acting_sponsor()?;
     let mut heights = BTreeMap::new();
     for id in kept {
-        if let Some(receipt) = finalized_receipt(&client, &receipt_cache(cfg), &id)? {
+        if let Some(receipt) = finalized_receipt(&client, &receipt_cache(cfg), &id, 0)? {
             heights.insert(id, receipt.finalized_height);
         }
     }
@@ -312,7 +314,7 @@ impl PoolRecord {
         let mut history = PoolHistory::new(pool_id, &origin)?;
         let mut finalized = Vec::new();
         for bundle in &self.bundles {
-            if let Some(receipt) = finalized_receipt(client, cache, &bundle.id)? {
+            if let Some(receipt) = finalized_receipt(client, cache, &bundle.id, bundle.height)? {
                 finalized.push(receipt);
             }
         }
@@ -329,10 +331,11 @@ impl PoolRecord {
     }
 }
 
-/// A finalized receipt is immutable public data: cached on disk once read.
-fn finalized_receipt(client: &Client, cache: &Path, id: &str) -> Result<Option<PrivateSettlementReceiptV1>> {
+/// A finalized receipt is immutable public data: cached on disk once read. The cached copy is used only when it is the receipt of
+/// bundle `id` at the finalized `height` the pools file records (0 = not known yet: always read); else it is read and overwritten.
+fn finalized_receipt(client: &Client, cache: &Path, id: &str, height: u64) -> Result<Option<PrivateSettlementReceiptV1>> {
     let file = cache.join(format!("{id}.norito.hex"));
-    if let Some(receipt) = read_cached(&file)? {
+    if let Some(receipt) = read_cached(&file, id, height)? {
         return Ok(Some(receipt));
     }
     match client.client().private_settlement_bundle_receipt_v1(Hash::prehashed(hex32(id)?))? {
@@ -344,9 +347,11 @@ fn finalized_receipt(client: &Client, cache: &Path, id: &str) -> Result<Option<P
     }
 }
 
-fn read_cached(file: &Path) -> Result<Option<PrivateSettlementReceiptV1>> {
-    // A missing or damaged file is a miss: the caller refetches and rewrites it.
-    Ok(std::fs::read_to_string(file).ok().and_then(|text| dec(text.trim()).ok()))
+fn read_cached(file: &Path, id: &str, height: u64) -> Result<Option<PrivateSettlementReceiptV1>> {
+    // A missing, damaged or foreign file is a miss: the caller refetches and rewrites it.
+    let cached = std::fs::read_to_string(file).ok().and_then(|text| dec::<PrivateSettlementReceiptV1>(text.trim()).ok());
+    let _ = (id, height);
+    Ok(cached) // RED stub
 }
 
 /// Write via a temp file and rename, so a reader never sees half a file. The temp name is random:
@@ -684,7 +689,11 @@ fn run_bundle(cfg: &Config, legs: [PlannedLeg; 2], options: &Options, kind: &str
             amount: leg.amount,
         };
         let (bundle, pool) = (*manifest.bundle_id.as_ref(), *governed[ordinal].governance.body.pool_id.as_ref());
-        let notes = LegNotes { recipient: cfg.note_keys(&recipient)?.one_time(&bundle, &pool, 0), change: keys.one_time(&bundle, &pool, 1) };
+        let notes = LegNotes {
+            recipient: cfg.note_keys(&recipient)?.one_time(&bundle, &pool, 0),
+            change: keys.one_time(&bundle, &pool, 1),
+            sponsor: cfg.reimbursement_keys(&bundle, &pool)?,
+        };
         let spend = Spend::Continue { opening: note.opening, secret: keys.spend, tree: history.tree, epoch: history.epoch, extra };
         let authority_digest = committees[ordinal].authority.digest()?;
         prepared.push(on_big_stack(|| {
@@ -692,7 +701,7 @@ fn run_bundle(cfg: &Config, legs: [PlannedLeg; 2], options: &Options, kind: &str
         })?);
         println!("leg {ordinal} proved after {:?} {}", started.elapsed(), peak_rss());
     }
-    settle_recorded(cfg, &sponsor, pool_keys, manifest, &prepared, &governed, &committees, started, options)?;
+    settle_recorded(cfg, pool_keys, manifest, &prepared, &governed, &committees, started, options)?;
     println!("kind={kind}");
     Ok(())
 }
@@ -707,12 +716,11 @@ fn committees_of(cfg: &Config, governed: &[Governed]) -> Result<Vec<Committee>> 
         .collect()
 }
 
-/// List the bundle as in flight in the two pools it touches (recorded before submission, so a finalized bundle is never lost),
-/// settle it, record how it ended.
+/// List the bundle as in flight in the two pools it touches (recorded before submission, so a finalized bundle is never lost) and
+/// in `inflight/` (so a restarted coordinator carries it on), settle it, record how it ended.
 #[allow(clippy::too_many_arguments)]
 fn settle_recorded(
     cfg: &Config,
-    sponsor: &Client,
     keys: [PoolKey; 2],
     manifest: AtomicPrivateSettlementV1,
     prepared: &[AtomicPrivateSettlementPreparedLegV1],
@@ -721,12 +729,68 @@ fn settle_recorded(
     started: Instant,
     options: &Options,
 ) -> Result<Option<(String, u64)>> {
+    // Refused before anything is recorded: every carrier is measured against the governed limit.
+    cfg.max_carrier_bytes()?;
     let id = hex::encode(manifest.bundle_id.as_ref());
     PoolFile::update(&cfg.pools_file, |pools| record_start(pools, keys, &id))?;
+    let legs = prepared.iter().map(encode_prepared).collect::<Result<Vec<_>>>()?;
+    let mut state = Inflight { bundle_id: id.clone(), keys, manifest: enc(&manifest)?, prepared: legs, phase: Phase::Proved };
+    let dir = inflight::dir(cfg);
+    inflight::save(&dir, &state)?;
     let aborted = Cell::new(false);
-    let outcome = settle(cfg, sponsor, manifest, prepared, governed, committees, started, options, &aborted);
-    let end = bundle_end(&outcome, aborted.get());
-    PoolFile::update(&cfg.pools_file, |pools| Ok(record_end(pools, &id, &end)))?;
+    let outcome = settle(cfg, manifest, prepared, governed, committees, started, options, &aborted, &mut |phase, manifest| {
+        state.phase = phase;
+        state.manifest = enc(manifest)?;
+        inflight::save(&dir, &state)
+    });
+    record_ended(cfg, &id, &bundle_end(&outcome, aborted.get()))?;
+    outcome
+}
+
+/// Record how a bundle ended. Once it has an end (anything but `Kept`) it is no longer in flight.
+fn record_ended(cfg: &Config, id: &str, end: &BundleEnd) -> Result<()> {
+    PoolFile::update(&cfg.pools_file, |pools| Ok(record_end(pools, id, end)))?;
+    if !matches!(end, BundleEnd::Kept) {
+        inflight::remove(&inflight::dir(cfg), id)?;
+    }
+    Ok(())
+}
+
+/// Coordinator start (`server::run`, under the submit lock): carry every bundle a previous run left in flight to its end, one
+/// after the other. A bundle that fails stays in `inflight/` for the next start. Logs name opaque ids, phases and heights only.
+pub(crate) fn resume_all(cfg: &Config) -> Result<()> {
+    for f in inflight::load_all(&inflight::dir(cfg))? {
+        let (id, phase) = (f.bundle_id.clone(), f.phase);
+        eprintln!("resume bundle={id} phase={phase:?}");
+        match resume(cfg, f) {
+            Ok(Some((_, height))) => eprintln!("resume bundle={id}: finalized height={height}"),
+            Ok(None) => eprintln!("resume bundle={id}: ended, nothing moved"),
+            Err(error) => eprintln!("resume bundle={id} failed, kept for the next start: {error:#}"),
+        }
+    }
+    Ok(())
+}
+
+/// One bundle a previous run left in flight: a bundle the nodes already ended is only recorded; one that never reached Prepare is
+/// dropped (nothing reserved, its sidecars expire); else the phases after `f.phase` run on the certificates the nodes hold
+/// (`recover_or_*`), never on local files.
+pub(crate) fn resume(cfg: &Config, f: Inflight) -> Result<Option<(String, u64)>> {
+    let pools = PoolFile::load(&cfg.pools_file)?;
+    let governed = leg_pools(&pools, f.keys)?;
+    let committees = committees_of(cfg, &governed)?;
+    let manifest: AtomicPrivateSettlementV1 = dec(&f.manifest)?;
+    let prepared = f.prepared.iter().map(|leg| decode_prepared(leg)).collect::<Result<Vec<_>>>()?;
+    let (id, phase) = (f.bundle_id.clone(), f.phase);
+    let mut state = f;
+    let dir = inflight::dir(cfg);
+    let aborted = Cell::new(false);
+    let ended = crate::aps::resume_bundle(cfg, manifest, &prepared, &governed, &committees, phase, &aborted, &mut |phase, manifest| {
+        state.phase = phase;
+        state.manifest = enc(manifest)?;
+        inflight::save(&dir, &state)
+    });
+    let outcome = ended.map(|ended| ended.and_then(|s| (s.outcome == "finalized").then_some((s.carrier_tx, s.height))));
+    record_ended(cfg, &id, &bundle_end(&outcome, aborted.get()))?;
     outcome
 }
 
@@ -798,11 +862,10 @@ pub(crate) fn settle_bundle(
     prepared: &[AtomicPrivateSettlementPreparedLegV1],
 ) -> Result<Option<(String, u64)>> {
     let pools = PoolFile::load(&cfg.pools_file)?;
-    let (sponsor, _) = cfg.acting_sponsor()?;
     let governed = leg_pools(&pools, keys)?;
     let committees = committees_of(cfg, &governed)?;
     let options = Options { expect: Expect::Either, replay: false };
-    settle_recorded(cfg, &sponsor, keys, manifest, prepared, &governed, &committees, Instant::now(), &options)
+    settle_recorded(cfg, keys, manifest, prepared, &governed, &committees, Instant::now(), &options)
 }
 
 /// One leg as `POST /aps/leg` hands it to the payer.
@@ -884,8 +947,11 @@ fn bundle_end(outcome: &Result<Option<(String, u64)>>, aborted: bool) -> BundleE
 }
 
 fn record_end(pools: &mut PoolFile, id: &str, end: &BundleEnd) {
+    // Empty: a resumed bundle the nodes had already finalized, whose carrier tx an earlier run submitted.
     if let BundleEnd::Finalized(_, carrier_tx) = end {
-        pools.carriers.insert(id.to_owned(), carrier_tx.clone());
+        if !carrier_tx.is_empty() {
+            pools.carriers.insert(id.to_owned(), carrier_tx.clone());
+        }
     }
     for entry in &mut pools.pools {
         let bundles = &mut entry.record.bundles;
@@ -1035,7 +1101,7 @@ pub fn abort_bundle(cfg: &Config, bundle: &str) -> Result<()> {
     let (sponsor, _) = cfg.acting_sponsor()?;
     let status = sponsor.client().private_settlement_bundle_status_v1(Hash::prehashed(hex32(bundle)?))?;
     let manifest = status.manifest.ok_or_else(|| eyre!("the node retains no manifest for this bundle"))?;
-    crate::aps::abort_bundle(cfg, sponsor.client(), &manifest)?;
+    crate::aps::abort_bundle(cfg, &manifest)?;
     println!("aborted bundle={bundle}");
     Ok(())
 }
@@ -1082,7 +1148,29 @@ mod tests {
         std::fs::create_dir_all(&cache).unwrap();
         let file = cache.join("x.norito.hex");
         std::fs::write(&file, "not a receipt").unwrap();
-        assert!(read_cached(&file).unwrap().is_none());
+        assert!(read_cached(&file, "x", 1).unwrap().is_none());
+        std::fs::remove_dir_all(cache).unwrap();
+    }
+
+    /// A cached receipt is used only for the bundle and finalized height the pools file records; anything else is read again.
+    #[test]
+    fn a_cached_receipt_of_another_bundle_or_height_is_a_miss() {
+        let cache = temp_dir();
+        let manifest = crate::aps::test_manifest();
+        let id = hex::encode(manifest.bundle_id.as_ref());
+        let receipt = PrivateSettlementReceiptV1 {
+            version: iroha::data_model::nexus::ATOMIC_PRIVATE_SETTLEMENT_VERSION_V1,
+            manifest,
+            authority_catalog: iroha::data_model::nexus::PrivateSettlementAuthorityCatalogV1 { rosters: Vec::new(), leg_roster_indices: Vec::new() },
+            legs: Vec::new(),
+            finalized_height: 9,
+        };
+        let file = cache.join(format!("{id}.norito.hex"));
+        store_cached(&cache, &file, &enc(&receipt).unwrap()).unwrap();
+        assert_eq!(read_cached(&file, &id, 9).unwrap(), Some(receipt));
+        assert!(read_cached(&file, &id, 8).unwrap().is_none(), "another height");
+        assert!(read_cached(&file, &id, 0).unwrap().is_none(), "height not known yet");
+        assert!(read_cached(&file, &"ab".repeat(32), 9).unwrap().is_none(), "another bundle's receipt under this name");
         std::fs::remove_dir_all(cache).unwrap();
     }
 

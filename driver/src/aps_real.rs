@@ -22,7 +22,6 @@ use crate::{
     config::{Config, signing_key},
     plan::Capacity,
     pools::{self, Asset, PoolKey},
-    wallet::NoteKeys,
 };
 
 /// Reads the config without a lock: a guard held across a leg proof (~12 s) or a settle (~80 s) made BI's `GET /aps/bundles`
@@ -67,11 +66,11 @@ fn from_wire(authority: &str, view_public: &str, authorization: &str, active: bo
 
 /// `AtomicPrivateSettlementPreparedLegV1` is a native client-side value without a norito codec: on the wire it is
 /// `statement.proof.capsule`, each hex, and the delta is derived again on the way in (`complete_..._prepared_leg_v1`).
-fn encode_prepared(leg: &AtomicPrivateSettlementPreparedLegV1) -> Result<String> {
+pub(crate) fn encode_prepared(leg: &AtomicPrivateSettlementPreparedLegV1) -> Result<String> {
     Ok(format!("{}.{}.{}", enc(&leg.statement)?, hex::encode(&leg.proof), enc(&leg.audit_capsule)?))
 }
 
-fn decode_prepared(text: &str) -> Result<AtomicPrivateSettlementPreparedLegV1> {
+pub(crate) fn decode_prepared(text: &str) -> Result<AtomicPrivateSettlementPreparedLegV1> {
     let parts: Vec<&str> = text.split('.').collect();
     let [statement, proof, capsule] = parts.as_slice() else {
         bail!("prepared leg: expected statement.proof.capsule");
@@ -106,7 +105,7 @@ impl ApsBackend for RealBackend<'_> {
         let ctx = output_ctx(ctx)?;
         let (_, sponsor_key) = cfg.acting_sponsor()?;
         // The sponsor owns its reimbursement (role 2, as `wallet sponsor` scans); with no `[aps.sponsor]` yet nobody can spend it.
-        let notes = if cfg.aps.sponsor.is_some() { cfg.sponsor_note_keys()?.one_time(&bundle, &pool, 2) } else { NoteKeys::random() };
+        let notes = cfg.reimbursement_keys(&bundle, &pool)?;
         let key = aps_split::sign_output_key(&sponsor_key, &ctx, 2, PrivateSettlementAuditOutputRoleV1::SponsorReimbursement, &notes, active)?;
         let key = to_wire(key)?;
         Ok(SponsorOutput { authority: key.authority, view_public: key.view_public, authorization: key.authorization, active })
@@ -210,6 +209,10 @@ impl ApsBackend for RealBackend<'_> {
         let cfg = self.cfg();
         pools::wallet_json(&cfg, &cfg.party)
     }
+
+    fn resume_all(&self) -> Result<()> {
+        pools::resume_all(self.cfg())
+    }
 }
 
 #[cfg(test)]
@@ -223,6 +226,7 @@ mod tests {
     use iroha_model_base::topology::{DataSpaceId, LaneId};
 
     use super::*;
+    use crate::wallet::NoteKeys;
 
     fn config_in(dir: &Path) -> Config {
         let text = format!(

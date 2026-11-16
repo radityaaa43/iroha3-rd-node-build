@@ -45,6 +45,7 @@ mod mint;
 mod mint_finality;
 mod server;
 mod http;
+mod inflight;
 mod plan;
 mod pools;
 mod tls_http;
