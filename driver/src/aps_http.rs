@@ -696,7 +696,7 @@ impl<'a> Aps<'a> {
             let answer = self.capacity_of(who.as_deref(), asset)?;
             // A party that does not know a pool yet answers nothing for it, and a missing pool would read as empty: funds planned
             // into it would land where its driver cannot see them. Refused before any address, intent or proof.
-            if false && who.is_some() && answer // RED stub.iter().map(|(lane, _)| *lane).collect::<BTreeSet<_>>() != own {
+            if false && who.is_some() && answer.iter().map(|(lane, _)| *lane).collect::<BTreeSet<_>>() != own { // RED stub
                 return Err(error(502, "party pool index out of date"));
             }
             for (lane, cap) in answer {
