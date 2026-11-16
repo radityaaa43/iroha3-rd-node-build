@@ -402,12 +402,28 @@ fn origin_note_file(cfg: &Config, key: PoolKey) -> PathBuf {
     if !current.exists() && key.lane == lane_of(cfg, key.asset) && legacy.exists() { legacy } else { current }
 }
 
-/// BI's origin (reserve) note of a pool; other parties have none.
-fn origin_notes(cfg: &Config, party: &str, asset: Asset) -> Result<Vec<PrivateSettlementAuditNoteOpeningV1>> {
+/// BI's origin (reserve) note of the pool `key`; other parties have none.
+fn origin_notes(cfg: &Config, party: &str, key: PoolKey) -> Result<Vec<PrivateSettlementAuditNoteOpeningV1>> {
     if party != "bi" {
         return Ok(Vec::new());
     }
-    Ok(vec![dec(std::fs::read_to_string(origin_note_file(cfg, PoolKey { lane: lane_of(cfg, asset), asset }))?.trim())?])
+    Ok(vec![dec(std::fs::read_to_string(origin_note_file(cfg, PoolKey { lane: lane_of(cfg, key.asset), asset: key.asset }))?.trim())?])
+}
+
+/// The values of `party`'s unspent notes in each pool of `asset`, by lane (`POST /aps/capacity`).
+pub(crate) fn unspent_values(cfg: &Config, party: &str, asset: Asset) -> Result<Vec<(u32, Vec<u128>)>> {
+    let pools = PoolFile::load(&cfg.pools_file)?;
+    let (client, _) = cfg.sponsor(party)?;
+    let keys = cfg.note_keys(party)?;
+    pools
+        .keys(asset)
+        .into_iter()
+        .map(|key| {
+            let history = pools.get(key)?.history(&client, &receipt_cache(cfg))?;
+            let (unspent, _) = scan(&history, &keys, &origin_notes(cfg, party, key)?)?;
+            Ok((key.lane, unspent.iter().map(|note| note.opening.value).collect()))
+        })
+        .collect()
 }
 
 fn lane_of(cfg: &Config, asset: Asset) -> u32 {
@@ -635,7 +651,7 @@ fn run_bundle(cfg: &Config, legs: [LegSpec; 2], options: &Options, kind: &str) -
         let record = pools.sole(leg.asset)?;
         let history = record.history(&sponsor, &receipt_cache(cfg))?;
         let keys = cfg.note_keys(&leg.payer)?;
-        let (unspent, _) = scan(&history, &keys, &origin_notes(cfg, &leg.payer, leg.asset)?)?;
+        let (unspent, _) = scan(&history, &keys, &origin_notes(cfg, &leg.payer, PoolKey { lane: lane_of(cfg, leg.asset), asset: leg.asset })?)?;
         let reimbursement = if ordinal == 0 { SPONSOR_REIMBURSEMENT } else { 0 };
         // Refused before any proving or on-chain write; no amounts in the message (logs).
         let note = pick_note(&unspent, leg.amount + reimbursement)
@@ -719,18 +735,20 @@ fn settle_recorded(
     outcome
 }
 
-/// What the coordinator fixes before any party signs or proves: the manifest and, per leg ([rd, dfabi]), its route, pool and committee digest.
+/// What the coordinator fixes before any party signs or proves: the manifest and, per leg (by lane), its pool key, route, pool id
+/// and committee digest.
 pub(crate) struct BundleStart {
     pub manifest: AtomicPrivateSettlementV1,
     pub salt: [u8; 32],
-    pub legs: Vec<(PrivateSettlementRouteV1, [u8; 32], Hash)>,
+    pub legs: Vec<(PoolKey, PrivateSettlementRouteV1, [u8; 32], Hash)>,
 }
 
-/// Coordinator: the manifest of a new bundle over the RD and DFABI pools (`run_bundle` up to the legs, with no payer's secret).
-pub(crate) fn begin_bundle(cfg: &Config) -> Result<BundleStart> {
+/// Coordinator: the manifest of a new bundle over the two planned pools (`run_bundle` up to the legs, with no payer's secret).
+pub(crate) fn begin_bundle(cfg: &Config, keys: [PoolKey; 2]) -> Result<BundleStart> {
+    ensure!(keys[0].lane < keys[1].lane, "a bundle has one leg per lane, sorted by lane");
     let pools = PoolFile::load(&cfg.pools_file)?;
     let (sponsor, sponsor_key) = cfg.acting_sponsor()?;
-    let governed = [pools.sole(Asset::Rd)?.governed()?, pools.sole(Asset::Dfabi)?.governed()?];
+    let governed = [pools.get(keys[0])?.governed()?, pools.get(keys[1])?.governed()?];
     let committees = committees_of(cfg, &governed)?;
     let network_id = *sponsor.client().network_id();
     let height = sponsor.client().get_privacy_capabilities()?.committed_height;
@@ -744,12 +762,12 @@ pub(crate) fn begin_bundle(cfg: &Config) -> Result<BundleStart> {
         &governed,
         salt,
     )?;
-    let legs = governed
+    let legs = keys
         .iter()
-        .zip(&committees)
-        .map(|(g, c)| {
+        .zip(governed.iter().zip(&committees))
+        .map(|(key, (g, c))| {
             let pool: [u8; 32] = *g.governance.body.pool_id.as_ref();
-            Ok((g.route, pool, c.authority.digest()?))
+            Ok((*key, g.route, pool, c.authority.digest()?))
         })
         .collect::<Result<Vec<_>>>()?;
     Ok(BundleStart { manifest, salt, legs })
@@ -786,7 +804,7 @@ pub(crate) fn prove_split_leg(cfg: &Config, payer: &str, asset: Asset, leg: &Spl
     let (client, _) = cfg.sponsor(payer)?;
     let history = record.history(&client, &receipt_cache(cfg))?;
     let keys = cfg.note_keys(payer)?;
-    let (unspent, _) = scan(&history, &keys, &origin_notes(cfg, payer, asset)?)?;
+    let (unspent, _) = scan(&history, &keys, &origin_notes(cfg, payer, PoolKey { lane: lane_of(cfg, asset), asset })?)?;
     let reimbursement = if leg.ordinal == 0 { SPONSOR_REIMBURSEMENT } else { 0 };
     // Refused before any proving; no amounts in the message (logs).
     let mut notes = pick_notes(&unspent, leg.amount + reimbursement)
@@ -874,7 +892,7 @@ pub fn wallet_json(cfg: &Config, party: &str) -> Result<serde_json::Value> {
         for key in pools.keys(asset) {
             let record = pools.get(key)?;
             let history = record.history(&client, &receipt_cache(cfg))?;
-            let (unspent, spent) = scan(&history, &keys, &origin_notes(cfg, party, asset)?)?;
+            let (unspent, spent) = scan(&history, &keys, &origin_notes(cfg, party, key)?)?;
             balance += unspent.iter().map(|n| n.opening.value).sum::<u128>();
             for bundle in &record.bundles {
                 let received: u128 = unspent
@@ -1352,6 +1370,20 @@ dfabi = 2
         assert_eq!(origin_note_file(&cfg, other_lane), dir.join("bi.origin-3-rd.note"));
         std::fs::write(dir.join("bi.origin-1-rd.note"), "y").unwrap();
         assert_eq!(origin_note_file(&cfg, legacy_lane), dir.join("bi.origin-1-rd.note"), "the new name wins");
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// BI holds one reserve note per pool: each pool of an asset reads its own, not the one of the config's lane.
+    #[test]
+    fn bi_origin_notes_are_read_per_pool() {
+        let dir = temp_dir();
+        std::fs::create_dir_all(&dir).unwrap();
+        let cfg = offline_config(&dir);
+        std::fs::write(dir.join("bi.origin-1-rd.note"), enc(&crate::aps::note_opening(true, 11)).unwrap()).unwrap();
+        std::fs::write(dir.join("bi.origin-2-rd.note"), enc(&crate::aps::note_opening(true, 22)).unwrap()).unwrap();
+        let value = |lane: u32| origin_notes(&cfg, "bi", PoolKey { lane, asset: Asset::Rd }).unwrap()[0].value;
+        assert_eq!((value(1), value(2)), (11, 22));
+        assert!(origin_notes(&cfg, "bank-a", PoolKey { lane: 2, asset: Asset::Rd }).unwrap().is_empty());
         std::fs::remove_dir_all(dir).unwrap();
     }
 

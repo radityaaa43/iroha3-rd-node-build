@@ -44,6 +44,7 @@ mod mint;
 mod mint_finality;
 mod server;
 mod http;
+mod plan;
 mod pools;
 mod tls_http;
 mod transfer;

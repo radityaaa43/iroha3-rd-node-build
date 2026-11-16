@@ -1,13 +1,14 @@
 //! APS HTTP side of a per-org driver (plan 2026-11-13-04, task T2).
 //!
-//! `POST /aps/intent`, `POST /aps/address`, `POST /aps/leg`, `GET /aps/wallet` and `POST /aps/submit`. A leg is split per key holder: the
-//! recipient signs its own output authorization (`/aps/address`), the payer proves its own leg (`/aps/leg`, only after the one-shot
-//! intent that its Lensa registered with `/aps/intent`), and BI (`[aps] coordinator`) walks the parties through one bundle at a time
-//! (`/aps/submit`). Every other driver forwards its `/aps/submit` to BI over the mTLS client. Nothing secret is read from a request or
+//! `POST /aps/intent`, `POST /aps/address`, `POST /aps/leg`, `POST /aps/capacity`, `GET /aps/wallet` and `POST /aps/submit`. A leg is
+//! split per key holder: the recipient signs its own output authorization (`/aps/address`), the payer proves its own leg (`/aps/leg`,
+//! only after the one-shot intent that its Lensa registered with `/aps/intent`), and BI (`[aps] coordinator`) walks the parties
+//! through one bundle at a time (`/aps/submit`): it asks the payers what each pool can carry (`/aps/capacity`), plans the two pools
+//! (`plan`), then collects addresses and legs. Every other driver forwards its `/aps/submit` to BI over the mTLS client. Nothing secret is read from a request or
 //! written to a response: all chain, proving and key work sits behind `ApsBackend`, all calls to another party behind `Peer`.
 
 use std::{
-    collections::{BTreeMap, HashMap},
+    collections::{BTreeMap, BTreeSet, HashMap},
     sync::Mutex,
     time::{Duration, Instant},
 };
@@ -18,6 +19,8 @@ use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use crate::{
     config::{ApsConfig, TlsConfig},
     dvp_native, http,
+    plan::{self, Capacity, PlanError, Request},
+    pools::{Asset, PoolKey},
 };
 
 /// How long a registered intent stays usable (a restart forgets all of them: Lensa repeats the flow).
@@ -62,8 +65,12 @@ pub struct SponsorOutput {
 #[serde(deny_unknown_fields)]
 pub struct LegReq {
     pub intent: String,
-    /// 0 = the RD leg, 1 = the DFABI leg (bundles are always [rd, dfabi]).
+    /// Legs are sorted by lane: leg 0 (the lowest lane) also pays the sponsor's reimbursement.
     pub ordinal: u8,
+    /// The pool of this leg.
+    pub lane: u32,
+    /// "rd" or "dfabi".
+    pub asset: String,
     /// norito hex of `AtomicPrivateSettlementV1`.
     pub manifest: String,
     pub authority_digest: String,
@@ -105,6 +112,8 @@ pub struct LegCtx {
     pub pool_id: String,
     pub route: String,
     pub authority_digest: String,
+    pub lane: u32,
+    pub asset: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -121,8 +130,10 @@ pub trait ApsBackend: Send + Sync {
     fn address(&self, req: &AddressReq) -> Result<OutputKey>;
     /// Coordinator side: the sponsor's output 2 for this leg (`ctx` as for `address`).
     fn sponsor_output(&self, ctx: &AddressReq, active: bool) -> Result<SponsorOutput>;
-    /// Coordinator side: build the bundle manifest over the two pools.
-    fn begin_bundle(&self) -> Result<BundleCtx>;
+    /// What the own party can spend from each pool of `asset`, by lane (`POST /aps/capacity`, and the coordinator's own).
+    fn capacity(&self, asset: Asset) -> Result<Vec<(u32, Capacity)>>;
+    /// Coordinator side: build the bundle manifest over the two planned pools (sorted by lane).
+    fn begin_bundle(&self, keys: [PoolKey; 2]) -> Result<BundleCtx>;
     /// Payer side: scan the own notes, pick one, prove the leg; returns the prepared leg as `statement.proof.capsule` (each hex:
     /// `AtomicPrivateSettlementPreparedLegV1` has no norito codec upstream).
     /// The intent is already consumed; `req.intent` is empty for the coordinator's own BI -> BI companion leg.
@@ -151,7 +162,8 @@ struct IntentTerms {
 }
 
 enum Slot {
-    Open(IntentTerms),
+    /// The approved terms and the amount no leg has spent yet (a split pay spends one intent over two legs).
+    Open(IntentTerms, u128),
     Used,
 }
 
@@ -174,34 +186,39 @@ impl IntentStore {
         let mut slots = self.slots.lock().unwrap_or_else(|p| p.into_inner());
         slots.retain(|_, (_, expires)| *expires > now);
         let known = match slots.get(intent) {
-            Some((Slot::Open(old), _)) => Some(*old == terms),
+            Some((Slot::Open(old, _), _)) => Some(*old == terms),
             Some((Slot::Used, _)) => Some(false),
             None => None,
         };
         match known {
             Some(same) => same,
             None => {
-                slots.insert(intent.to_owned(), (Slot::Open(terms), now + INTENT_TTL));
+                let amount = terms.amount;
+                slots.insert(intent.to_owned(), (Slot::Open(terms, amount), now + INTENT_TTL));
                 true
             }
         }
     }
 
-    /// Spend the intent when its terms are exactly `expected`; a refused leg does not spend it.
-    fn take(&self, now: Instant, intent: &str, expected: &IntentTerms) -> Take {
+    /// Spend `leg.amount` of the intent when asset and recipient match and that much is left; spent in full, it is used. A refused
+    /// leg spends nothing.
+    fn take(&self, now: Instant, intent: &str, leg: &IntentTerms) -> Take {
         let mut slots = self.slots.lock().unwrap_or_else(|p| p.into_inner());
         slots.retain(|_, (_, expires)| *expires > now);
-        let outcome = match slots.get(intent) {
-            Some((Slot::Open(terms), _)) if terms == expected => Take::Taken,
-            Some((Slot::Open(_), _)) => Take::Mismatch,
-            _ => Take::Missing,
+        let Some((slot, _)) = slots.get_mut(intent) else {
+            return Take::Missing;
         };
-        if outcome == Take::Taken {
-            if let Some(entry) = slots.get_mut(intent) {
-                entry.0 = Slot::Used;
-            }
+        let Slot::Open(terms, left) = slot else {
+            return Take::Missing;
+        };
+        if terms.asset != leg.asset || terms.to != leg.to || leg.amount != *left {
+            return Take::Mismatch;
         }
-        outcome
+        *left -= leg.amount;
+        if *left == 0 {
+            *slot = Slot::Used;
+        }
+        Take::Taken
     }
 }
 
@@ -246,13 +263,26 @@ struct DvpReq {
     dfabi: String,
 }
 
-/// One leg of a submit. `None` payer/recipient = the coordinator's own account (the BI -> BI companion leg of a `pay`).
-struct LegSpec {
-    payer: Option<String>,
-    recipient: Option<String>,
-    amount: u128,
-    /// `None` only for the companion leg, which the coordinator pays itself.
-    intent: Option<String>,
+/// Body of `POST /aps/capacity` (coordinator -> party).
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct CapacityReq {
+    asset: Asset,
+}
+
+/// One pool of a `/aps/capacity` answer; amounts are decimal strings.
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct CapacityRow {
+    lane: u32,
+    two_notes: String,
+    total: String,
+}
+
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct CapacityAnswer {
+    pools: Vec<CapacityRow>,
 }
 
 /// `(HTTP status, JSON body)`.
@@ -302,11 +332,6 @@ fn norm(text: &str) -> String {
     text.to_ascii_lowercase()
 }
 
-/// Bundles are always [rd, dfabi] (`pools::run_bundle`).
-fn asset_of(ordinal: u8) -> &'static str {
-    if ordinal == 0 { "rd" } else { "dfabi" }
-}
-
 fn check_key(authority: &str, view_public: &str, authorization: &str) -> Result<()> {
     ensure!(
         hex_n(authority, 32) && hex_n(view_public, 32) && hex_any(authorization),
@@ -335,6 +360,7 @@ fn check_address(req: &AddressReq) -> Result<()> {
 fn check_leg(req: &LegReq) -> Result<u128> {
     ensure!(hex_n(&req.intent, 32), "intent must be 64 hex characters");
     ensure!(req.ordinal < 2, "ordinal must be 0 or 1");
+    Asset::parse(&req.asset)?;
     ensure!(hex_any(&req.manifest), "manifest must be hex");
     ensure!(hex_n(&req.authority_digest, 32) && hex_n(&req.salt, 32), "authority_digest and salt must be 64 hex characters");
     dvp_native::parse_account(&req.recipient)?;
@@ -344,22 +370,20 @@ fn check_leg(req: &LegReq) -> Result<u128> {
     Ok(amount)
 }
 
-/// The two legs of a submit body, [rd, dfabi]. A `pay` pairs its leg with BI -> BI 1 in the other pool (APS needs two dataspaces).
-fn parse_submit(body: &str) -> Result<[LegSpec; 2]> {
+/// A submit body, checked; `plan` turns it into two legs.
+fn parse_submit(body: &str) -> Result<Request> {
     let value: serde_json::Value = serde_json::from_str(body).wrap_err("bad request body")?;
     let kind = value.get("kind").and_then(|kind| kind.as_str()).map(str::to_owned);
     match kind.as_deref() {
         Some("pay") => {
             let req: PayReq = serde_json::from_value(value).wrap_err("bad pay body")?;
             ensure!(hex_n(&req.intent, 32), "intent must be 64 hex characters");
-            ensure!(matches!(req.asset.as_str(), "rd" | "dfabi"), "asset must be rd or dfabi");
+            let asset = Asset::parse(&req.asset).map_err(|_| eyre::eyre!("asset must be rd or dfabi"))?;
             dvp_native::parse_account(&req.from)?;
             dvp_native::parse_account(&req.to)?;
             ensure!(norm(&req.from) != norm(&req.to), "from and to must differ");
             let amount = dvp_native::parse_amount(&req.amount)?;
-            let main = LegSpec { payer: Some(req.from), recipient: Some(req.to), amount, intent: Some(norm(&req.intent)) };
-            let companion = LegSpec { payer: None, recipient: None, amount: 1, intent: None };
-            Ok(if req.asset == "rd" { [main, companion] } else { [companion, main] })
+            Ok(Request::Pay { asset, from: req.from, to: req.to, amount, intent: norm(&req.intent) })
         }
         Some("dvp") => {
             let req: DvpReq = serde_json::from_value(value).wrap_err("bad dvp body")?;
@@ -368,10 +392,14 @@ fn parse_submit(body: &str) -> Result<[LegSpec; 2]> {
             dvp_native::parse_account(&req.seller)?;
             ensure!(norm(&req.buyer) != norm(&req.seller), "buyer and seller must differ");
             let (rd, dfabi) = (dvp_native::parse_amount(&req.rd)?, dvp_native::parse_amount(&req.dfabi)?);
-            Ok([
-                LegSpec { payer: Some(req.buyer.clone()), recipient: Some(req.seller.clone()), amount: rd, intent: Some(norm(&req.intent_rd)) },
-                LegSpec { payer: Some(req.seller), recipient: Some(req.buyer), amount: dfabi, intent: Some(norm(&req.intent_dfabi)) },
-            ])
+            Ok(Request::Dvp {
+                buyer: req.buyer,
+                seller: req.seller,
+                rd,
+                dfabi,
+                intent_rd: norm(&req.intent_rd),
+                intent_dfabi: norm(&req.intent_dfabi),
+            })
         }
         _ => bail!("kind must be pay or dvp"),
     }
@@ -391,7 +419,8 @@ pub struct Aps<'a> {
     intents: IntentStore,
     /// The coordinator's global mutex: the pool is serial (`old_root` must be the current root), so one bundle at a time.
     submit_lock: Mutex<()>,
-    /// One own proof at a time: a proof peaks at about 1.1 GB, two would crowd the driver's memory limit.
+    /// One own proof at a time, the coordinator's own legs and every `/aps/leg` alike (a split pay asks one payer for two legs):
+    /// a proof peaks at about 1.1 GB, two would crowd the driver's memory limit.
     prove_lock: Mutex<()>,
 }
 
@@ -411,10 +440,13 @@ impl<'a> Aps<'a> {
             ("POST", "/aps/intent") => self.intent(now, body),
             ("POST", "/aps/address") => self.address(body),
             ("POST", "/aps/leg") => self.leg(now, body),
+            ("POST", "/aps/capacity") => self.capacity(body),
             ("GET", "/aps/wallet") => self.wallet(),
             ("GET", "/aps/bundles") => self.bundles(),
             ("POST", "/aps/submit") => self.submit(now, body),
-            (_, "/aps/intent" | "/aps/address" | "/aps/leg" | "/aps/wallet" | "/aps/bundles" | "/aps/submit") => error(405, "method not allowed"),
+            (_, "/aps/intent" | "/aps/address" | "/aps/leg" | "/aps/capacity" | "/aps/wallet" | "/aps/bundles" | "/aps/submit") => {
+                error(405, "method not allowed")
+            }
             _ => error(404, "not found"),
         }
     }
@@ -472,12 +504,22 @@ impl<'a> Aps<'a> {
 
     /// Match the leg against the intent this driver registered and spend it, before any proving.
     fn consume(&self, now: Instant, req: &LegReq, amount: u128) -> Result<(), Reply> {
-        let terms = IntentTerms { asset: asset_of(req.ordinal).to_owned(), to: norm(&req.recipient), amount };
+        let terms = IntentTerms { asset: req.asset.clone(), to: norm(&req.recipient), amount };
         match self.intents.take(now, &norm(&req.intent), &terms) {
             Take::Taken => Ok(()),
             Take::Missing => Err(error(403, "no open intent for this leg (unknown, already used or expired)")),
             Take::Mismatch => Err(error(403, "the intent's terms do not match this leg")),
         }
+    }
+
+    /// What the own party can spend per pool of an asset, on a fresh pool history (only the coordinator asks; gateway policy).
+    fn capacity(&self, body: &str) -> Reply {
+        let req: CapacityReq = match parse(body) {
+            Ok(req) => req,
+            Err(reply) => return reply,
+        };
+        let _ = req.asset;
+        error(501, "RED")
     }
 
     fn wallet(&self) -> Reply {
@@ -523,15 +565,15 @@ impl<'a> Aps<'a> {
     }
 
     fn submit(&self, now: Instant, body: &str) -> Reply {
-        let legs = match parse_submit(body) {
-            Ok(legs) => legs,
+        let req = match parse_submit(body) {
+            Ok(req) => req,
             Err(e) => return error(400, format!("{e:#}")),
         };
         if !self.cfg.coordinator {
             return self.forward(body);
         }
         let _one_bundle_at_a_time = self.submit_lock.lock().unwrap_or_else(|p| p.into_inner());
-        match self.coordinate(now, &legs) {
+        match self.coordinate(now, &req) {
             Ok(reply) | Err(reply) => reply,
         }
     }
@@ -578,20 +620,53 @@ impl<'a> Aps<'a> {
         Ok(answer.prepared)
     }
 
-    /// One bundle: manifest, then per leg the recipient's address, the sponsor's output and the payer's proof, then settle.
-    fn coordinate(&self, now: Instant, legs: &[LegSpec; 2]) -> Result<Reply, Reply> {
+    /// What `who` (`None` = this coordinator) can spend from each pool of `asset`, by lane.
+    fn capacity_of(&self, who: Option<&str>, asset: Asset) -> Result<Vec<(u32, Capacity)>, Reply> {
+        let Some(key) = who else {
+            return self.backend.capacity(asset).map_err(fail);
+        };
+        let answer: CapacityAnswer = self.ask(key, "/aps/capacity", &CapacityReq { asset })?;
+        let row = |row: &CapacityRow| Ok::<_, std::num::ParseIntError>((row.lane, Capacity { two_notes: row.two_notes.parse()?, total: row.total.parse()? }));
+        answer.pools.iter().map(row).collect::<Result<_, _>>().map_err(|e| error(502, format!("/aps/capacity: bad answer: {e}")))
+    }
+
+    /// One bundle: the payers' capacities and the plan, the manifest, then per leg the recipient's address, the sponsor's output
+    /// and the payer's proof, then settle.
+    fn coordinate(&self, now: Instant, req: &Request) -> Result<Reply, Reply> {
         let me = self.backend.own_key().map_err(fail)?;
         let is_me = |key: &str| norm(key) == norm(&me);
-        let party = |key: &Option<String>| key.clone().unwrap_or_else(|| me.clone());
-        // Unknown parties are refused before anything is prepared.
-        for spec in legs {
-            for key in [party(&spec.payer), party(&spec.recipient)] {
-                if !is_me(&key) {
-                    self.gateway(&key)?;
+        let other = |key: &String| (!is_me(key)).then(|| key.clone());
+        // The capacities `plan` reads: each payer's; for a pay also BI's (the companion) and, for an issuance, the recipient's.
+        let (accounts, mut asked) = match req {
+            Request::Pay { asset, from, to, .. } => {
+                let mut asked = vec![(None, *asset), (other(from), *asset)];
+                if other(from).is_none() {
+                    asked.push((other(to), *asset));
                 }
+                ([from, to], asked)
+            }
+            Request::Dvp { buyer, seller, .. } => ([buyer, seller], vec![(other(buyer), Asset::Rd), (other(seller), Asset::Dfabi)]),
+        };
+        // Unknown parties are refused before anything is asked or prepared.
+        for key in accounts {
+            if !is_me(key) {
+                self.gateway(key)?;
             }
         }
-        let bundle = self.backend.begin_bundle().map_err(fail)?;
+        asked.dedup();
+        let mut caps = HashMap::new();
+        let mut lanes = BTreeSet::new();
+        for (who, asset) in asked {
+            for (lane, cap) in self.capacity_of(who.as_deref(), asset)? {
+                lanes.insert(lane);
+                caps.insert((who.as_deref().map(norm), PoolKey { lane, asset }), cap);
+            }
+        }
+        let lanes: [u32; 2] = Vec::from_iter(lanes).try_into().map_err(|_| error(502, "/aps/capacity: the pools are not in exactly two lanes"))?;
+        let cap = |who: Option<&str>, key: PoolKey| caps.get(&(who.map(norm), key)).copied().unwrap_or_default();
+        let legs = plan::plan(req, &me, lanes, &cap, &mut rand::rng()).map_err(|PlanError::Insufficient(message)| error(422, message))?;
+        let party = |key: &Option<String>| key.clone().unwrap_or_else(|| me.clone());
+        let bundle = self.backend.begin_bundle([legs[0].key, legs[1].key]).map_err(fail)?;
         // Per leg, in order: the recipient's address, the sponsor's output and, for a leg the coordinator pays, its intent.
         // Nothing is proved before both legs are ready, so a refused intent costs no proving.
         let mut jobs = Vec::new();
@@ -617,6 +692,8 @@ impl<'a> Aps<'a> {
             let req = LegReq {
                 intent: spec.intent.clone().unwrap_or_default(),
                 ordinal,
+                lane: bundle.legs[index].lane,
+                asset: bundle.legs[index].asset.clone(),
                 manifest: bundle.manifest.clone(),
                 authority_digest: bundle.legs[index].authority_digest.clone(),
                 salt: bundle.salt.clone(),
@@ -632,8 +709,8 @@ impl<'a> Aps<'a> {
             }
             jobs.push((local, payer, req));
         }
-        // The two proofs are independent (one RD and one DFABI pool, each proved by its own payer): run them at the same time.
-        // Both are joined; the first failing leg in leg order is the answer.
+        // The two proofs are independent (two pools, each leg proved by its payer, which takes one own proof at a time): run them at
+        // the same time. Both are joined; the first failing leg in leg order is the answer.
         let prepared = std::thread::scope(|scope| {
             let running: Vec<_> = jobs.iter().map(|(local, payer, req)| scope.spawn(move || self.prove(*local, payer, req))).collect();
             let done: Vec<_> = running.into_iter().map(|job| job.join().unwrap_or_else(|_| Err(error(500, "leg prover panicked")))).collect();
@@ -709,6 +786,8 @@ pub(crate) mod testkit {
         pub merged: Mutex<Vec<BundleLists>>,
         pub active: AtomicUsize,
         pub max_active: AtomicUsize,
+        /// What `capacity` answers for either asset; empty = 1000 in lanes 1 and 2.
+        pub caps: Vec<(u32, Capacity)>,
     }
 
     impl FakeBackend {
@@ -741,10 +820,17 @@ pub(crate) mod testkit {
             Ok(SponsorOutput { authority: key.authority, view_public: key.view_public, authorization: key.authorization, active })
         }
 
-        fn begin_bundle(&self) -> Result<BundleCtx> {
+        fn capacity(&self, _asset: Asset) -> Result<Vec<(u32, Capacity)>> {
+            self.note("capacity")?;
+            let plenty = Capacity { two_notes: 1000, total: 1000 };
+            Ok(if self.caps.is_empty() { vec![(1, plenty), (2, plenty)] } else { self.caps.clone() })
+        }
+
+        fn begin_bundle(&self, keys: [PoolKey; 2]) -> Result<BundleCtx> {
             self.note("begin_bundle")?;
-            let leg = |n: u8| LegCtx { pool_id: id(n), route: "0a".to_owned(), authority_digest: id(0xdd) };
-            Ok(BundleCtx { bundle_id: id(0xbb), manifest: "abcd".to_owned(), salt: id(0xcc), expiry_height: 10, network_id: "ee".to_owned(), legs: [leg(1), leg(2)] })
+            let leg = |n: u8, key: PoolKey| LegCtx { pool_id: id(n), route: "0a".to_owned(), authority_digest: id(0xdd), lane: key.lane, asset: key.asset.name().to_owned() };
+            let legs = [leg(1, keys[0]), leg(2, keys[1])];
+            Ok(BundleCtx { bundle_id: id(0xbb), manifest: "abcd".to_owned(), salt: id(0xcc), expiry_height: 10, network_id: "ee".to_owned(), legs })
         }
 
         fn prove_leg(&self, _req: &LegReq) -> Result<String> {
@@ -799,13 +885,27 @@ pub(crate) mod testkit {
 
         /// A healthy party: signs addresses, proves legs, finalizes submits.
         pub(crate) fn standard() -> Self {
-            Self::with(|_, path, _| match path {
-                "/aps/address" => Ok((200, serde_json::json!({ "authority": id(0x33), "view_public": id(0x44), "authorization": "abcd" }).to_string())),
-                "/aps/leg" => Ok((200, r#"{"prepared":"cafe"}"#.to_owned())),
-                "/aps/submit" => Ok((200, r#"{"outcome":"finalized"}"#.to_owned())),
-                "/aps/bundles" => Ok((200, serde_json::to_string(&lists()).unwrap())),
-                _ => Ok((404, r#"{"error":"not found"}"#.to_owned())),
-            })
+            Self::with(standard_answer)
+        }
+    }
+
+    /// A `/aps/capacity` answer: `(lane, two_notes = total)` per pool.
+    pub(crate) fn capacity_answer(pools: &[(u32, u128)]) -> String {
+        let pools: Vec<_> = pools.iter().map(|(lane, v)| serde_json::json!({ "lane": lane, "two_notes": v.to_string(), "total": v.to_string() })).collect();
+        serde_json::json!({ "pools": pools }).to_string()
+    }
+
+    /// What a healthy party answers. Its RD sits in lane 1 and its DFABI in lane 2, so a plan has one outcome: a pay's main leg in
+    /// its asset's lane, a DvP's RD leg in lane 1.
+    pub(crate) fn standard_answer(_target: &str, path: &str, body: &str) -> Result<(u16, String)> {
+        match path {
+            "/aps/address" => Ok((200, serde_json::json!({ "authority": id(0x33), "view_public": id(0x44), "authorization": "abcd" }).to_string())),
+            "/aps/leg" => Ok((200, r#"{"prepared":"cafe"}"#.to_owned())),
+            "/aps/submit" => Ok((200, r#"{"outcome":"finalized"}"#.to_owned())),
+            "/aps/bundles" => Ok((200, serde_json::to_string(&lists()).unwrap())),
+            "/aps/capacity" if body.contains(r#""rd""#) => Ok((200, capacity_answer(&[(1, 1000), (2, 0)]))),
+            "/aps/capacity" => Ok((200, capacity_answer(&[(1, 0), (2, 1000)]))),
+            _ => Ok((404, r#"{"error":"not found"}"#.to_owned())),
         }
     }
 
@@ -852,11 +952,12 @@ mod tests {
         serde_json::json!({ "intent": intent, "asset": asset, "to": to, "amount": amount }).to_string()
     }
 
-    fn leg_body(intent: &str, ordinal: u8, to: &str, amount: &str) -> String {
+    /// Leg 0 in lane 1.
+    fn leg_body(intent: &str, asset: &str, to: &str, amount: &str) -> String {
         let out = serde_json::json!({ "authority": id(0x11), "view_public": id(0x22), "authorization": "abcd" });
-        let sponsor = serde_json::json!({ "authority": id(0x55), "view_public": id(0x66), "authorization": "abcd", "active": ordinal == 0 });
+        let sponsor = serde_json::json!({ "authority": id(0x55), "view_public": id(0x66), "authorization": "abcd", "active": true });
         serde_json::json!({
-            "intent": intent, "ordinal": ordinal, "manifest": "abcd", "authority_digest": id(0xdd), "salt": id(0xcc),
+            "intent": intent, "ordinal": 0, "lane": 1, "asset": asset, "manifest": "abcd", "authority_digest": id(0xdd), "salt": id(0xcc),
             "recipient": to, "amount": amount, "recipient_output": out, "sponsor_output": sponsor,
         })
         .to_string()
@@ -881,9 +982,9 @@ mod tests {
         let (to, intent) = (account(9), id(1));
         let (status, response) = aps.route("POST", "/aps/intent", &intent_body(&intent, "rd", &to, "5"));
         assert_eq!((status, json(&response)), (200, serde_json::json!({ "intent": intent })));
-        let (status, response) = aps.route("POST", "/aps/leg", &leg_body(&intent, 0, &to, "5"));
+        let (status, response) = aps.route("POST", "/aps/leg", &leg_body(&intent, "rd", &to, "5"));
         assert_eq!((status, json(&response)), (200, serde_json::json!({ "prepared": "beef" })));
-        assert_eq!(aps.route("POST", "/aps/leg", &leg_body(&intent, 0, &to, "5")).0, 403, "the intent is spent");
+        assert_eq!(aps.route("POST", "/aps/leg", &leg_body(&intent, "rd", &to, "5")).0, 403, "the intent is spent");
         assert_eq!(calls(&backend), ["merge_bundles", "prove"]);
         assert_eq!(aps.route("POST", "/aps/intent", &intent_body(&intent, "rd", &to, "5")).0, 409, "a spent intent is not registered again");
     }
@@ -900,8 +1001,8 @@ mod tests {
             assert_eq!(status, 409, "{other}");
             assert!(json(&response)["error"].is_string());
         }
-        assert_eq!(aps.route("POST", "/aps/leg", &leg_body(&intent, 0, &to, "6")).0, 403, "the rejected terms were not stored");
-        assert_eq!(aps.route("POST", "/aps/leg", &leg_body(&intent, 0, &to, "5")).0, 200, "the first terms still hold");
+        assert_eq!(aps.route("POST", "/aps/leg", &leg_body(&intent, "rd", &to, "6")).0, 403, "the rejected terms were not stored");
+        assert_eq!(aps.route("POST", "/aps/leg", &leg_body(&intent, "rd", &to, "5")).0, 200, "the first terms still hold");
     }
 
     #[test]
@@ -912,11 +1013,11 @@ mod tests {
         let start = std::time::Instant::now();
         assert_eq!(aps.route_at(start, "POST", "/aps/intent", &intent_body(&intent, "rd", &to, "5")).0, 200);
         let late = start + Duration::from_secs(15 * 60 + 1);
-        assert_eq!(aps.route_at(late, "POST", "/aps/leg", &leg_body(&intent, 0, &to, "5")).0, 403);
+        assert_eq!(aps.route_at(late, "POST", "/aps/leg", &leg_body(&intent, "rd", &to, "5")).0, 403);
         assert!(calls(&backend).is_empty());
         let early = start + Duration::from_secs(14 * 60);
         assert_eq!(aps.route_at(early, "POST", "/aps/intent", &intent_body(&id(2), "rd", &to, "5")).0, 200);
-        assert_eq!(aps.route_at(early, "POST", "/aps/leg", &leg_body(&id(2), 0, &to, "5")).0, 200);
+        assert_eq!(aps.route_at(early, "POST", "/aps/leg", &leg_body(&id(2), "rd", &to, "5")).0, 200);
     }
 
     #[test]
@@ -924,16 +1025,16 @@ mod tests {
         let (backend, peer) = (driver(8), FakePeer::standard());
         let aps = Aps::new(&backend, &peer, bank());
         let (to, intent) = (account(9), id(1));
-        let (status, response) = aps.route("POST", "/aps/leg", &leg_body(&intent, 0, &to, "5"));
+        let (status, response) = aps.route("POST", "/aps/leg", &leg_body(&intent, "rd", &to, "5"));
         assert_eq!(status, 403);
         assert!(json(&response)["error"].is_string());
         assert_eq!(aps.route("POST", "/aps/intent", &intent_body(&intent, "rd", &to, "5")).0, 200);
-        // another recipient, another amount, the other pool (ordinal 1 = dfabi): none of them is what was approved
-        for bad in [leg_body(&intent, 0, &account(7), "5"), leg_body(&intent, 0, &to, "6"), leg_body(&intent, 1, &to, "5")] {
+        // another recipient, a larger amount, the other asset: none of them is what was approved
+        for bad in [leg_body(&intent, "rd", &account(7), "5"), leg_body(&intent, "rd", &to, "6"), leg_body(&intent, "dfabi", &to, "5")] {
             assert_eq!(aps.route("POST", "/aps/leg", &bad).0, 403, "{bad}");
         }
         assert!(calls(&backend).is_empty(), "no proving without a matching intent");
-        assert_eq!(aps.route("POST", "/aps/leg", &leg_body(&intent, 0, &to, "5")).0, 200, "a refused leg did not spend the intent");
+        assert_eq!(aps.route("POST", "/aps/leg", &leg_body(&intent, "rd", &to, "5")).0, 200, "a refused leg did not spend the intent");
         assert_eq!(calls(&backend), ["merge_bundles", "prove"]);
     }
 
@@ -944,10 +1045,10 @@ mod tests {
         let aps = Aps::new(&backend, &peer, bank());
         let (to, intent) = (account(9), id(1));
         assert_eq!(aps.route("POST", "/aps/intent", &intent_body(&intent, "rd", &to, "5")).0, 200);
-        let (status, response) = aps.route("POST", "/aps/leg", &leg_body(&intent, 0, &to, "5"));
+        let (status, response) = aps.route("POST", "/aps/leg", &leg_body(&intent, "rd", &to, "5"));
         assert_eq!(status, 502);
         assert!(!response.contains(".note") && !response.contains(".seed"), "{response}");
-        assert_eq!(aps.route("POST", "/aps/leg", &leg_body(&intent, 0, &to, "5")).0, 403, "a retry needs a new intent");
+        assert_eq!(aps.route("POST", "/aps/leg", &leg_body(&intent, "rd", &to, "5")).0, 403, "a retry needs a new intent");
         assert_eq!(calls(&backend), ["merge_bundles", "prove"]);
     }
 
@@ -1016,28 +1117,34 @@ mod tests {
         assert_eq!((status, json(&response)), (200, serde_json::json!({ "outcome": "finalized", "bundle_id": id(0xbb), "carrier_tx": "txh", "height": 42 })));
         let sent = peer.calls.lock().unwrap().clone();
         let route: Vec<_> = sent.iter().map(|call| (call.0.as_str(), call.2.as_str())).collect();
-        assert_eq!(route, [(BANK_B, "/aps/address"), (BANK_A, "/aps/leg")], "address from the recipient, leg from the payer");
-        let leg = json(&sent[1].3);
+        assert_eq!(
+            route,
+            [(BANK_A, "/aps/capacity"), (BANK_B, "/aps/address"), (BANK_A, "/aps/leg")],
+            "capacity from the payer, address from the recipient, leg from the payer"
+        );
+        assert_eq!(json(&sent[0].3), serde_json::json!({ "asset": "rd" }));
+        let leg = json(&sent[2].3);
         assert_eq!(
             (leg["intent"].as_str(), leg["ordinal"].as_u64(), leg["recipient"].as_str(), leg["amount"].as_str(), leg["manifest"].as_str()),
             (Some(id(1).as_str()), Some(0), Some(account(9).as_str()), Some("5"), Some("abcd"))
         );
+        assert_eq!((leg["lane"].as_u64(), leg["asset"].as_str()), (Some(1), Some("rd")), "the payer's RD is in lane 1");
         assert_eq!(leg["recipient_output"]["authority"], id(0x33), "the recipient's own answer");
         assert_eq!(leg["sponsor_output"]["active"], true, "leg 0 pays the sponsor");
-        // BI's own side: manifest, its sponsor output per leg, the BI -> BI companion leg without HTTP, then settle
-        assert_eq!(calls(&backend), ["begin_bundle", "sponsor_output", "address", "sponsor_output", "prove", "settle"]);
+        // BI's own side: its capacity (companion), manifest, its sponsor output per leg, the BI -> BI companion leg without HTTP, then settle
+        assert_eq!(calls(&backend), ["capacity", "begin_bundle", "sponsor_output", "address", "sponsor_output", "prove", "settle"]);
     }
 
     #[test]
     fn the_two_legs_are_proved_at_the_same_time() {
         // Leg 0 is proved by bank A over HTTP, leg 1 (the BI -> BI companion) by the coordinator: 400 ms each.
         let backend = FakeBackend { prove_delay: Duration::from_millis(400), ..driver(7) };
-        let peer = FakePeer::with(|_, path, _| match path {
+        let peer = FakePeer::with(|target, path, body| match path {
             "/aps/leg" => {
                 std::thread::sleep(Duration::from_millis(400));
                 Ok((200, r#"{"prepared":"cafe"}"#.to_owned()))
             }
-            _ => Ok((200, serde_json::json!({ "authority": id(0x33), "view_public": id(0x44), "authorization": "abcd" }).to_string())),
+            _ => standard_answer(target, path, body),
         });
         let aps = Aps::new(&backend, &peer, coordinator());
         let started = std::time::Instant::now();
@@ -1056,6 +1163,11 @@ mod tests {
         assert_eq!(aps.route("POST", "/aps/submit", &pay_body(&id(1), "rd", &account(7), &account(9), "5")).0, 200);
         assert_eq!(calls(&backend).iter().filter(|call| **call == "prove").count(), 2);
         assert_eq!(backend.max_proving.load(Ordering::SeqCst), 1);
+        // the recipient's capacity decides the lane: it holds its RD in lane 1, so the issuance goes to lane 2 (leg 1)
+        let sent = peer.calls.lock().unwrap().clone();
+        let route: Vec<_> = sent.iter().map(|call| (call.0.as_str(), call.2.as_str())).collect();
+        assert_eq!(route, [(BANK_B, "/aps/capacity"), (BANK_B, "/aps/address")]);
+        assert_eq!(json(&sent[1].3)["leg_ordinal"], 1);
     }
 
     #[test]
@@ -1066,22 +1178,24 @@ mod tests {
         assert_eq!(status, 200);
         let sent = peer.calls.lock().unwrap().clone();
         let route: Vec<_> = sent.iter().map(|call| (call.0.as_str(), call.2.as_str())).collect();
-        // Both addresses first, in leg order; then the two legs, proved at the same time (either may be asked first).
-        assert_eq!(route[..2], [(BANK_B, "/aps/address"), (BANK_A, "/aps/address")]);
+        // The buyer's RD and the seller's DFABI capacity, both addresses in leg order; then the two legs, proved at the same time
+        // (either may be asked first).
+        assert_eq!(route[..4], [(BANK_A, "/aps/capacity"), (BANK_B, "/aps/capacity"), (BANK_B, "/aps/address"), (BANK_A, "/aps/address")]);
         let leg_of = |bank: &str| sent.iter().find(|call| call.0 == bank && call.2 == "/aps/leg").map(|call| json(&call.3)).unwrap();
-        assert_eq!(route.len(), 4);
+        assert_eq!(route.len(), 6);
         let (rd, dfabi) = (leg_of(BANK_A), leg_of(BANK_B));
         assert_eq!((rd["intent"].as_str(), rd["amount"].as_str(), rd["recipient"].as_str()), (Some(id(1).as_str()), Some("5"), Some(account(9).as_str())));
         assert_eq!((dfabi["intent"].as_str(), dfabi["amount"].as_str(), dfabi["recipient"].as_str()), (Some(id(2).as_str()), Some("7"), Some(account(8).as_str())));
         assert_eq!((dfabi["ordinal"].as_u64(), dfabi["sponsor_output"]["active"].as_bool()), (Some(1), Some(false)));
+        assert_eq!((rd["lane"].as_u64(), rd["asset"].as_str(), dfabi["lane"].as_u64(), dfabi["asset"].as_str()), (Some(1), Some("rd"), Some(2), Some("dfabi")));
     }
 
     #[test]
     fn a_payer_that_refuses_its_leg_stops_the_submit_before_settle() {
         let backend = driver(7);
-        let peer = FakePeer::with(|_, path, _| match path {
+        let peer = FakePeer::with(|target, path, body| match path {
             "/aps/leg" => Ok((403, r#"{"error":"no matching intent"}"#.to_owned())),
-            _ => Ok((200, serde_json::json!({ "authority": id(0x33), "view_public": id(0x44), "authorization": "abcd" }).to_string())),
+            _ => standard_answer(target, path, body),
         });
         let aps = Aps::new(&backend, &peer, coordinator());
         let (status, response) = aps.route("POST", "/aps/submit", &pay_body(&id(1), "rd", &account(8), &account(9), "5"));
@@ -1206,7 +1320,7 @@ mod tests {
         let aps = Aps::new(&backend, &peer, bank());
         let to = account(9);
         let intent = intent_body(&id(1), "rd", &to, "5");
-        let leg = leg_body(&id(1), 0, &to, "5");
+        let leg = leg_body(&id(1), "rd", &to, "5");
         let address = address_body();
         let cases: Vec<(&str, String)> = vec![
             ("/aps/intent", String::new()),
@@ -1221,10 +1335,12 @@ mod tests {
             ("/aps/leg", String::new()),
             ("/aps/leg", "{}".to_owned()),
             ("/aps/leg", leg.replace('}', r#","extra":1}"#)),
-            ("/aps/leg", leg_body(&id(1), 2, &to, "5")),
-            ("/aps/leg", leg_body("abcd", 0, &to, "5")),
-            ("/aps/leg", leg_body(&id(1), 0, "not-a-key", "5")),
-            ("/aps/leg", leg_body(&id(1), 0, &to, "0")),
+            ("/aps/leg", leg.replace(r#""ordinal":0"#, r#""ordinal":2"#)),
+            ("/aps/leg", leg_body(&id(1), "gold", &to, "5")),
+            ("/aps/leg", leg.replace(r#","lane":1"#, "")),
+            ("/aps/leg", leg_body("abcd", "rd", &to, "5")),
+            ("/aps/leg", leg_body(&id(1), "rd", "not-a-key", "5")),
+            ("/aps/leg", leg_body(&id(1), "rd", &to, "0")),
             ("/aps/leg", leg.replace(r#""manifest":"abcd""#, r#""manifest":"xyz""#)),
             ("/aps/address", String::new()),
             ("/aps/address", "{}".to_owned()),
@@ -1249,7 +1365,16 @@ mod tests {
             assert_eq!(aps.route("GET", path, "").0, 404, "GET {path}");
             assert_eq!(aps.route("POST", path, "{}").0, 404, "POST {path}");
         }
-        for (method, path) in [("GET", "/aps/intent"), ("GET", "/aps/address"), ("GET", "/aps/leg"), ("GET", "/aps/submit"), ("POST", "/aps/wallet"), ("DELETE", "/aps/leg"), ("POST", "/aps/bundles")] {
+        for (method, path) in [
+            ("GET", "/aps/intent"),
+            ("GET", "/aps/address"),
+            ("GET", "/aps/leg"),
+            ("GET", "/aps/capacity"),
+            ("GET", "/aps/submit"),
+            ("POST", "/aps/wallet"),
+            ("DELETE", "/aps/leg"),
+            ("POST", "/aps/bundles"),
+        ] {
             assert_eq!(aps.route(method, path, "{}").0, 405, "{method} {path}");
         }
         assert!(calls(&backend).is_empty() && peer.calls.lock().unwrap().is_empty());
@@ -1264,7 +1389,7 @@ mod tests {
         for backend in [&failing, &healthy] {
             let aps = Aps::new(backend, &peer, coordinator());
             all.push(aps.route("POST", "/aps/intent", &intent_body(&id(1), "rd", &to, "5")).1);
-            all.push(aps.route("POST", "/aps/leg", &leg_body(&id(1), 0, &to, "5")).1);
+            all.push(aps.route("POST", "/aps/leg", &leg_body(&id(1), "rd", &to, "5")).1);
             all.push(aps.route("POST", "/aps/address", &address_body()).1);
             all.push(aps.route("GET", "/aps/wallet", "").1);
             all.push(aps.route("GET", "/aps/bundles", "").1);
@@ -1286,7 +1411,7 @@ mod tests {
         let aps = Aps::new(&backend, &peer, bank());
         let (to, intent) = (account(9), id(1));
         assert_eq!(aps.route("POST", "/aps/intent", &intent_body(&intent, "rd", &to, "5")).0, 200);
-        assert_eq!(aps.route("POST", "/aps/leg", &leg_body(&intent, 0, &to, "5")).0, 200);
+        assert_eq!(aps.route("POST", "/aps/leg", &leg_body(&intent, "rd", &to, "5")).0, 200);
         assert_eq!(aps.route("GET", "/aps/wallet", "").0, 200);
         let sent: Vec<_> = peer.calls.lock().unwrap().iter().map(|call| (call.0.clone(), call.1.clone(), call.2.clone(), call.3.clone())).collect();
         let ask = (BI.to_owned(), "GET".to_owned(), "/aps/bundles".to_owned(), String::new());
@@ -1310,7 +1435,7 @@ mod tests {
             let peer = FakePeer::with(move |_, _, _| answer.lock().unwrap().take().unwrap_or_else(|| Err(eyre::eyre!("again"))));
             let aps = Aps::new(&backend, &peer, bank());
             assert_eq!(aps.route("POST", "/aps/intent", &intent_body(&intent, "rd", &to, "5")).0, 200);
-            let (status, response) = aps.route("POST", "/aps/leg", &leg_body(&intent, 0, &to, "5"));
+            let (status, response) = aps.route("POST", "/aps/leg", &leg_body(&intent, "rd", &to, "5"));
             assert_eq!(status, 502, "{response}");
             assert!(json(&response)["error"].is_string());
             assert!(calls(&backend).is_empty(), "no proving on a stale pool history: {:?}", calls(&backend));
@@ -1325,7 +1450,7 @@ mod tests {
         let aps = Aps::new(&backend, &peer, ApsConfig::default());
         let (to, intent) = (account(9), id(1));
         assert_eq!(aps.route("POST", "/aps/intent", &intent_body(&intent, "rd", &to, "5")).0, 200);
-        assert_eq!(aps.route("POST", "/aps/leg", &leg_body(&intent, 0, &to, "5")).0, 503);
+        assert_eq!(aps.route("POST", "/aps/leg", &leg_body(&intent, "rd", &to, "5")).0, 503);
         assert_eq!(aps.route("GET", "/aps/wallet", "").0, 503);
         assert!(calls(&backend).is_empty() && peer.calls.lock().unwrap().is_empty());
     }
@@ -1358,9 +1483,9 @@ mod tests {
         let (to, from) = (account(9), account(8));
         for (prepared, status) in [("aa.bb.cc", 200), ("cafe", 200), ("zz", 502), ("aa..cc", 502), ("", 502), ("aa.", 502)] {
             let (backend, answer) = (driver(7), format!(r#"{{"prepared":"{prepared}"}}"#));
-            let peer = FakePeer::with(move |_, path, _| match path {
+            let peer = FakePeer::with(move |target, path, body| match path {
                 "/aps/leg" => Ok((200, answer.clone())),
-                _ => Ok((200, serde_json::json!({ "authority": id(0x33), "view_public": id(0x44), "authorization": "abcd" }).to_string())),
+                _ => standard_answer(target, path, body),
             });
             let aps = Aps::new(&backend, &peer, coordinator());
             let (got, _) = aps.route("POST", "/aps/submit", &pay_body(&id(1), "rd", &from, &to, "5"));
@@ -1377,5 +1502,93 @@ mod tests {
         assert_eq!(aps.route("POST", "/aps/address", &literal).0, 200);
         let empty = address_body().replace(r#""network_id":"ee""#, r#""network_id":"""#);
         assert_eq!(aps.route("POST", "/aps/address", &empty).0, 400);
+    }
+
+    #[test]
+    fn capacity_answers_per_pool() {
+        let backend = FakeBackend { caps: vec![(1, Capacity { two_notes: 13, total: 17 }), (2, Capacity::default())], ..driver(8) };
+        let peer = FakePeer::standard();
+        let aps = Aps::new(&backend, &peer, bank());
+        let (status, response) = aps.route("POST", "/aps/capacity", r#"{"asset":"dfabi"}"#);
+        let pools = serde_json::json!({ "pools": [{ "lane": 1, "two_notes": "13", "total": "17" }, { "lane": 2, "two_notes": "0", "total": "0" }] });
+        assert_eq!((status, json(&response)), (200, pools));
+        assert_eq!(calls(&backend), ["merge_bundles", "capacity"], "read on a fresh pool history");
+        for bad in ["", "{}", r#"{"asset":"gold"}"#, r#"{"asset":"rd","x":1}"#] {
+            assert_eq!(aps.route("POST", "/aps/capacity", bad).0, 400, "{bad}");
+        }
+        assert_eq!(calls(&backend).len(), 2);
+    }
+
+    #[test]
+    fn split_intent_covers_two_legs() {
+        let (backend, peer) = (driver(8), FakePeer::standard());
+        let aps = Aps::new(&backend, &peer, bank());
+        let (to, intent) = (account(9), id(1));
+        assert_eq!(aps.route("POST", "/aps/intent", &intent_body(&intent, "rd", &to, "9")).0, 200);
+        let lane_2 = |amount: &str| leg_body(&intent, "rd", &to, amount).replace(r#""lane":1"#, r#""lane":2"#);
+        assert_eq!(aps.route("POST", "/aps/leg", &leg_body(&intent, "rd", &to, "5")).0, 200);
+        assert_eq!(aps.route("POST", "/aps/leg", &lane_2("5")).0, 403, "more than is left of the intent");
+        assert_eq!(aps.route("POST", "/aps/leg", &lane_2("4")).0, 200);
+        assert_eq!(aps.route("POST", "/aps/leg", &lane_2("1")).0, 403, "the intent is spent");
+        assert_eq!(calls(&backend).iter().filter(|call| **call == "prove").count(), 2);
+    }
+
+    #[test]
+    fn a_party_proves_two_legs_one_after_the_other() {
+        // A split pay asks one payer for both legs at once: one proof at a time (memory), as for the coordinator's own legs.
+        let backend = FakeBackend { prove_delay: Duration::from_millis(100), ..driver(8) };
+        let peer = FakePeer::standard();
+        let aps = Aps::new(&backend, &peer, bank());
+        let (to, intent) = (account(9), id(1));
+        assert_eq!(aps.route("POST", "/aps/intent", &intent_body(&intent, "rd", &to, "9")).0, 200);
+        let first = leg_body(&intent, "rd", &to, "5");
+        let second = leg_body(&intent, "rd", &to, "4").replace(r#""lane":1"#, r#""lane":2"#);
+        std::thread::scope(|scope| {
+            let one = scope.spawn(|| aps.route("POST", "/aps/leg", &first).0);
+            let two = scope.spawn(|| aps.route("POST", "/aps/leg", &second).0);
+            assert_eq!((one.join().unwrap(), two.join().unwrap()), (200, 200));
+        });
+        assert_eq!(backend.max_proving.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn a_payment_no_single_pool_covers_is_split_into_two_legs_of_the_payer() {
+        let backend = driver(7);
+        let peer = FakePeer::with(|target, path, body| match path {
+            "/aps/capacity" => Ok((200, capacity_answer(&[(1, 6), (2, 5)]))),
+            _ => standard_answer(target, path, body),
+        });
+        let aps = Aps::new(&backend, &peer, coordinator());
+        assert_eq!(aps.route("POST", "/aps/submit", &pay_body(&id(1), "rd", &account(8), &account(9), "9")).0, 200);
+        let sent = peer.calls.lock().unwrap().clone();
+        let mut legs: Vec<_> = sent.iter().filter(|call| call.2 == "/aps/leg").map(|call| (call.0.clone(), json(&call.3))).collect();
+        legs.sort_by_key(|(_, leg)| leg["ordinal"].as_u64());
+        let intent = id(1);
+        let summary: Vec<_> = legs
+            .iter()
+            .map(|(bank, leg)| (bank.as_str(), leg["ordinal"].as_u64(), leg["lane"].as_u64(), leg["asset"].as_str(), leg["amount"].as_str(), leg["intent"].as_str()))
+            .collect();
+        let expected = [
+            (BANK_A, Some(0), Some(1), Some("rd"), Some("5"), Some(intent.as_str())),
+            (BANK_A, Some(1), Some(2), Some("rd"), Some("4"), Some(intent.as_str())),
+        ];
+        assert_eq!(summary, expected);
+        assert!(!calls(&backend).contains(&"prove"), "no companion: BI proves nothing");
+    }
+
+    #[test]
+    fn a_payment_no_pool_arrangement_covers_is_422_before_anything_is_prepared() {
+        for (body, own) in [(pay_body(&id(1), "rd", &account(8), &account(9), "9"), vec!["capacity"]), (dvp_body(&account(8), &account(9), "5", "7"), vec![])] {
+            let backend = driver(7);
+            let peer = FakePeer::with(|target, path, body| match path {
+                "/aps/capacity" => Ok((200, capacity_answer(&[(1, 3), (2, 3)]))),
+                _ => standard_answer(target, path, body),
+            });
+            let aps = Aps::new(&backend, &peer, coordinator());
+            let (status, response) = aps.route("POST", "/aps/submit", &body);
+            assert_eq!((status, json(&response)), (422, serde_json::json!({ "error": "no pool arrangement covers the payment" })), "{body}");
+            assert_eq!(calls(&backend), own, "nothing prepared or proved");
+            assert!(peer.calls.lock().unwrap().iter().all(|call| call.2 == "/aps/capacity"));
+        }
     }
 }

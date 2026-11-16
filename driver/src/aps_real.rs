@@ -20,7 +20,8 @@ use crate::{
     aps_http::{AddressReq, ApsBackend, BundleCtx, BundleLists, LegCtx, LegReq, OutputKey, Settled, SponsorOutput},
     aps_split::{self, OutputCtx},
     config::{Config, signing_key},
-    pools::{self, Asset},
+    plan::Capacity,
+    pools::{self, Asset, PoolKey},
     wallet::NoteKeys,
 };
 
@@ -108,11 +109,23 @@ impl ApsBackend for RealBackend<'_> {
         Ok(SponsorOutput { authority: key.authority, view_public: key.view_public, authorization: key.authorization, active })
     }
 
-    fn begin_bundle(&self) -> Result<BundleCtx> {
-        let start = pools::begin_bundle(&self.cfg())?;
+    fn capacity(&self, asset: Asset) -> Result<Vec<(u32, Capacity)>> {
+        let cfg = self.cfg();
+        let pools = pools::unspent_values(cfg, &cfg.party, asset)?;
+        Ok(pools.into_iter().map(|(lane, values)| (lane, Capacity::of(&values))).collect())
+    }
+
+    fn begin_bundle(&self, keys: [PoolKey; 2]) -> Result<BundleCtx> {
+        let start = pools::begin_bundle(self.cfg(), keys)?;
         let leg = |index: usize| -> Result<LegCtx> {
-            let (route, pool, digest) = &start.legs[index];
-            Ok(LegCtx { pool_id: hex::encode(pool), route: enc(route)?, authority_digest: hex::encode(digest.as_ref()) })
+            let (key, route, pool, digest) = &start.legs[index];
+            Ok(LegCtx {
+                pool_id: hex::encode(pool),
+                route: enc(route)?,
+                authority_digest: hex::encode(digest.as_ref()),
+                lane: key.lane,
+                asset: key.asset.name().to_owned(),
+            })
         };
         Ok(BundleCtx {
             bundle_id: hex::encode(start.manifest.bundle_id.as_ref()),
@@ -140,7 +153,8 @@ impl ApsBackend for RealBackend<'_> {
                 req.sponsor_output.active,
             )?,
         };
-        let asset = if req.ordinal == 0 { Asset::Rd } else { Asset::Dfabi };
+        // ponytail: still the asset's sole pool; Task 4 proves in the pool `req.lane` names.
+        let asset = Asset::parse(&req.asset)?;
         let cfg = self.cfg();
         encode_prepared(&pools::prove_split_leg(&cfg, &cfg.party, asset, &leg)?)
     }
