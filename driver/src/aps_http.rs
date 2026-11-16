@@ -1294,9 +1294,10 @@ mod tests {
         let peer = FakePeer::standard();
         let aps = Aps::new(&backend, &peer, coordinator());
         let started = std::time::Instant::now();
+        let aps = &aps;
         std::thread::scope(|scope| {
             let (locked, held) = std::sync::mpsc::channel();
-            scope.spawn(|| aps.resume(|| locked.send(()).unwrap()));
+            scope.spawn(move || aps.resume(move || locked.send(()).unwrap()));
             held.recv().unwrap();
             std::thread::sleep(Duration::from_millis(50));
             let (status, _) = aps.route("POST", "/aps/submit", &pay_body(&id(1), "rd", &account(8), &account(9), "5"));
