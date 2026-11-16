@@ -153,10 +153,9 @@ impl ApsBackend for RealBackend<'_> {
                 req.sponsor_output.active,
             )?,
         };
-        // ponytail: still the asset's sole pool; Task 4 proves in the pool `req.lane` names.
-        let asset = Asset::parse(&req.asset)?;
+        let key = PoolKey { lane: req.lane, asset: Asset::parse(&req.asset)? };
         let cfg = self.cfg();
-        encode_prepared(&pools::prove_split_leg(&cfg, &cfg.party, asset, &leg)?)
+        encode_prepared(&pools::prove_split_leg(cfg, &cfg.party, key, &leg)?)
     }
 
     fn is_leg_pool(&self, req: &LegReq) -> Result<bool> {
@@ -170,7 +169,8 @@ impl ApsBackend for RealBackend<'_> {
     fn settle(&self, bundle: &BundleCtx, prepared: &[String; 2]) -> Result<Option<Settled>> {
         let manifest = dec::<AtomicPrivateSettlementV1>(&bundle.manifest)?;
         let legs = [decode_prepared(&prepared[0])?, decode_prepared(&prepared[1])?];
-        let done = pools::settle_bundle(&self.cfg(), manifest, &legs)?;
+        let key = |leg: &LegCtx| Ok::<_, eyre::Report>(PoolKey { lane: leg.lane, asset: Asset::parse(&leg.asset)? });
+        let done = pools::settle_bundle(self.cfg(), [key(&bundle.legs[0])?, key(&bundle.legs[1])?], manifest, &legs)?;
         Ok(done.map(|(carrier_tx, height)| Settled { carrier_tx, height }))
     }
 
@@ -191,6 +191,7 @@ impl ApsBackend for RealBackend<'_> {
 
     fn merge_bundles(&self, lists: &BundleLists) -> Result<()> {
         let cfg = self.cfg();
+        // The lists name no lane: each id goes to every pool of its asset, and `history()` applies a bundle only where it has a leg.
         pools::PoolFile::update(&cfg.pools_file, |file| {
             for (asset, ids) in [(Asset::Rd, &lists.rd), (Asset::Dfabi, &lists.dfabi)] {
                 for key in file.keys(asset) {

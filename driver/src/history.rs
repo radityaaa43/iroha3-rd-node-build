@@ -7,7 +7,7 @@
 //! outputs. The bundle-id index is ours (public, non-secret); the chain is the authority: every
 //! delta must continue the previous root, and the rebuilt tree must reproduce each new root.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use eyre::{Result, ensure, eyre};
 use iroha::data_model::{
@@ -31,6 +31,8 @@ pub struct PoolHistory {
     pub outputs: Vec<OutputRow>,
     /// Published nullifier -> bundle id that spent it.
     pub spent_in: BTreeMap<PrivacyNullifierV1, String>,
+    /// Bundles whose leg 0 this pool carried (its payer also paid the sponsor's reimbursement).
+    pub leg0: BTreeSet<String>,
 }
 
 impl PoolHistory {
@@ -40,7 +42,7 @@ impl PoolHistory {
         sorted.sort_unstable();
         let mut tree = PoolTree::new(pool_id)?;
         tree.append(&sorted)?;
-        Ok(Self { pool_id, tree, epoch: 1, outputs: Vec::new(), spent_in: BTreeMap::new() })
+        Ok(Self { pool_id, tree, epoch: 1, outputs: Vec::new(), spent_in: BTreeMap::new(), leg0: BTreeSet::new() })
     }
 
     pub fn root(&self) -> PrivacyRootV1 {
@@ -57,6 +59,9 @@ impl PoolHistory {
         ensure!(self.root() == delta.new_root, "rebuilt tree root differs from the finalized new root");
         self.epoch = delta.new_epoch;
         let bundle_id = hex::encode(delta.bundle_id.as_ref());
+        if delta.leg_ordinal == 0 {
+            self.leg0.insert(bundle_id.clone());
+        }
         for nullifier in &delta.nullifiers {
             self.spent_in.insert(*nullifier, bundle_id.clone());
         }

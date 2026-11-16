@@ -8,7 +8,7 @@
 
 use std::{
     cell::Cell,
-    collections::{BTreeMap, BTreeSet, HashSet},
+    collections::{BTreeMap, BTreeSet, HashMap, HashSet},
     io::Write,
     os::unix::fs::OpenOptionsExt,
     path::{Path, PathBuf},
@@ -48,7 +48,8 @@ use crate::{
     auditor::Keys,
     config::{Config, signing_key},
     history::PoolHistory,
-    wallet::{pick_note, pick_notes, scan},
+    plan::{self, Capacity, PlanError, PlannedLeg, Request},
+    wallet::{pick_notes, scan},
 };
 
 #[derive(Serialize, Deserialize, Clone, Copy, PartialEq, Eq, Debug, Hash, PartialOrd, Ord)]
@@ -71,13 +72,6 @@ impl Asset {
         match self {
             Self::Rd => "rd",
             Self::Dfabi => "dfabi",
-        }
-    }
-
-    fn other(self) -> Self {
-        match self {
-            Self::Rd => Self::Dfabi,
-            Self::Dfabi => Self::Rd,
         }
     }
 }
@@ -273,13 +267,6 @@ impl PoolFile {
         keys.sort();
         keys
     }
-
-    /// Where the code still means "the" pool of an asset: it exists once. Later steps choose among several.
-    fn sole(&self, asset: Asset) -> Result<&PoolRecord> {
-        let keys = self.keys(asset);
-        ensure!(keys.len() == 1, "{} {} pools in the pools file, expected one", keys.len(), asset.name());
-        self.get(keys[0])
-    }
 }
 
 impl PoolEntry {
@@ -331,11 +318,11 @@ impl PoolRecord {
         }
         finalized.sort_by_key(|receipt| receipt.finalized_height);
         for receipt in finalized {
-            let leg = receipt
-                .legs
-                .iter()
-                .find(|leg| leg.delta.pool_id == pool_id)
-                .ok_or_else(|| eyre!("a finalized bundle has no leg in this pool"))?;
+            // A party merges the coordinator's list per asset (`/aps/bundles` names no lane), so a pool may list a bundle of the
+            // asset's other pool: it moved nothing here.
+            let Some(leg) = receipt.legs.iter().find(|leg| leg.delta.pool_id == pool_id) else {
+                continue;
+            };
             history.apply(&leg.delta, receipt.finalized_height)?;
         }
         Ok(history)
@@ -412,14 +399,18 @@ fn origin_notes(cfg: &Config, party: &str, key: PoolKey) -> Result<Vec<PrivateSe
 
 /// The values of `party`'s unspent notes in each pool of `asset`, by lane (`POST /aps/capacity`).
 pub(crate) fn unspent_values(cfg: &Config, party: &str, asset: Asset) -> Result<Vec<(u32, Vec<u128>)>> {
-    let pools = PoolFile::load(&cfg.pools_file)?;
     let (client, _) = cfg.sponsor(party)?;
+    unspent_in(cfg, &client, party, asset)
+}
+
+fn unspent_in(cfg: &Config, client: &Client, party: &str, asset: Asset) -> Result<Vec<(u32, Vec<u128>)>> {
+    let pools = PoolFile::load(&cfg.pools_file)?;
     let keys = cfg.note_keys(party)?;
     pools
         .keys(asset)
         .into_iter()
         .map(|key| {
-            let history = pools.get(key)?.history(&client, &receipt_cache(cfg))?;
+            let history = pools.get(key)?.history(client, &receipt_cache(cfg))?;
             let (unspent, _) = scan(&history, &keys, &origin_notes(cfg, party, key)?)?;
             Ok((key.lane, unspent.iter().map(|note| note.opening.value).collect()))
         })
@@ -611,53 +602,59 @@ pub fn parse_plan(rest: &[&str]) -> Result<Vec<(u32, Vec<(Asset, u128)>)>> {
     Ok(plan)
 }
 
-/// One payment inside a shared-pool bundle.
-pub struct LegSpec {
-    pub asset: Asset,
-    pub payer: String,
-    pub recipient: String,
-    pub amount: u128,
-}
-
-/// `pay`: the asset's leg carries the payment; the other pool gets BI -> BI 1 (APS needs two
-/// dataspaces). Legs are always [RD, DFABI] (leg 0 also pays the sponsor's reimbursement).
+/// `pay`: plan the bundle as the coordinator does (`plan::plan`), from the capacities this CLI reads itself (it holds every key):
+/// the payer's, BI's (the companion) and, for an issuance, the recipient's.
 pub fn pay(cfg: &Config, asset: Asset, from: &str, to: &str, amount: u128, options: &Options) -> Result<()> {
-    let main = LegSpec { asset, payer: from.into(), recipient: to.into(), amount };
-    let companion = LegSpec { asset: asset.other(), payer: "bi".into(), recipient: "bi".into(), amount: 1 };
-    let legs = if asset == Asset::Rd { [main, companion] } else { [companion, main] };
-    run_bundle(cfg, legs, options, "pay")
+    let req = Request::Pay { asset, from: from.into(), to: to.into(), amount, intent: String::new() };
+    let mut asked = vec![("bi", asset), (from, asset)];
+    if from == "bi" {
+        asked.push((to, asset));
+    }
+    run_bundle(cfg, plan_local(cfg, &req, &asked)?, options, "pay")
 }
 
-/// DvP on the shared pools: RD buyer -> seller, DFABI seller -> buyer.
+/// DvP: RD buyer -> seller, DFABI seller -> buyer, in the pools `plan::plan` picks.
 pub fn dvp(cfg: &Config, buyer: &str, seller: &str, rd: u128, dfabi: u128, options: &Options) -> Result<()> {
-    run_bundle(
-        cfg,
-        [
-            LegSpec { asset: Asset::Rd, payer: buyer.into(), recipient: seller.into(), amount: rd },
-            LegSpec { asset: Asset::Dfabi, payer: seller.into(), recipient: buyer.into(), amount: dfabi },
-        ],
-        options,
-        "dvp",
-    )
+    let req = Request::Dvp { buyer: buyer.into(), seller: seller.into(), rd, dfabi, intent_rd: String::new(), intent_dfabi: String::new() };
+    run_bundle(cfg, plan_local(cfg, &req, &[(buyer, Asset::Rd), (seller, Asset::Dfabi)])?, options, "dvp")
 }
 
-fn run_bundle(cfg: &Config, legs: [LegSpec; 2], options: &Options, kind: &str) -> Result<()> {
-    ensure!(legs[0].asset == Asset::Rd && legs[1].asset == Asset::Dfabi, "legs must be [rd, dfabi]");
+/// `plan::plan` over the capacities of `asked` (party name, asset), read with the acting sponsor's client. BI is "bi".
+fn plan_local(cfg: &Config, req: &Request, asked: &[(&str, Asset)]) -> Result<[PlannedLeg; 2]> {
+    let (client, _) = cfg.acting_sponsor()?;
+    let mut caps = HashMap::new();
+    let mut lanes = BTreeSet::new();
+    for &(party, asset) in asked {
+        for (lane, values) in unspent_in(cfg, &client, party, asset)? {
+            lanes.insert(lane);
+            caps.insert((party.to_owned(), PoolKey { lane, asset }), Capacity::of(&values));
+        }
+    }
+    let lanes: [u32; 2] = Vec::from_iter(lanes).try_into().map_err(|_| eyre!("the pools are not in exactly two lanes"))?;
+    let cap = |who: Option<&str>, key: PoolKey| caps.get(&(who.unwrap_or("bi").to_owned(), key)).copied().unwrap_or_default();
+    plan::plan(req, "bi", lanes, &cap, &mut rand::rng()).map_err(|PlanError::Insufficient(message)| eyre!(message))
+}
+
+/// The CLI's bundle over the two planned pools (`None` payer/recipient = "bi"), proved here with every party's key.
+fn run_bundle(cfg: &Config, legs: [PlannedLeg; 2], options: &Options, kind: &str) -> Result<()> {
+    let pool_keys = [legs[0].key, legs[1].key];
     let pools = PoolFile::load(&cfg.pools_file)?;
     let (sponsor, sponsor_key) = cfg.acting_sponsor()?;
+    let governed = leg_pools(&pools, pool_keys)?;
+    let name = |party: &Option<String>| party.clone().unwrap_or_else(|| "bi".to_owned());
     let mut spends = Vec::new();
-    let mut governed = Vec::new();
     for (ordinal, leg) in legs.iter().enumerate() {
-        let record = pools.sole(leg.asset)?;
-        let history = record.history(&sponsor, &receipt_cache(cfg))?;
-        let keys = cfg.note_keys(&leg.payer)?;
-        let (unspent, _) = scan(&history, &keys, &origin_notes(cfg, &leg.payer, PoolKey { lane: lane_of(cfg, leg.asset), asset: leg.asset })?)?;
+        let payer = name(&leg.payer);
+        let history = pools.get(leg.key)?.history(&sponsor, &receipt_cache(cfg))?;
+        let keys = cfg.note_keys(&payer)?;
+        let (unspent, _) = scan(&history, &keys, &origin_notes(cfg, &payer, leg.key)?)?;
         let reimbursement = if ordinal == 0 { SPONSOR_REIMBURSEMENT } else { 0 };
         // Refused before any proving or on-chain write; no amounts in the message (logs).
-        let note = pick_note(&unspent, leg.amount + reimbursement)
-            .wrap_err_with(|| format!("leg {ordinal}: insufficient payer note (rejected before proving)"))?;
-        spends.push((note, keys, history));
-        governed.push(record.governed()?);
+        let mut notes = pick_notes(&unspent, leg.amount + reimbursement)
+            .wrap_err_with(|| format!("leg {ordinal}: insufficient payer note (rejected before proving)"))?
+            .into_iter();
+        let (note, extra) = (notes.next().ok_or_else(|| eyre!("no note picked"))?, notes.next().map(|n| n.opening));
+        spends.push((note, extra, keys, history));
     }
     let committees = committees_of(cfg, &governed)?;
     let network_id = *sponsor.client().network_id();
@@ -675,26 +672,27 @@ fn run_bundle(cfg: &Config, legs: [LegSpec; 2], options: &Options, kind: &str) -
     println!("bundle_id={}", hex::encode(manifest.bundle_id.as_ref()));
     let started = Instant::now();
     let mut prepared = Vec::new();
-    for (ordinal, (leg, (note, keys, history))) in legs.iter().zip(spends).enumerate() {
+    for (ordinal, (leg, (note, extra, keys, history))) in legs.iter().zip(spends).enumerate() {
         let wallet = |party: &str| Ok::<_, eyre::Report>(signing_key(&cfg.seed(party)?));
+        let recipient = name(&leg.recipient);
         let spec = Leg {
-            lane: lane_of(cfg, leg.asset),
-            asset: asset_id(cfg, leg.asset).parse()?,
-            payer: wallet(&leg.payer)?,
-            recipient: wallet(&leg.recipient)?,
-            funding: note.opening.value,
+            lane: leg.key.lane,
+            asset: asset_id(cfg, leg.key.asset).parse()?,
+            payer: wallet(&name(&leg.payer))?,
+            recipient: wallet(&recipient)?,
+            funding: note.opening.value + extra.as_ref().map_or(0, |n| n.value),
             amount: leg.amount,
         };
         let (bundle, pool) = (*manifest.bundle_id.as_ref(), *governed[ordinal].governance.body.pool_id.as_ref());
-        let notes = LegNotes { recipient: cfg.note_keys(&leg.recipient)?.one_time(&bundle, &pool, 0), change: keys.one_time(&bundle, &pool, 1) };
-        let spend = Spend::Continue { opening: note.opening, secret: keys.spend, tree: history.tree, epoch: history.epoch, extra: None };
+        let notes = LegNotes { recipient: cfg.note_keys(&recipient)?.one_time(&bundle, &pool, 0), change: keys.one_time(&bundle, &pool, 1) };
+        let spend = Spend::Continue { opening: note.opening, secret: keys.spend, tree: history.tree, epoch: history.epoch, extra };
         let authority_digest = committees[ordinal].authority.digest()?;
         prepared.push(on_big_stack(|| {
             prepare_leg(ordinal, &spec, &governed[ordinal], spend, &notes, &manifest, authority_digest, &sponsor_key, salt)
         })?);
         println!("leg {ordinal} proved after {:?} {}", started.elapsed(), peak_rss());
     }
-    settle_recorded(cfg, &sponsor, manifest, &prepared, &governed, &committees, started, options)?;
+    settle_recorded(cfg, &sponsor, pool_keys, manifest, &prepared, &governed, &committees, started, options)?;
     println!("kind={kind}");
     Ok(())
 }
@@ -709,11 +707,13 @@ fn committees_of(cfg: &Config, governed: &[Governed]) -> Result<Vec<Committee>> 
         .collect()
 }
 
-/// List the bundle as in flight in pools.json (recorded before submission, so a finalized bundle is never lost), settle it, record how it ended.
+/// List the bundle as in flight in the two pools it touches (recorded before submission, so a finalized bundle is never lost),
+/// settle it, record how it ended.
 #[allow(clippy::too_many_arguments)]
 fn settle_recorded(
     cfg: &Config,
     sponsor: &Client,
+    keys: [PoolKey; 2],
     manifest: AtomicPrivateSettlementV1,
     prepared: &[AtomicPrivateSettlementPreparedLegV1],
     governed: &[Governed],
@@ -722,12 +722,7 @@ fn settle_recorded(
     options: &Options,
 ) -> Result<Option<(String, u64)>> {
     let id = hex::encode(manifest.bundle_id.as_ref());
-    PoolFile::update(&cfg.pools_file, |pools| {
-        for entry in &mut pools.pools {
-            entry.record.bundles.push(BundleRef { id: id.clone(), height: 0 });
-        }
-        Ok(())
-    })?;
+    PoolFile::update(&cfg.pools_file, |pools| record_start(pools, keys, &id))?;
     let aborted = Cell::new(false);
     let outcome = settle(cfg, sponsor, manifest, prepared, governed, committees, started, options, &aborted);
     let end = bundle_end(&outcome, aborted.get());
@@ -737,17 +732,24 @@ fn settle_recorded(
 
 /// List the bundle at height 0 in the two pools it touches, and only there.
 fn record_start(pools: &mut PoolFile, keys: [PoolKey; 2], id: &str) -> Result<()> {
-    todo!("{:?} {id} {}", keys, pools.pools.len())
+    for key in keys {
+        pools.merge_finalized(key, &[id.to_owned()], &BTreeMap::new())?;
+    }
+    Ok(())
 }
 
 /// The governed pools of a bundle's two legs, in leg order: `keys` sorted by lane (leg 0 = the lowest lane).
 fn leg_pools(pools: &PoolFile, keys: [PoolKey; 2]) -> Result<[Governed; 2]> {
-    todo!("{:?} {}", keys, pools.pools.len())
+    ensure!(keys[0].lane < keys[1].lane, "a bundle has one leg per lane, sorted by lane");
+    Ok([pools.get(keys[0])?.governed()?, pools.get(keys[1])?.governed()?])
 }
 
 /// Whether `key` names the pool the manifest has at leg `ordinal` (a key this pools file does not know never does).
 pub(crate) fn is_leg_pool(pools: &PoolFile, key: PoolKey, manifest: &AtomicPrivateSettlementV1, ordinal: usize) -> bool {
-    todo!("{key:?} {ordinal} {} {}", pools.pools.len(), manifest.legs.len())
+    let Some(leg) = manifest.legs.get(ordinal) else {
+        return false;
+    };
+    pools.get(key).and_then(PoolRecord::pool_id).is_ok_and(|pool| pool == leg.pool_id)
 }
 
 /// What the coordinator fixes before any party signs or proves: the manifest and, per leg (by lane), its pool key, route, pool id
@@ -760,10 +762,9 @@ pub(crate) struct BundleStart {
 
 /// Coordinator: the manifest of a new bundle over the two planned pools (`run_bundle` up to the legs, with no payer's secret).
 pub(crate) fn begin_bundle(cfg: &Config, keys: [PoolKey; 2]) -> Result<BundleStart> {
-    ensure!(keys[0].lane < keys[1].lane, "a bundle has one leg per lane, sorted by lane");
     let pools = PoolFile::load(&cfg.pools_file)?;
     let (sponsor, sponsor_key) = cfg.acting_sponsor()?;
-    let governed = [pools.get(keys[0])?.governed()?, pools.get(keys[1])?.governed()?];
+    let governed = leg_pools(&pools, keys)?;
     let committees = committees_of(cfg, &governed)?;
     let network_id = *sponsor.client().network_id();
     let height = sponsor.client().get_privacy_capabilities()?.committed_height;
@@ -790,13 +791,18 @@ pub(crate) fn begin_bundle(cfg: &Config, keys: [PoolKey; 2]) -> Result<BundleSta
 
 /// Coordinator: settle a bundle whose legs the parties proved (the tail of `run_bundle`). An audit rejection aborts the
 /// bundle and is `None`, not an error.
-pub(crate) fn settle_bundle(cfg: &Config, manifest: AtomicPrivateSettlementV1, prepared: &[AtomicPrivateSettlementPreparedLegV1]) -> Result<Option<(String, u64)>> {
+pub(crate) fn settle_bundle(
+    cfg: &Config,
+    keys: [PoolKey; 2],
+    manifest: AtomicPrivateSettlementV1,
+    prepared: &[AtomicPrivateSettlementPreparedLegV1],
+) -> Result<Option<(String, u64)>> {
     let pools = PoolFile::load(&cfg.pools_file)?;
     let (sponsor, _) = cfg.acting_sponsor()?;
-    let governed = [pools.sole(Asset::Rd)?.governed()?, pools.sole(Asset::Dfabi)?.governed()?];
+    let governed = leg_pools(&pools, keys)?;
     let committees = committees_of(cfg, &governed)?;
     let options = Options { expect: Expect::Either, replay: false };
-    settle_recorded(cfg, &sponsor, manifest, prepared, &governed, &committees, Instant::now(), &options)
+    settle_recorded(cfg, &sponsor, keys, manifest, prepared, &governed, &committees, Instant::now(), &options)
 }
 
 /// One leg as `POST /aps/leg` hands it to the payer.
@@ -811,15 +817,17 @@ pub(crate) struct SplitLeg {
     pub sponsor_output: OutputKey,
 }
 
-/// Payer side of one leg of a bundle the coordinator built: scan the own notes, pick one, prove with the own secrets only
-/// (`aps_split::prepare_leg_split`); the recipient's and the sponsor's outputs arrive signed by their owners.
-pub(crate) fn prove_split_leg(cfg: &Config, payer: &str, asset: Asset, leg: &SplitLeg) -> Result<AtomicPrivateSettlementPreparedLegV1> {
+/// Payer side of one leg of a bundle the coordinator built, in the pool `key` (the manifest's pool at the leg's ordinal): scan the
+/// own notes, pick one or two, prove with the own secrets only (`aps_split::prepare_leg_split`); the recipient's and the sponsor's
+/// outputs arrive signed by their owners. The reimbursement goes with leg 0, whatever its asset.
+pub(crate) fn prove_split_leg(cfg: &Config, payer: &str, key: PoolKey, leg: &SplitLeg) -> Result<AtomicPrivateSettlementPreparedLegV1> {
     let pools = PoolFile::load(&cfg.pools_file)?;
-    let record = pools.sole(asset)?;
+    ensure!(is_leg_pool(&pools, key, &leg.manifest, leg.ordinal), "leg {}: not the manifest's pool for this leg", leg.ordinal);
+    let record = pools.get(key)?;
     let (client, _) = cfg.sponsor(payer)?;
     let history = record.history(&client, &receipt_cache(cfg))?;
     let keys = cfg.note_keys(payer)?;
-    let (unspent, _) = scan(&history, &keys, &origin_notes(cfg, payer, PoolKey { lane: lane_of(cfg, asset), asset })?)?;
+    let (unspent, _) = scan(&history, &keys, &origin_notes(cfg, payer, key)?)?;
     let reimbursement = if leg.ordinal == 0 { SPONSOR_REIMBURSEMENT } else { 0 };
     // Refused before any proving; no amounts in the message (logs).
     let mut notes = pick_notes(&unspent, leg.amount + reimbursement)
@@ -831,8 +839,8 @@ pub(crate) fn prove_split_leg(cfg: &Config, payer: &str, asset: Asset, leg: &Spl
     let change = keys.one_time(&bundle, &pool, 1);
     let sponsor = leg.manifest.sponsor.try_signatory().ok_or_else(|| eyre!("the manifest sponsor is not a single-key account"))?;
     let spec = LegPayer {
-        lane: lane_of(cfg, asset),
-        asset: asset_id(cfg, asset).parse()?,
+        lane: key.lane,
+        asset: asset_id(cfg, key.asset).parse()?,
         payer: signing_key(&cfg.seed(payer)?),
         recipient: leg.recipient.clone(),
         amount: leg.amount,
@@ -900,30 +908,31 @@ pub fn wallet_json(cfg: &Config, party: &str) -> Result<serde_json::Value> {
     let pools = PoolFile::load(&cfg.pools_file)?;
     let (client, _) = cfg.sponsor(party)?;
     let keys = cfg.note_keys(party)?;
-    let mut balances = serde_json::Map::new();
-    let mut items = Vec::new();
+    let mut views = Vec::new();
     for asset in [Asset::Rd, Asset::Dfabi] {
-        let mut balance = 0u128;
         for key in pools.keys(asset) {
             let record = pools.get(key)?;
             let history = record.history(&client, &receipt_cache(cfg))?;
             let (unspent, spent) = scan(&history, &keys, &origin_notes(cfg, party, key)?)?;
-            balance += unspent.iter().map(|n| n.opening.value).sum::<u128>();
-            for bundle in &record.bundles {
-                let received: u128 = unspent
-                    .iter()
-                    .chain(spent.iter().map(|(n, _)| n))
-                    .filter(|n| n.bundle_id.as_deref() == Some(bundle.id.as_str()))
-                    .map(|n| n.opening.value)
-                    .sum();
-                let paid: u128 = spent.iter().filter(|(_, by)| *by == bundle.id).map(|(n, _)| n.opening.value).sum();
-                items.extend(item_json(asset, bundle, received, paid, pools.carriers.get(&bundle.id).map(String::as_str)));
-            }
+            let moved = record
+                .bundles
+                .iter()
+                .map(|bundle| Moved {
+                    bundle: bundle.clone(),
+                    received: unspent
+                        .iter()
+                        .chain(spent.iter().map(|(n, _)| n))
+                        .filter(|n| n.bundle_id.as_deref() == Some(bundle.id.as_str()))
+                        .map(|n| n.opening.value)
+                        .sum(),
+                    paid: spent.iter().filter(|(_, by)| *by == bundle.id).map(|(n, _)| n.opening.value).sum(),
+                    leg0: history.leg0.contains(&bundle.id),
+                })
+                .collect();
+            views.push(PoolView { asset, balance: unspent.iter().map(|n| n.opening.value).sum(), moved });
         }
-        balances.insert(asset.name().into(), balance.to_string().into());
     }
-    items.sort_by_key(|i| std::cmp::Reverse(i["height"].as_u64()));
-    Ok(serde_json::json!({ "party": party, "balances": balances, "items": items }))
+    Ok(wallet_value(party, &views, &pools.carriers))
 }
 
 /// What a party holds in one pool and moved there per bundle, read from the pool's history.
@@ -941,16 +950,38 @@ struct Moved {
     leg0: bool,
 }
 
-/// The wallet JSON from the views of every pool: balances summed per asset, one row per (bundle, asset).
+/// The wallet JSON from the views of every pool: balances summed per asset, one row per (bundle, asset) summed over the asset's
+/// pools (a split pay touches both). The party that paid leg 0 paid the reimbursement in that leg's asset: its row has the fee.
 fn wallet_value(party: &str, views: &[PoolView], carriers: &BTreeMap<String, String>) -> serde_json::Value {
-    todo!("{party} {} {}", views.len(), carriers.len())
+    let mut balances = serde_json::Map::new();
+    for asset in [Asset::Rd, Asset::Dfabi] {
+        let balance: u128 = views.iter().filter(|view| view.asset == asset).map(|view| view.balance).sum();
+        balances.insert(asset.name().into(), balance.to_string().into());
+    }
+    let mut rows: BTreeMap<(&str, Asset), (&BundleRef, u128, u128, bool)> = BTreeMap::new();
+    for view in views {
+        for moved in &view.moved {
+            let row = rows.entry((moved.bundle.id.as_str(), view.asset)).or_insert((&moved.bundle, 0, 0, false));
+            row.1 += moved.received;
+            row.2 += moved.paid;
+            row.3 |= moved.leg0 && moved.paid > 0;
+        }
+    }
+    let mut items: Vec<_> = rows
+        .into_iter()
+        .filter_map(|((id, asset), (bundle, received, paid, leg0))| {
+            let fee = if leg0 { SPONSOR_REIMBURSEMENT } else { 0 };
+            item_json(asset, bundle, received, paid, fee, carriers.get(id).map(String::as_str))
+        })
+        .collect();
+    items.sort_by_key(|i| std::cmp::Reverse(i["height"].as_u64()));
+    serde_json::json!({ "party": party, "balances": balances, "items": items })
 }
 
-/// One wallet row for a bundle, or None when nothing visible moved. The payer of the RD leg (leg 0) also
-/// reimbursed the sponsor 1 RD: `amount` is the leg without it.
-fn item_json(asset: Asset, bundle: &BundleRef, received: u128, paid: u128, carrier_tx: Option<&str>) -> Option<serde_json::Value> {
-    let fee = if asset == Asset::Rd && paid > 0 { SPONSOR_REIMBURSEMENT } else { 0 };
-    let (direction, amount) = if paid > received { ("out", paid - received - fee) } else { ("in", received - paid) };
+/// One wallet row for a bundle, or None when nothing visible moved. `fee`: the party paid leg 0, so it also reimbursed the
+/// sponsor; `amount` is what it paid without it.
+fn item_json(asset: Asset, bundle: &BundleRef, received: u128, paid: u128, fee: u128, carrier_tx: Option<&str>) -> Option<serde_json::Value> {
+    let (direction, amount) = if paid > received { ("out", (paid - received).saturating_sub(fee)) } else { ("in", received - paid) };
     (amount > 0).then(|| {
         serde_json::json!({
             "bundle_id": bundle.id, "height": bundle.height, "asset": asset.name(),
@@ -1057,16 +1088,16 @@ mod tests {
     fn wallet_item_carries_sponsor_fee() {
         let bundle = BundleRef { id: "b".into(), height: 7 };
         // RD payer: spent a note of 2000, got 999 change back, paid 1000 + 1 reimbursement.
-        let rd_out = item_json(Asset::Rd, &bundle, 999, 2000, None).unwrap();
+        let rd_out = item_json(Asset::Rd, &bundle, 999, 2000, 1, None).unwrap();
         assert_eq!((rd_out["direction"].as_str(), rd_out["amount"].as_str(), rd_out["fee"].as_str()), (Some("out"), Some("1000"), Some("1")));
         // RD recipient pays no fee.
-        let rd_in = item_json(Asset::Rd, &bundle, 1000, 0, None).unwrap();
+        let rd_in = item_json(Asset::Rd, &bundle, 1000, 0, 0, None).unwrap();
         assert_eq!((rd_in["direction"].as_str(), rd_in["fee"].as_str()), (Some("in"), Some("0")));
-        // Only leg 0 (RD) carries the reimbursement.
-        let dfabi_out = item_json(Asset::Dfabi, &bundle, 49, 50, None).unwrap();
+        // A payer outside leg 0 pays no reimbursement.
+        let dfabi_out = item_json(Asset::Dfabi, &bundle, 49, 50, 0, None).unwrap();
         assert_eq!((dfabi_out["amount"].as_str(), dfabi_out["fee"].as_str()), (Some("1"), Some("0")));
         // BI's companion RD leg (BI -> BI 1): only the fee left, so no row.
-        assert!(item_json(Asset::Rd, &bundle, 1999, 2000, None).is_none());
+        assert!(item_json(Asset::Rd, &bundle, 1999, 2000, 1, None).is_none());
     }
 
     /// Lensa runs several driver containers on one pools.json; each finishing bundle must keep the others' entries.
@@ -1163,9 +1194,9 @@ mod tests {
     #[test]
     fn wallet_item_names_its_carrier_tx() {
         let bundle = BundleRef { id: "b".into(), height: 7 };
-        let known = item_json(Asset::Rd, &bundle, 1000, 0, Some("c0ffee")).unwrap();
+        let known = item_json(Asset::Rd, &bundle, 1000, 0, 0, Some("c0ffee")).unwrap();
         assert_eq!(known["carrier_tx"].as_str(), Some("c0ffee"));
-        let unknown = item_json(Asset::Rd, &bundle, 1000, 0, None).unwrap();
+        let unknown = item_json(Asset::Rd, &bundle, 1000, 0, 0, None).unwrap();
         assert!(unknown["carrier_tx"].is_null(), "{unknown}");
     }
 
@@ -1572,7 +1603,12 @@ dfabi = 2
                     Asset::Rd => "7onbjg2gRXveoAAUFsohCZyGW98t",
                     Asset::Dfabi => "4mBWK1JCwQdHLDPpuVKc56eLsXka",
                 };
-                let g = crate::aps::govern_with(dec(&route_hex(lane)).unwrap(), definition.parse().unwrap(), 100, None, &auditors, 1).unwrap();
+                let route = PrivateSettlementRouteV1 {
+                    dataspace_id: DataSpaceId::new(u64::from(lane)),
+                    lane_id: LaneId::new(lane),
+                    lane_incarnation: Hash::new(b"rd-dfabi-selftest"),
+                };
+                let g = crate::aps::govern_with(route, definition.parse().unwrap(), 100, None, &auditors, 1).unwrap();
                 let record = PoolRecord {
                     pool_id: hex::encode(g.governance.body.pool_id.as_ref()),
                     route: enc(&g.route).unwrap(),

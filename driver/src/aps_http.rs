@@ -495,6 +495,11 @@ impl<'a> Aps<'a> {
             Ok(amount) => amount,
             Err(e) => return error(400, format!("{e:#}")),
         };
+        match self.backend.is_leg_pool(&req) {
+            Ok(true) => {}
+            Ok(false) => return error(400, "lane and asset do not name the manifest's pool for this leg"),
+            Err(e) => return fail(e),
+        }
         if let Err(reply) = self.consume(now, &req, amount) {
             return reply;
         }
