@@ -1,6 +1,6 @@
 //! Long-lived settlement pools: every Lensa flow is one bundle in the same two pools.
 //!
-//! `pool-init` activates one RD pool (ds-rd) and one DFABI pool (ds-dfabi) once, each with an
+//! `pool-init` / `pool-add` activate pools per dataspace lane (an RD pool and/or a DFABI pool), each with an
 //! origin note owned by BI (its issuance reserve). Every later operation spends one live note of
 //! the payer (`Spend::Continue`, path from the client-side tree) into the recipient's and the
 //! payer's note keys. The pools file holds only public material (route, policy, governance,
@@ -8,7 +8,7 @@
 
 use std::{
     cell::Cell,
-    collections::BTreeMap,
+    collections::{BTreeMap, BTreeSet, HashSet},
     io::Write,
     os::unix::fs::OpenOptionsExt,
     path::{Path, PathBuf},
@@ -35,6 +35,7 @@ use iroha_model_base::{
     metadata::Metadata,
     topology::{DataSpaceId, LaneId},
 };
+use rand::seq::SliceRandom;
 use serde::{Deserialize, Serialize};
 
 use crate::{
@@ -128,6 +129,7 @@ impl PoolFile {
     pub fn load(path: &Path) -> Result<Self> {
         #[derive(Deserialize)]
         struct Raw {
+            version: Option<u32>,
             pools: Option<Vec<PoolEntry>>,
             rd: Option<PoolRecord>,
             dfabi: Option<PoolRecord>,
@@ -141,8 +143,14 @@ impl PoolFile {
             Ok(PoolEntry { lane, asset, record })
         };
         let pools = match raw {
-            Raw { pools: Some(pools), rd: None, dfabi: None, .. } => pools,
-            Raw { pools: None, rd: Some(rd), dfabi: Some(dfabi), .. } => vec![legacy(Asset::Rd, rd)?, legacy(Asset::Dfabi, dfabi)?],
+            Raw { version, pools: Some(pools), rd: None, dfabi: None, .. } => {
+                ensure!(version == Some(2), "{}: pool file version {version:?}, expected 2", path.display());
+                pools
+            }
+            Raw { version, pools: None, rd: Some(rd), dfabi: Some(dfabi), .. } => {
+                ensure!(version.is_none(), "{}: a legacy pool file has no version, found {version:?}", path.display());
+                vec![legacy(Asset::Rd, rd)?, legacy(Asset::Dfabi, dfabi)?]
+            }
             _ => bail!("{}: neither a v2 pool file nor the legacy {{rd, dfabi}} one", path.display()),
         };
         let file = Self { pools, carriers: raw.carriers };
@@ -177,15 +185,23 @@ impl PoolFile {
 
     /// Append new pools (creating the file when there is none) under the lock. A key already present is refused.
     pub fn add(path: &Path, entries: Vec<PoolEntry>) -> Result<()> {
-        todo!("RED: {} {}", path.display(), entries.len())
+        let _lock = Self::lock(path)?;
+        let mut file = if path.exists() { Self::load(path)? } else { Self { pools: Vec::new(), carriers: BTreeMap::new() } };
+        for entry in entries {
+            let key = entry.key();
+            ensure!(file.get(key).is_err(), "{} pool in lane {} already exists", key.asset.name(), key.lane);
+            file.pools.push(entry);
+        }
+        file.save(path)
     }
 
     /// The finalized bundles (height > 0) of every pool of the asset, in ledger order: what a party driver needs to rebuild the history.
     pub fn finalized(&self, asset: Asset) -> Vec<BundleRef> {
         let mut bundles: Vec<BundleRef> = Vec::new();
+        let mut seen = HashSet::new();
         for entry in self.pools.iter().filter(|entry| entry.asset == asset) {
             for bundle in entry.record.bundles.iter().filter(|bundle| bundle.height > 0) {
-                if !bundles.iter().any(|known| known.id == bundle.id) {
+                if seen.insert(bundle.id.as_str()) {
                     bundles.push(bundle.clone());
                 }
             }
@@ -205,7 +221,9 @@ impl PoolFile {
 
     /// A key that names no pool is an error: callers take their keys from `keys()`.
     pub fn merge_finalized(&mut self, key: PoolKey, ids: &[String], heights: &BTreeMap<String, u64>) -> Result<()> {
-        let Some(entry) = self.pools.iter_mut().find(|entry| entry.key() == key) else { return Ok(()) };
+        let Some(entry) = self.pools.iter_mut().find(|entry| entry.key() == key) else {
+            bail!("no {} pool in lane {} to merge into", key.asset.name(), key.lane);
+        };
         let bundles = &mut entry.record.bundles;
         for id in ids {
             let height = heights.get(id).copied().unwrap_or(0);
@@ -377,9 +395,11 @@ fn origin_note_path(cfg: &Config, key: PoolKey) -> PathBuf {
     cfg.key_dir.join(format!("bi.origin-{}-{}.note", key.lane, key.asset.name()))
 }
 
-/// RED stub: the origin note file to read.
+/// The origin note file to read: the pool's own, else (only for the lane the first deployment used) `bi.origin-<asset>.note`.
 fn origin_note_file(cfg: &Config, key: PoolKey) -> PathBuf {
-    origin_note_path(cfg, key)
+    let current = origin_note_path(cfg, key);
+    let legacy = cfg.key_dir.join(format!("bi.origin-{}.note", key.asset.name()));
+    if !current.exists() && key.lane == lane_of(cfg, key.asset) && legacy.exists() { legacy } else { current }
 }
 
 /// BI's origin (reserve) note of a pool; other parties have none.
@@ -417,24 +437,114 @@ fn route(client: &Client, lane: u32) -> Result<PrivateSettlementRouteV1> {
     Ok(PrivateSettlementRouteV1 { dataspace_id: DataSpaceId::new(u64::from(lane)), lane_id, lane_incarnation: incarnation })
 }
 
-/// RED stub.
-pub fn pool_add(cfg: &Config, lane: u32, reserves: &[(Asset, u128)], _rng: &mut impl rand::Rng) -> Result<Vec<PoolKey>> {
-    todo!("RED: {} {lane} {}", cfg.pools_file.display(), reserves.len())
+/// Activate pools in ONE dataspace (`lane`), one per `(asset, reserve)`, each holding a BI reserve note: ONE transaction with
+/// one `ActivatePrivateSettlementPoolV1` per pool, in an order shuffled with `rng` (the position of an instruction must not
+/// tell which asset it is). One transaction must stay inside ONE dataspace: each activation routes to its own dataspace
+/// (queue/router.rs `ActivatePrivateSettlementPoolV1 => route.dataspace_id`), and two dataspaces in one transaction become a
+/// cross-dataspace NativeAmx plan that never got a lane payload on this cluster: queued forever, no block, 300 s timeout
+/// (see `aps.rs`, the same reason it activates one transaction per pool). Hence one call per lane.
+/// Refuses a key already in the pools file, and an origin note file that exists, before any network call.
+pub fn pool_add(cfg: &Config, lane: u32, reserves: &[(Asset, u128)], rng: &mut impl rand::Rng) -> Result<Vec<PoolKey>> {
+    ensure!(!reserves.is_empty(), "pool-add: no reserve given for lane {lane}");
+    let assets: BTreeSet<_> = reserves.iter().map(|(asset, _)| *asset).collect();
+    ensure!(assets.len() == reserves.len(), "pool-add: an asset twice in lane {lane}");
+    if cfg.pools_file.exists() {
+        let file = PoolFile::load(&cfg.pools_file)?;
+        for asset in &assets {
+            ensure!(file.get(PoolKey { lane, asset: *asset }).is_err(), "{} pool in lane {lane} already exists", asset.name());
+        }
+    }
+    for asset in &assets {
+        let note = origin_note_path(cfg, PoolKey { lane, asset: *asset });
+        ensure!(!note.exists(), "{} exists: no pool is recorded for it, move it away first", note.display());
+    }
+    let (sponsor, _) = cfg.acting_sponsor()?;
+    let caps = sponsor.client().get_privacy_capabilities()?;
+    ensure!(
+        caps.protocols.iter().any(|row| row.protocol_id == PrivacyProtocolIdV1::IrohaIvmPrivateNoteStarkV1 && row.activation.is_some()),
+        "IVM private-note capability is not activated"
+    );
+    let (auditors, min_approvals) = crate::aps::auditors_from_config(cfg)?;
+    let bi = cfg.note_keys("bi")?;
+    let fee = bounded_fee(cfg)?;
+    let lane_route = route(&sponsor, lane)?;
+    let mut activations = Vec::new();
+    let mut pending = Vec::new();
+    for (asset, reserve) in activation_order(reserves, rng) {
+        let governed = crate::aps::govern_with(lane_route, asset_id(cfg, asset).parse()?, caps.committed_height, None, &auditors, min_approvals)?;
+        let funding = funding_with_secret(reserve, bi.spend)?;
+        activations.push(ActivatePrivateSettlementPoolV1::from_restricted(&governed.governance, funding.activation_commitments().to_vec())?);
+        pending.push((asset, governed, funding));
+    }
+    let account = sponsor.account_client();
+    let tx = account
+        .prepare_transaction(AccountTransactionDraft::new(activations, fee, Metadata::default()))
+        .and_then(|payload| account.sign_transaction(payload))
+        .wrap_err("build pool activation")?;
+    let hash = sponsor.submit_transaction_and_wait(&tx).wrap_err_with(|| format!("activate pools of lane {lane}"))?;
+    println!("pool_activation_tx={hash} lane={lane}");
+    let mut entries = Vec::new();
+    for (asset, governed, funding) in pending {
+        write_secret(&origin_note_path(cfg, PoolKey { lane, asset }), &enc(&funding.opening)?)?;
+        let record = PoolRecord {
+            pool_id: hex::encode(governed.governance.body.pool_id.as_ref()),
+            route: enc(&governed.route)?,
+            policy: enc(&governed.policy)?,
+            governance: enc(&governed.governance)?,
+            origin: funding.input_commitments.iter().map(|c| hex::encode(c.as_bytes())).collect(),
+            bundles: Vec::new(),
+        };
+        println!("pool_json={}", serde_json::json!({ "lane": lane, "asset": asset.name(), "pool_id": record.pool_id }));
+        entries.push(PoolEntry { lane, asset, record });
+    }
+    let keys = entries.iter().map(PoolEntry::key).collect();
+    PoolFile::add(&cfg.pools_file, entries)?;
+    Ok(keys)
 }
 
-/// RED stub.
-pub fn pool_init(cfg: &Config, plan: &[(u32, Vec<(Asset, u128)>)], _rng: &mut impl rand::Rng) -> Result<()> {
-    todo!("RED: {} {}", cfg.pools_file.display(), plan.len())
+/// One-time: activate the pools of every lane in `plan` (one `pool_add` per lane, lanes in shuffled order). Needs no pools file.
+pub fn pool_init(cfg: &Config, plan: &[(u32, Vec<(Asset, u128)>)], rng: &mut impl rand::Rng) -> Result<()> {
+    ensure!(!cfg.pools_file.exists(), "{} exists: pools are initialized once", cfg.pools_file.display());
+    ensure!(!plan.is_empty(), "pool-init: no lane given");
+    let mut lanes = BTreeSet::new();
+    for (lane, _) in plan {
+        ensure!(lanes.insert(*lane), "pool-init: lane {lane} twice");
+    }
+    let mut order: Vec<_> = plan.iter().collect();
+    order.shuffle(rng);
+    for (lane, reserves) in order {
+        pool_add(cfg, *lane, reserves, rng)?;
+    }
+    Ok(())
 }
 
-/// RED stub: the order the activations go into the transaction.
-fn activation_order(reserves: &[(Asset, u128)], _rng: &mut impl rand::Rng) -> Vec<(Asset, u128)> {
-    reserves.to_vec()
+/// The order the activations go into the transaction.
+fn activation_order(reserves: &[(Asset, u128)], rng: &mut impl rand::Rng) -> Vec<(Asset, u128)> {
+    let mut order = reserves.to_vec();
+    order.shuffle(rng);
+    order
 }
 
-/// RED stub: `--lane N [--rd A] [--dfabi B]` groups.
+/// `--lane N [--rd A] [--dfabi B]` groups, in the order given: each amount belongs to the last `--lane` before it.
 pub fn parse_plan(rest: &[&str]) -> Result<Vec<(u32, Vec<(Asset, u128)>)>> {
-    todo!("RED: {}", rest.len())
+    let mut plan: Vec<(u32, Vec<(Asset, u128)>)> = Vec::new();
+    let mut args = rest.iter();
+    while let Some(flag) = args.next() {
+        let value = args.next().ok_or_else(|| eyre!("{flag} needs a value"))?;
+        if *flag == "--lane" {
+            let lane = value.parse().wrap_err_with(|| format!("--lane {value}"))?;
+            ensure!(plan.iter().all(|(known, _)| *known != lane), "--lane {lane} twice");
+            plan.push((lane, Vec::new()));
+            continue;
+        }
+        let asset = Asset::parse(flag.strip_prefix("--").ok_or_else(|| eyre!("unexpected {flag}"))?)?;
+        let (_, reserves) = plan.last_mut().ok_or_else(|| eyre!("{flag} before any --lane"))?;
+        ensure!(reserves.iter().all(|(known, _)| *known != asset), "{flag} twice in one lane");
+        reserves.push((asset, value.parse().wrap_err_with(|| format!("{flag} {value}"))?));
+    }
+    ensure!(!plan.is_empty(), "at least one --lane");
+    ensure!(plan.iter().all(|(_, reserves)| !reserves.is_empty()), "every --lane needs --rd and/or --dfabi");
+    Ok(plan)
 }
 
 /// One payment inside a shared-pool bundle.
