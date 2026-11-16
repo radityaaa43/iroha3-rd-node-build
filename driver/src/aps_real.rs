@@ -4,7 +4,6 @@
 //! the own leg alone (`pools::prove_split_leg`, `aps_split::prepare_leg_split`). Coordinator side (BI): `begin_bundle`,
 //! `sponsor_output` and `settle` (`aps::settle`). Nothing here reads another party's key.
 
-use std::sync::{Mutex, MutexGuard};
 
 use eyre::{Result, bail, eyre};
 use iroha::data_model::{
@@ -25,17 +24,20 @@ use crate::{
     wallet::NoteKeys,
 };
 
+/// Reads the config without a lock: a guard held across a leg proof (~12 s) or a settle (~80 s) made BI's `GET /aps/bundles`
+/// wait, and every bank asks it before proving its leg, so the two legs ran one after the other. The APS path is serialized by
+/// `Aps` itself (`submit_lock`: one bundle, `prove_lock`: one own proof).
 pub struct RealBackend<'a> {
-    cfg: &'a Mutex<Config>,
+    cfg: &'a Config,
 }
 
 impl<'a> RealBackend<'a> {
-    pub fn new(cfg: &'a Mutex<Config>) -> Self {
+    pub fn new(cfg: &'a Config) -> Self {
         Self { cfg }
     }
 
-    fn cfg(&self) -> MutexGuard<'a, Config> {
-        self.cfg.lock().unwrap_or_else(|p| p.into_inner())
+    fn cfg(&self) -> &'a Config {
+        self.cfg
     }
 }
 

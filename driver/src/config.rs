@@ -10,7 +10,7 @@ use serde::Deserialize;
 use url::Url;
 
 /// One TOML file shared by the coordinator (`dvp`) and `bi-auditor`.
-#[derive(Debug, Deserialize)]
+#[derive(Clone, Debug, Deserialize)]
 pub struct Config {
     #[serde(skip)]
     pub path: PathBuf,
@@ -84,7 +84,7 @@ pub struct TlsConfig {
 }
 
 /// `[audit]`: the auditors that must approve and how many.
-#[derive(Debug, Deserialize)]
+#[derive(Clone, Debug, Deserialize)]
 pub struct AuditSection {
     pub min_approvals: Option<usize>,
     /// host:port of each auditor (BI, org A, org B), the order of the policy's auditor list.
@@ -98,20 +98,20 @@ pub struct AuditPolicy {
     pub auditor_urls: Vec<String>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Clone, Debug, Deserialize)]
 pub struct Assets {
     pub rd: String,
     pub dfabi: String,
 }
 
 /// Lane ids. Dataspace id equals lane id in network/nexus.toml (ds-rd 1, ds-dfabi 2).
-#[derive(Debug, Deserialize)]
+#[derive(Clone, Debug, Deserialize)]
 pub struct Lanes {
     pub rd: u32,
     pub dfabi: u32,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Clone, Debug, Deserialize)]
 pub struct AuditorConfig {
     pub listen: String,
     pub store_dir: PathBuf,
