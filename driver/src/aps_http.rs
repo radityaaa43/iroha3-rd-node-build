@@ -696,7 +696,7 @@ impl<'a> Aps<'a> {
             let answer = self.capacity_of(who.as_deref(), asset)?;
             // A party that does not know a pool yet answers nothing for it, and a missing pool would read as empty: funds planned
             // into it would land where its driver cannot see them. Refused before any address, intent or proof.
-            if false && who.is_some() && answer.iter().map(|(lane, _)| *lane).collect::<BTreeSet<_>>() != own { // RED stub
+            if who.is_some() && answer.iter().map(|(lane, _)| *lane).collect::<BTreeSet<_>>() != own {
                 return Err(error(502, "party pool index out of date"));
             }
             for (lane, cap) in answer {
@@ -705,7 +705,7 @@ impl<'a> Aps<'a> {
             }
             lanes.extend(own);
         }
-        if false && lanes.len() < 2 { // RED stub
+        if lanes.len() < 2 {
             // e.g. a one-asset pay on a chain whose only pool of that asset is in one lane.
             return Err(error(422, "no pool arrangement covers the payment"));
         }

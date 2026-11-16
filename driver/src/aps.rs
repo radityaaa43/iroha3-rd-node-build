@@ -434,7 +434,7 @@ pub(crate) fn continue_bundle<N: Nodes>(
         }
         // The receipt stays pending until a marker is applied: submit it, or the pools stay reserved.
         // Never uploaded (`Proved`): nothing is reserved and no marker is needed; it is dropped below.
-        Some(Expired) => { // RED stub
+        Some(Expired) if phase != Phase::Proved => {
             let (carrier_tx, height) = abort_and_wait(nodes, &manifest)?;
             aborted.set(true);
             return Ok(Some(Settlement { manifest, carrier_tx, outcome: "aborted", height }));
