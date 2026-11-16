@@ -407,7 +407,7 @@ fn origin_notes(cfg: &Config, party: &str, key: PoolKey) -> Result<Vec<PrivateSe
     if party != "bi" {
         return Ok(Vec::new());
     }
-    Ok(vec![dec(std::fs::read_to_string(origin_note_file(cfg, PoolKey { lane: lane_of(cfg, key.asset), asset: key.asset }))?.trim())?])
+    Ok(vec![dec(std::fs::read_to_string(origin_note_file(cfg, key))?.trim())?])
 }
 
 /// The values of `party`'s unspent notes in each pool of `asset`, by lane (`POST /aps/capacity`).

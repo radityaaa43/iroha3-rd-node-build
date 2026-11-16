@@ -37,8 +37,10 @@ pub struct Capacity {
 impl Capacity {
     /// From the values of the unspent notes in one pool.
     pub fn of(values: &[u128]) -> Self {
-        let _ = values;
-        todo!("RED")
+        let mut sorted = values.to_vec();
+        sorted.sort_unstable_by(|a, b| b.cmp(a));
+        let top: u128 = sorted.iter().take(2).sum();
+        Self { two_notes: top.saturating_sub(1), total: values.iter().sum() }
     }
 }
 
@@ -68,8 +70,71 @@ pub fn plan(
     cap: &dyn Fn(Option<&str>, PoolKey) -> Capacity,
     rng: &mut impl Rng,
 ) -> Result<[PlannedLeg; 2], PlanError> {
-    let _ = (req, bi, lanes, cap, rng);
-    todo!("RED")
+    let party = |key: &str| (!key.eq_ignore_ascii_case(bi)).then(|| key.to_owned());
+    // The payer of leg 0 (the lowest lane) also pays the sponsor's reimbursement.
+    let need = |amount: u128, lane: u32| amount.saturating_add(if lane == lanes[0] { R } else { 0 });
+    let other = |lane: u32| if lane == lanes[0] { lanes[1] } else { lanes[0] };
+    let insufficient = || PlanError::Insufficient(NO_ARRANGEMENT.to_owned());
+    let mut legs = match req {
+        Request::Pay { asset, from, to, amount, intent } => {
+            let (payer, recipient, a) = (party(from), party(to), *amount);
+            let at = |lane: u32| PoolKey { lane, asset: *asset };
+            let main = |lane: u32, amount: u128| PlannedLeg {
+                key: at(lane),
+                payer: payer.clone(),
+                recipient: recipient.clone(),
+                amount,
+                intent: Some(intent.clone()),
+            };
+            let feasible: Vec<u32> = lanes
+                .into_iter()
+                .filter(|&l| cap(payer.as_deref(), at(l)).two_notes >= need(a, l) && cap(None, at(other(l))).two_notes >= need(1, other(l)))
+                .collect();
+            let chosen = if payer.is_none() {
+                // Issuance keeps each bank about 50/50 per lane: the pool where the recipient holds less.
+                let held = |l: u32| cap(recipient.as_deref(), at(l)).total;
+                let least = feasible.iter().map(|&l| held(l)).min();
+                let ties: Vec<u32> = feasible.iter().copied().filter(|&l| Some(held(l)) == least).collect();
+                ties.choose(rng).copied()
+            } else {
+                feasible.choose(rng).copied()
+            };
+            match chosen {
+                Some(l) => {
+                    let companion = PlannedLeg { key: at(other(l)), payer: None, recipient: None, amount: 1, intent: None };
+                    [main(l, a), companion]
+                }
+                None => {
+                    // Split: as much as leg 0 can carry next to the reimbursement, the rest in the other lane.
+                    let a1 = cap(payer.as_deref(), at(lanes[0])).two_notes.saturating_sub(R).min(a.saturating_sub(1));
+                    let a2 = a - a1;
+                    if a1 < 1 || a2 > cap(payer.as_deref(), at(lanes[1])).two_notes {
+                        return Err(insufficient());
+                    }
+                    [main(lanes[0], a1), main(lanes[1], a2)]
+                }
+            }
+        }
+        Request::Dvp { buyer, seller, rd, dfabi, intent_rd, intent_dfabi } => {
+            let (buyer, seller) = (party(buyer), party(seller));
+            let rd_at = |lane: u32| PoolKey { lane, asset: Asset::Rd };
+            let dfabi_at = |lane: u32| PoolKey { lane, asset: Asset::Dfabi };
+            let feasible: Vec<u32> = lanes
+                .into_iter()
+                .filter(|&l| {
+                    cap(buyer.as_deref(), rd_at(l)).two_notes >= need(*rd, l)
+                        && cap(seller.as_deref(), dfabi_at(other(l))).two_notes >= need(*dfabi, other(l))
+                })
+                .collect();
+            let l = *feasible.choose(rng).ok_or_else(insufficient)?;
+            [
+                PlannedLeg { key: rd_at(l), payer: buyer.clone(), recipient: seller.clone(), amount: *rd, intent: Some(intent_rd.clone()) },
+                PlannedLeg { key: dfabi_at(other(l)), payer: seller, recipient: buyer, amount: *dfabi, intent: Some(intent_dfabi.clone()) },
+            ]
+        }
+    };
+    legs.sort_by_key(|leg| leg.key.lane);
+    Ok(legs)
 }
 
 #[cfg(test)]

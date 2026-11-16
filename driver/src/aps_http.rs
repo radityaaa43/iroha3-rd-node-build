@@ -211,7 +211,7 @@ impl IntentStore {
         let Slot::Open(terms, left) = slot else {
             return Take::Missing;
         };
-        if terms.asset != leg.asset || terms.to != leg.to || leg.amount != *left {
+        if terms.asset != leg.asset || terms.to != leg.to || leg.amount > *left {
             return Take::Mismatch;
         }
         *left -= leg.amount;
@@ -496,6 +496,7 @@ impl<'a> Aps<'a> {
         if let Err(reply) = self.refresh() {
             return reply;
         }
+        let _one_own_proof = self.prove_lock.lock().unwrap_or_else(|p| p.into_inner());
         match self.backend.prove_leg(&req) {
             Ok(prepared) => ok(&Prepared { prepared }),
             Err(e) => fail(e),
@@ -518,8 +519,18 @@ impl<'a> Aps<'a> {
             Ok(req) => req,
             Err(reply) => return reply,
         };
-        let _ = req.asset;
-        error(501, "RED")
+        if let Err(reply) = self.refresh() {
+            return reply;
+        }
+        match self.backend.capacity(req.asset) {
+            Ok(pools) => ok(&CapacityAnswer {
+                pools: pools
+                    .into_iter()
+                    .map(|(lane, cap)| CapacityRow { lane, two_notes: cap.two_notes.to_string(), total: cap.total.to_string() })
+                    .collect(),
+            }),
+            Err(e) => fail(e),
+        }
     }
 
     fn wallet(&self) -> Reply {
