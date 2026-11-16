@@ -162,8 +162,9 @@ struct IntentTerms {
 }
 
 enum Slot {
-    /// The approved terms and the amount no leg has spent yet (a split pay spends one intent over two legs).
-    Open(IntentTerms, u128),
+    /// The approved terms, the amount no leg has spent yet and the `(ordinal, lane)` of the legs taken. A split pay spends one intent
+    /// over two legs: leg 0 and leg 1, each in its own lane, so the payer pays the sponsor's reimbursement (leg 0) at most once.
+    Open(IntentTerms, u128, Vec<(u8, u32)>),
     Used,
 }
 
@@ -186,7 +187,7 @@ impl IntentStore {
         let mut slots = self.slots.lock().unwrap_or_else(|p| p.into_inner());
         slots.retain(|_, (_, expires)| *expires > now);
         let known = match slots.get(intent) {
-            Some((Slot::Open(old, _), _)) => Some(*old == terms),
+            Some((Slot::Open(old, _, _), _)) => Some(*old == terms),
             Some((Slot::Used, _)) => Some(false),
             None => None,
         };
@@ -194,26 +195,28 @@ impl IntentStore {
             Some(same) => same,
             None => {
                 let amount = terms.amount;
-                slots.insert(intent.to_owned(), (Slot::Open(terms, amount), now + INTENT_TTL));
+                slots.insert(intent.to_owned(), (Slot::Open(terms, amount, Vec::new()), now + INTENT_TTL));
                 true
             }
         }
     }
 
-    /// Spend `leg.amount` of the intent when asset and recipient match and that much is left; spent in full, it is used. A refused
-    /// leg spends nothing.
-    fn take(&self, now: Instant, intent: &str, leg: &IntentTerms) -> Take {
+    /// Spend `leg.amount` of the intent when asset and recipient match, that much is left, and no taken leg had this ordinal or
+    /// this lane; spent in full, it is used. A refused leg spends nothing.
+    fn take(&self, now: Instant, intent: &str, leg: &IntentTerms, ordinal: u8, lane: u32) -> Take {
         let mut slots = self.slots.lock().unwrap_or_else(|p| p.into_inner());
         slots.retain(|_, (_, expires)| *expires > now);
         let Some((slot, _)) = slots.get_mut(intent) else {
             return Take::Missing;
         };
-        let Slot::Open(terms, left) = slot else {
+        let Slot::Open(terms, left, taken) = slot else {
             return Take::Missing;
         };
-        if terms.asset != leg.asset || terms.to != leg.to || leg.amount > *left {
+        let reused = taken.iter().any(|&(o, l)| o == ordinal || l == lane);
+        if terms.asset != leg.asset || terms.to != leg.to || leg.amount > *left || reused {
             return Take::Mismatch;
         }
+        taken.push((ordinal, lane));
         *left -= leg.amount;
         if *left == 0 {
             *slot = Slot::Used;
@@ -506,7 +509,7 @@ impl<'a> Aps<'a> {
     /// Match the leg against the intent this driver registered and spend it, before any proving.
     fn consume(&self, now: Instant, req: &LegReq, amount: u128) -> Result<(), Reply> {
         let terms = IntentTerms { asset: req.asset.clone(), to: norm(&req.recipient), amount };
-        match self.intents.take(now, &norm(&req.intent), &terms) {
+        match self.intents.take(now, &norm(&req.intent), &terms, req.ordinal, req.lane) {
             Take::Taken => Ok(()),
             Take::Missing => Err(error(403, "no open intent for this leg (unknown, already used or expired)")),
             Take::Mismatch => Err(error(403, "the intent's terms do not match this leg")),
