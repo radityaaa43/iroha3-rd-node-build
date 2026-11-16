@@ -683,6 +683,8 @@ pub(crate) mod testkit {
         /// `settle` answers "aborted".
         pub aborts: bool,
         pub settle_delay: Duration,
+        /// How long `prove_leg` takes.
+        pub prove_delay: Duration,
         /// What `bundles` answers (coordinator).
         pub lists: BundleLists,
         /// Every list `merge_bundles` was given (party driver).
@@ -728,6 +730,7 @@ pub(crate) mod testkit {
         }
 
         fn prove_leg(&self, _req: &LegReq) -> Result<String> {
+            std::thread::sleep(self.prove_delay);
             self.note("prove")?;
             Ok("beef".to_owned())
         }
@@ -1002,6 +1005,24 @@ mod tests {
         assert_eq!(leg["sponsor_output"]["active"], true, "leg 0 pays the sponsor");
         // BI's own side: manifest, its sponsor output per leg, the BI -> BI companion leg without HTTP, then settle
         assert_eq!(calls(&backend), ["begin_bundle", "sponsor_output", "address", "sponsor_output", "prove", "settle"]);
+    }
+
+    #[test]
+    fn the_two_legs_are_proved_at_the_same_time() {
+        // Leg 0 is proved by bank A over HTTP, leg 1 (the BI -> BI companion) by the coordinator: 400 ms each.
+        let backend = FakeBackend { prove_delay: Duration::from_millis(400), ..driver(7) };
+        let peer = FakePeer::with(|_, path, _| match path {
+            "/aps/leg" => {
+                std::thread::sleep(Duration::from_millis(400));
+                Ok((200, r#"{"prepared":"cafe"}"#.to_owned()))
+            }
+            _ => Ok((200, serde_json::json!({ "authority": id(0x33), "view_public": id(0x44), "authorization": "abcd" }).to_string())),
+        });
+        let aps = Aps::new(&backend, &peer, coordinator());
+        let started = std::time::Instant::now();
+        assert_eq!(aps.route("POST", "/aps/submit", &pay_body(&id(1), "rd", &account(8), &account(9), "5")).0, 200);
+        let took = started.elapsed();
+        assert!(took < Duration::from_millis(700), "the legs were proved one after the other: {took:?}");
     }
 
     #[test]
