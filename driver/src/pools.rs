@@ -909,4 +909,84 @@ mod tests {
         pools.merge_carriers(&BTreeMap::from([("a".to_owned(), "y".to_owned()), ("b".to_owned(), "z".to_owned())]));
         assert_eq!(pools.carriers, BTreeMap::from([("a".to_owned(), "x".to_owned()), ("b".to_owned(), "z".to_owned())]));
     }
+
+    fn route_hex(lane: u32) -> String {
+        enc(&PrivateSettlementRouteV1 {
+            dataspace_id: DataSpaceId::new(u64::from(lane)),
+            lane_id: LaneId::new(lane),
+            lane_incarnation: Hash::prehashed([0; 32]),
+        })
+        .unwrap()
+    }
+
+    fn entry(lane: u32, asset: Asset, bundles: &[(&str, u64)]) -> PoolEntry {
+        let record = PoolRecord {
+            pool_id: format!("{lane:02x}").repeat(32),
+            route: route_hex(lane),
+            policy: String::new(),
+            governance: String::new(),
+            origin: vec![],
+            bundles: bundles.iter().map(|(id, height)| BundleRef { id: (*id).into(), height: *height }).collect(),
+        };
+        PoolEntry { lane, asset, record }
+    }
+
+    fn ids(bundles: Vec<BundleRef>) -> Vec<(String, u64)> {
+        bundles.into_iter().map(|b| (b.id, b.height)).collect()
+    }
+
+    /// The chain's live pools.json is `{rd, dfabi, carriers}`: the lane comes from each record's route.
+    #[test]
+    fn legacy_pool_file_loads() {
+        let dir = temp_dir();
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("pools.json");
+        let rd = entry(1, Asset::Rd, &[("a", 3), ("b", 0)]).record;
+        let dfabi = entry(2, Asset::Dfabi, &[("a", 3)]).record;
+        let legacy = serde_json::json!({ "rd": rd, "dfabi": dfabi, "carriers": { "a": "c0ffee" } });
+        std::fs::write(&path, legacy.to_string()).unwrap();
+        let file = PoolFile::load(&path).unwrap();
+        assert_eq!(file.keys(Asset::Rd), [PoolKey { lane: 1, asset: Asset::Rd }]);
+        assert_eq!(file.keys(Asset::Dfabi), [PoolKey { lane: 2, asset: Asset::Dfabi }]);
+        assert_eq!(file.carriers.get("a").map(String::as_str), Some("c0ffee"));
+        assert_eq!(ids(file.finalized(Asset::Rd)), [("a".to_string(), 3)]);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn four_pools_roundtrip() {
+        let dir = temp_dir();
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("pools.json");
+        let file = PoolFile {
+            pools: vec![
+                entry(1, Asset::Rd, &[("a", 3)]),
+                entry(2, Asset::Dfabi, &[("a", 3)]),
+                entry(3, Asset::Rd, &[("b", 4)]),
+                entry(4, Asset::Dfabi, &[("b", 4)]),
+            ],
+            carriers: BTreeMap::from([("a".to_owned(), "x".to_owned())]),
+        };
+        file.save(&path).unwrap();
+        let saved: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        assert_eq!(saved["version"], 2);
+        let back = PoolFile::load(&path).unwrap();
+        assert_eq!(serde_json::to_value(&back.pools).unwrap(), serde_json::to_value(&file.pools).unwrap());
+        assert_eq!(back.carriers, file.carriers);
+        assert_eq!(back.keys(Asset::Rd), [PoolKey { lane: 1, asset: Asset::Rd }, PoolKey { lane: 3, asset: Asset::Rd }]);
+        assert!(back.get(PoolKey { lane: 4, asset: Asset::Dfabi }).is_ok());
+        assert!(back.get(PoolKey { lane: 4, asset: Asset::Rd }).is_err());
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn finalized_unions_pools_by_height() {
+        let file = PoolFile {
+            pools: vec![entry(1, Asset::Rd, &[("a", 2), ("c", 6), ("live", 0)]), entry(3, Asset::Rd, &[("b", 4), ("d", 8)])],
+            carriers: BTreeMap::new(),
+        };
+        let got = ids(file.finalized(Asset::Rd));
+        assert_eq!(got, [("a".to_string(), 2), ("b".to_string(), 4), ("c".to_string(), 6), ("d".to_string(), 8)]);
+        assert!(file.finalized(Asset::Dfabi).is_empty());
+    }
 }
