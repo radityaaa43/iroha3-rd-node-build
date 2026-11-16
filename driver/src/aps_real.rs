@@ -210,6 +210,10 @@ impl ApsBackend for RealBackend<'_> {
         pools::wallet_json(&cfg, &cfg.party)
     }
 
+    fn pool_lanes(&self, asset: Asset) -> Result<Vec<u32>> {
+        Ok(pools::PoolFile::load(&self.cfg().pools_file)?.keys(asset).into_iter().map(|key| key.lane).collect())
+    }
+
     fn resume_all(&self) -> Result<()> {
         pools::resume_all(self.cfg())
     }

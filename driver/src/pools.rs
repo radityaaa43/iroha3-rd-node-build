@@ -1491,6 +1491,38 @@ dfabi = 2
         std::fs::remove_dir_all(dir).unwrap();
     }
 
+    /// A bundle that never reached the upload is dropped past its expiry too, without any carrier: nothing is reserved.
+    #[test]
+    fn an_expired_bundle_never_uploaded_is_dropped_without_a_carrier() {
+        use crate::{aps::continue_bundle, inflight::tests::FakeNodes};
+        use iroha::client::PrivateSettlementLifecycleDtoV1;
+        let dir = temp_dir();
+        std::fs::create_dir_all(&dir).unwrap();
+        let cfg = offline_config(&dir);
+        let manifest = crate::aps::test_manifest();
+        let id = hex::encode(manifest.bundle_id.as_ref());
+        let listed = [(id.as_str(), 0)];
+        PoolFile { pools: vec![entry(1, Asset::Rd, &listed), entry(2, Asset::Dfabi, &listed)], carriers: BTreeMap::new() }
+            .save(&cfg.pools_file)
+            .unwrap();
+        let f = Inflight {
+            bundle_id: id,
+            keys: [key(1, Asset::Rd), key(2, Asset::Dfabi)],
+            manifest: enc(&manifest).unwrap(),
+            prepared: Vec::new(),
+            phase: Phase::Proved,
+        };
+        inflight::save(&inflight::dir(&cfg), &f).unwrap();
+        let nodes = FakeNodes { expired: true, ..FakeNodes::new(Some(PrivateSettlementLifecycleDtoV1::Expired)) };
+        let ended = resume_with(&cfg, f, |manifest, phase, aborted, save| continue_bundle(&nodes, manifest, phase, aborted, save)).unwrap();
+        assert_eq!(ended, None);
+        assert_eq!(nodes.carriers.get(), 0, "{:?}", nodes.calls.borrow());
+        assert!(nodes.calls.borrow().is_empty());
+        assert!(inflight::load_all(&inflight::dir(&cfg)).unwrap().is_empty(), "no longer in flight");
+        assert!(PoolFile::load(&cfg.pools_file).unwrap().pools.iter().all(|e| e.record.bundles.is_empty()));
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
     fn error_of<T>(result: Result<T>) -> String {
         format!("{:#}", result.err().expect("expected an error"))
     }

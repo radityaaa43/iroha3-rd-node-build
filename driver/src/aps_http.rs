@@ -148,6 +148,8 @@ pub trait ApsBackend: Send + Sync {
     fn merge_bundles(&self, lists: &BundleLists) -> Result<()>;
     /// The own `wallet_json`.
     fn wallet(&self) -> Result<serde_json::Value>;
+    /// Coordinator side: the lanes of this driver's pools of `asset` (its pools file).
+    fn pool_lanes(&self, asset: Asset) -> Result<Vec<u32>>;
     /// Coordinator start: carry every bundle a previous run left in flight to its end (`pools::resume_all`).
     fn resume_all(&self) -> Result<()>;
 }
@@ -690,10 +692,22 @@ impl<'a> Aps<'a> {
         let mut caps = HashMap::new();
         let mut lanes = BTreeSet::new();
         for (who, asset) in asked {
-            for (lane, cap) in self.capacity_of(who.as_deref(), asset)? {
+            let own: BTreeSet<u32> = self.backend.pool_lanes(asset).map_err(fail)?.into_iter().collect();
+            let answer = self.capacity_of(who.as_deref(), asset)?;
+            // A party that does not know a pool yet answers nothing for it, and a missing pool would read as empty: funds planned
+            // into it would land where its driver cannot see them. Refused before any address, intent or proof.
+            if false && who.is_some() && answer // RED stub.iter().map(|(lane, _)| *lane).collect::<BTreeSet<_>>() != own {
+                return Err(error(502, "party pool index out of date"));
+            }
+            for (lane, cap) in answer {
                 lanes.insert(lane);
                 caps.insert((who.as_deref().map(norm), PoolKey { lane, asset }), cap);
             }
+            lanes.extend(own);
+        }
+        if false && lanes.len() < 2 { // RED stub
+            // e.g. a one-asset pay on a chain whose only pool of that asset is in one lane.
+            return Err(error(422, "no pool arrangement covers the payment"));
         }
         let lanes: [u32; 2] = Vec::from_iter(lanes).try_into().map_err(|_| error(502, "/aps/capacity: the pools are not in exactly two lanes"))?;
         let cap = |who: Option<&str>, key: PoolKey| caps.get(&(who.map(norm), key)).copied().unwrap_or_default();
@@ -908,6 +922,11 @@ pub(crate) mod testkit {
         fn wallet(&self) -> Result<serde_json::Value> {
             self.note("wallet")?;
             Ok(serde_json::json!({ "party": "fake", "balances": { "rd": "5", "dfabi": "6" }, "items": [] }))
+        }
+
+        /// The lanes of `caps` (default lanes 1 and 2), as `capacity` answers.
+        fn pool_lanes(&self, _asset: Asset) -> Result<Vec<u32>> {
+            Ok(if self.caps.is_empty() { vec![1, 2] } else { self.caps.iter().map(|(lane, _)| *lane).collect() })
         }
 
         /// Listed when it ends.
@@ -1286,6 +1305,40 @@ mod tests {
         let aps = Aps::new(&backend, &peer, coordinator());
         let (status, response) = aps.route("POST", "/aps/submit", &pay_body(&id(1), "rd", &account(8), &account(9), "5"));
         assert_eq!((status, json(&response)), (200, serde_json::json!({ "outcome": "aborted", "bundle_id": id(0xbb), "carrier_tx": null, "height": null })));
+    }
+
+    /// A party whose pools index lacks a pool the coordinator has (lane 2) would read it as empty: the submit is refused before
+    /// anything is addressed or proved, and the coordinator's intent stays usable.
+    #[test]
+    fn a_party_with_an_out_of_date_pool_index_is_refused() {
+        let backend = driver(7);
+        let stale = std::sync::atomic::AtomicBool::new(true);
+        let peer = FakePeer::with(move |target, path, body| {
+            if path == "/aps/capacity" && stale.swap(false, Ordering::SeqCst) {
+                return Ok((200, capacity_answer(&[(1, 1000)])));
+            }
+            standard_answer(target, path, body)
+        });
+        let aps = Aps::new(&backend, &peer, coordinator());
+        let to = account(9);
+        assert_eq!(aps.route("POST", "/aps/intent", &intent_body(&id(1), "rd", &to, "5")).0, 200);
+        let (status, response) = aps.route("POST", "/aps/submit", &pay_body(&id(1), "rd", &account(7), &to, "5"));
+        assert_eq!((status, json(&response)), (502, serde_json::json!({ "error": "party pool index out of date" })));
+        assert!(calls(&backend).iter().all(|call| !["begin_bundle", "address", "prove", "settle"].contains(call)), "{:?}", calls(&backend));
+        assert!(peer.calls.lock().unwrap().iter().all(|(_, _, path, _)| path == "/aps/capacity"), "only the capacity was asked");
+        // The intent was not spent: the same submit goes through once the party knows the pool.
+        assert_eq!(aps.route("POST", "/aps/submit", &pay_body(&id(1), "rd", &account(7), &to, "5")).0, 200);
+    }
+
+    /// A one-asset pay on a chain whose pools of that asset are all in one lane has no two-lane arrangement.
+    #[test]
+    fn a_payment_with_pools_in_one_lane_is_422() {
+        let backend = FakeBackend { caps: vec![(1, Capacity { two_notes: 1000, total: 1000 })], ..driver(7) };
+        let peer = FakePeer::with(|_, path, _| if path == "/aps/capacity" { Ok((200, capacity_answer(&[(1, 1000)]))) } else { Ok((404, String::new())) });
+        let aps = Aps::new(&backend, &peer, coordinator());
+        let (status, response) = aps.route("POST", "/aps/submit", &pay_body(&id(1), "rd", &account(8), &account(9), "5"));
+        assert_eq!((status, json(&response)), (422, serde_json::json!({ "error": "no pool arrangement covers the payment" })));
+        assert!(!calls(&backend).contains(&"begin_bundle"));
     }
 
     /// A restarted coordinator finishes the bundle it left in flight before it starts a new one.

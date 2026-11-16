@@ -433,7 +433,8 @@ pub(crate) fn continue_bundle<N: Nodes>(
             return Ok(Some(Settlement { manifest, carrier_tx: String::new(), outcome, height }));
         }
         // The receipt stays pending until a marker is applied: submit it, or the pools stay reserved.
-        Some(Expired) => {
+        // Never uploaded (`Proved`): nothing is reserved and no marker is needed; it is dropped below.
+        Some(Expired) => { // RED stub
             let (carrier_tx, height) = abort_and_wait(nodes, &manifest)?;
             aborted.set(true);
             return Ok(Some(Settlement { manifest, carrier_tx, outcome: "aborted", height }));

@@ -2,8 +2,10 @@
 //! one to its end (`pools::resume`, task 6 / design 4.5).
 //!
 //! Public material only: the bundle id, its two pools, the manifest, the proved legs (proofs, public statements and audit
-//! capsules already encrypted to the auditors) and the last phase the nodes made durable. No seed, note key, witness, amount,
-//! party or asset (official docs: secret witnesses never go into durable coordination records). No certificate either: a
+//! capsules already encrypted to the auditors) and the last phase the nodes made durable. No seed, note key, witness, amount or
+//! party (official docs: secret witnesses never go into durable coordination records). The asset appears only as the pools' public
+//! label in `keys` (lane, asset), the same index pools.json already holds; the capsules carry the real asset id encrypted. No
+//! certificate either: a
 //! resumed bundle recovers its Prepare and Commit certificates from the nodes (`recover_or_*`), never from a local file.
 
 use std::{
