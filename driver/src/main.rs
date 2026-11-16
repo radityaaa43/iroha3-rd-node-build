@@ -7,7 +7,8 @@
 //!   rd-dfabi prove-selftest <peers.json>  offline: prove one leg, print time and peak RSS
 //!   rd-dfabi prove-continuation-selftest <peers.json>  offline gate G1a: spend a received note
 //!   rd-dfabi keys new-note <dir> <name>  write <dir>/<name>.note (0600): note spend + view secrets
-//!   rd-dfabi pool-init <config> --rd-reserve N --dfabi-reserve N  one-time: long-lived RD/DFABI pools, BI reserve
+//!   rd-dfabi pool-init <config> --lane N [--rd A] [--dfabi B] [--lane M ...]  one-time: long-lived pools per dataspace, BI reserve
+//!   rd-dfabi pool-add <config> --lane N [--rd A] [--dfabi B]  activate more pools in one dataspace (one shuffled transaction)
 //!   rd-dfabi pay <config> --asset rd|dfabi --from P --to Q --amount N  private payment in the shared pools
 //!   rd-dfabi dvp-shared <config> --buyer P --seller P --rd N --dfabi N   DvP in the shared pools
 //!   rd-dfabi wallet <config> --party P   balances and movements from the chain (wallet_json=)
@@ -122,8 +123,12 @@ fn main() -> Result<()> {
         ["prove-continuation-selftest", peers_json] => aps::prove_continuation_selftest(Path::new(peers_json)),
         ["dvp", config, rest @ ..] => dvp(&Config::load(Path::new(config))?, rest),
         ["pool-init", config, rest @ ..] => {
-            let flags = flags(rest)?;
-            pools::pool_init(&Config::load(Path::new(config))?, flags.number("rd-reserve")?, flags.number("dfabi-reserve")?)
+            pools::pool_init(&Config::load(Path::new(config))?, &pools::parse_plan(rest)?, &mut rand::rng())
+        }
+        ["pool-add", config, rest @ ..] => {
+            let plan = pools::parse_plan(rest)?;
+            let [(lane, reserves)] = plan.as_slice() else { bail!("pool-add takes exactly one --lane") };
+            pools::pool_add(&Config::load(Path::new(config))?, *lane, reserves, &mut rand::rng()).map(|_| ())
         }
         ["pool-history", config, "--asset", asset] => pools::pool_history(&Config::load(Path::new(config))?, pools::Asset::parse(asset)?),
         ["pay", config, rest @ ..] => {

@@ -172,10 +172,11 @@ impl ApsBackend for RealBackend<'_> {
         pools::PoolFile::update(&cfg.pools_file, |file| {
             for (asset, ids) in [(Asset::Rd, &lists.rd), (Asset::Dfabi, &lists.dfabi)] {
                 for key in file.keys(asset) {
-                    file.merge_finalized(key, ids, &lists.heights);
+                    file.merge_finalized(key, ids, &lists.heights)?;
                 }
             }
             file.merge_carriers(&lists.carriers);
+            Ok(())
         })
     }
 

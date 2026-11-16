@@ -161,13 +161,23 @@ impl PoolFile {
     }
 
     /// Read-modify-write for a run that held its copy for minutes: another run may have added a bundle meanwhile.
-    pub fn update(path: &Path, change: impl FnOnce(&mut Self)) -> Result<()> {
-        // A separate lock file: save() renames over pools.json, which would drop a lock held on it.
+    pub fn update(path: &Path, change: impl FnOnce(&mut Self) -> Result<()>) -> Result<()> {
+        let _lock = Self::lock(path)?;
+        let mut pools = Self::load(path)?;
+        change(&mut pools)?;
+        pools.save(path)
+    }
+
+    /// A separate lock file: save() renames over pools.json, which would drop a lock held on it. Released when dropped.
+    fn lock(path: &Path) -> Result<std::fs::File> {
         let lock = std::fs::OpenOptions::new().create(true).append(true).open(path.with_extension("json.lock"))?;
         lock.lock()?;
-        let mut pools = Self::load(path)?;
-        change(&mut pools);
-        pools.save(path)
+        Ok(lock)
+    }
+
+    /// Append new pools (creating the file when there is none) under the lock. A key already present is refused.
+    pub fn add(path: &Path, entries: Vec<PoolEntry>) -> Result<()> {
+        todo!("RED: {} {}", path.display(), entries.len())
     }
 
     /// The finalized bundles (height > 0) of every pool of the asset, in ledger order: what a party driver needs to rebuild the history.
@@ -193,9 +203,9 @@ impl PoolFile {
         }
     }
 
-    /// A key that names no pool is ignored: callers take their keys from `keys()`.
-    pub fn merge_finalized(&mut self, key: PoolKey, ids: &[String], heights: &BTreeMap<String, u64>) {
-        let Some(entry) = self.pools.iter_mut().find(|entry| entry.key() == key) else { return };
+    /// A key that names no pool is an error: callers take their keys from `keys()`.
+    pub fn merge_finalized(&mut self, key: PoolKey, ids: &[String], heights: &BTreeMap<String, u64>) -> Result<()> {
+        let Some(entry) = self.pools.iter_mut().find(|entry| entry.key() == key) else { return Ok(()) };
         let bundles = &mut entry.record.bundles;
         for id in ids {
             let height = heights.get(id).copied().unwrap_or(0);
@@ -208,6 +218,7 @@ impl PoolFile {
                 None => bundles.push(BundleRef { id: id.clone(), height }),
             }
         }
+        Ok(())
     }
 
     /// Ids still at height 0 in any pool: in flight, or kept after the coordinator stopped waiting for every node's receipt.
@@ -276,7 +287,7 @@ pub fn fill_kept_heights(cfg: &Config) -> Result<()> {
     if heights.is_empty() {
         return Ok(());
     }
-    PoolFile::update(&cfg.pools_file, |file| file.fill_heights(&heights))
+    PoolFile::update(&cfg.pools_file, |file| Ok(file.fill_heights(&heights)))
 }
 
 impl PoolRecord {
@@ -362,8 +373,13 @@ fn receipt_cache(cfg: &Config) -> PathBuf {
     cfg.pools_file.with_file_name("receipts")
 }
 
-fn origin_note_path(cfg: &Config, asset: Asset) -> PathBuf {
-    cfg.key_dir.join(format!("bi.origin-{}.note", asset.name()))
+fn origin_note_path(cfg: &Config, key: PoolKey) -> PathBuf {
+    cfg.key_dir.join(format!("bi.origin-{}-{}.note", key.lane, key.asset.name()))
+}
+
+/// RED stub: the origin note file to read.
+fn origin_note_file(cfg: &Config, key: PoolKey) -> PathBuf {
+    origin_note_path(cfg, key)
 }
 
 /// BI's origin (reserve) note of a pool; other parties have none.
@@ -371,7 +387,7 @@ fn origin_notes(cfg: &Config, party: &str, asset: Asset) -> Result<Vec<PrivateSe
     if party != "bi" {
         return Ok(Vec::new());
     }
-    Ok(vec![dec(std::fs::read_to_string(origin_note_path(cfg, asset))?.trim())?])
+    Ok(vec![dec(std::fs::read_to_string(origin_note_file(cfg, PoolKey { lane: lane_of(cfg, asset), asset }))?.trim())?])
 }
 
 fn lane_of(cfg: &Config, asset: Asset) -> u32 {
@@ -401,47 +417,24 @@ fn route(client: &Client, lane: u32) -> Result<PrivateSettlementRouteV1> {
     Ok(PrivateSettlementRouteV1 { dataspace_id: DataSpaceId::new(u64::from(lane)), lane_id, lane_incarnation: incarnation })
 }
 
-/// One-time: activate the RD and DFABI pools, each holding a BI reserve note.
-pub fn pool_init(cfg: &Config, rd_reserve: u128, dfabi_reserve: u128) -> Result<()> {
-    ensure!(!cfg.pools_file.exists(), "{} exists: pools are initialized once", cfg.pools_file.display());
-    let (sponsor, _) = cfg.acting_sponsor()?;
-    let caps = sponsor.client().get_privacy_capabilities()?;
-    ensure!(
-        caps.protocols.iter().any(|row| row.protocol_id == PrivacyProtocolIdV1::IrohaIvmPrivateNoteStarkV1 && row.activation.is_some()),
-        "IVM private-note capability is not activated"
-    );
-    let (auditors, min_approvals) = crate::aps::auditors_from_config(cfg)?;
-    let bi = cfg.note_keys("bi")?;
-    let fee = bounded_fee(cfg)?;
-    let account = sponsor.account_client();
-    let mut entries = Vec::new();
-    for (asset, reserve) in [(Asset::Rd, rd_reserve), (Asset::Dfabi, dfabi_reserve)] {
-        let route = route(&sponsor, lane_of(cfg, asset))?;
-        let governed = crate::aps::govern_with(route, asset_id(cfg, asset).parse()?, caps.committed_height, None, &auditors, min_approvals)?;
-        let funding = funding_with_secret(reserve, bi.spend)?;
-        let activation = ActivatePrivateSettlementPoolV1::from_restricted(&governed.governance, funding.activation_commitments().to_vec())?;
-        let tx = account
-            .prepare_transaction(AccountTransactionDraft::new(vec![activation], fee.clone(), Metadata::default()))
-            .and_then(|payload| account.sign_transaction(payload))
-            .wrap_err("build pool activation")?;
-        let hash = sponsor.submit_transaction_and_wait(&tx).wrap_err_with(|| format!("activate {} pool", asset.name()))?;
-        println!("pool_activation_tx={hash} asset={}", asset.name());
-        write_secret(&origin_note_path(cfg, asset), &enc(&funding.opening)?)?;
-        let record = PoolRecord {
-            pool_id: hex::encode(governed.governance.body.pool_id.as_ref()),
-            route: enc(&governed.route)?,
-            policy: enc(&governed.policy)?,
-            governance: enc(&governed.governance)?,
-            origin: funding.input_commitments.iter().map(|c| hex::encode(c.as_bytes())).collect(),
-            bundles: Vec::new(),
-        };
-        entries.push(PoolEntry { lane: lane_of(cfg, asset), asset, record });
-    }
-    let file = PoolFile { pools: entries, carriers: BTreeMap::new() };
-    file.save(&cfg.pools_file)?;
-    let ids: serde_json::Map<_, _> = file.pools.iter().map(|e| (e.asset.name().to_owned(), e.record.pool_id.clone().into())).collect();
-    println!("pool_init_json={}", serde_json::Value::Object(ids));
-    Ok(())
+/// RED stub.
+pub fn pool_add(cfg: &Config, lane: u32, reserves: &[(Asset, u128)], _rng: &mut impl rand::Rng) -> Result<Vec<PoolKey>> {
+    todo!("RED: {} {lane} {}", cfg.pools_file.display(), reserves.len())
+}
+
+/// RED stub.
+pub fn pool_init(cfg: &Config, plan: &[(u32, Vec<(Asset, u128)>)], _rng: &mut impl rand::Rng) -> Result<()> {
+    todo!("RED: {} {}", cfg.pools_file.display(), plan.len())
+}
+
+/// RED stub: the order the activations go into the transaction.
+fn activation_order(reserves: &[(Asset, u128)], _rng: &mut impl rand::Rng) -> Vec<(Asset, u128)> {
+    reserves.to_vec()
+}
+
+/// RED stub: `--lane N [--rd A] [--dfabi B]` groups.
+pub fn parse_plan(rest: &[&str]) -> Result<Vec<(u32, Vec<(Asset, u128)>)>> {
+    todo!("RED: {}", rest.len())
 }
 
 /// One payment inside a shared-pool bundle.
@@ -559,11 +552,12 @@ fn settle_recorded(
         for entry in &mut pools.pools {
             entry.record.bundles.push(BundleRef { id: id.clone(), height: 0 });
         }
+        Ok(())
     })?;
     let aborted = Cell::new(false);
     let outcome = settle(cfg, sponsor, manifest, prepared, governed, committees, started, options, &aborted);
     let end = bundle_end(&outcome, aborted.get());
-    PoolFile::update(&cfg.pools_file, |pools| record_end(pools, &id, &end))?;
+    PoolFile::update(&cfg.pools_file, |pools| Ok(record_end(pools, &id, &end)))?;
     outcome
 }
 
@@ -876,7 +870,7 @@ mod tests {
                 let path = path.clone();
                 std::thread::spawn(move || {
                     for i in 0..50 {
-                        PoolFile::update(&path, |p| p.pools[0].record.bundles.push(BundleRef { id: format!("{t}-{i}"), height: 0 })).unwrap();
+                        PoolFile::update(&path, |p| Ok(p.pools[0].record.bundles.push(BundleRef { id: format!("{t}-{i}"), height: 0 }))).unwrap();
                     }
                 })
             })
@@ -896,12 +890,12 @@ mod tests {
         pools.pools[0].record.bundles = vec![BundleRef { id: "a".into(), height: 3 }, BundleRef { id: "p".into(), height: 0 }];
         let ids: Vec<String> = ["a", "b", "p"].iter().map(|id| id.to_string()).collect();
         let heights = std::collections::BTreeMap::from([("a".to_owned(), 3), ("b".to_owned(), 5), ("p".to_owned(), 7)]);
-        pools.merge_finalized(rd, &ids, &heights);
-        pools.merge_finalized(rd, &ids, &heights);
+        pools.merge_finalized(rd, &ids, &heights).unwrap();
+        pools.merge_finalized(rd, &ids, &heights).unwrap();
         let merged: Vec<_> = pools.get(rd).unwrap().bundles.iter().map(|b| (b.id.as_str(), b.height)).collect();
         assert_eq!(merged, [("a", 3), ("p", 7), ("b", 5)]);
         assert!(pools.get(dfabi).unwrap().bundles.is_empty());
-        pools.merge_finalized(dfabi, &["z".to_owned()], &heights);
+        pools.merge_finalized(dfabi, &["z".to_owned()], &heights).unwrap();
         let z = &pools.get(dfabi).unwrap().bundles[0];
         assert_eq!((z.id.as_str(), z.height), ("z", 0), "an unknown height stays 0");
     }
@@ -1050,5 +1044,223 @@ mod tests {
         let got = ids(file.finalized(Asset::Rd));
         assert_eq!(got, [("a".to_string(), 2), ("b".to_string(), 4), ("c".to_string(), 6), ("d".to_string(), 8)]);
         assert!(file.finalized(Asset::Dfabi).is_empty());
+    }
+
+    fn rng(seed: u64) -> rand::rngs::StdRng {
+        rand::SeedableRng::seed_from_u64(seed)
+    }
+
+    /// Both orders of two activations occur: the order of the instructions in the transaction must not tell which asset is which.
+    #[test]
+    fn activation_order_is_shuffled() {
+        let reserves = [(Asset::Rd, 5), (Asset::Dfabi, 7)];
+        let mut firsts = std::collections::BTreeSet::new();
+        for seed in 0..64 {
+            let order = activation_order(&reserves, &mut rng(seed));
+            let mut sorted = order.clone();
+            sorted.sort();
+            assert_eq!(sorted, reserves, "the same reserves, only reordered");
+            firsts.insert(order[0].0);
+        }
+        assert_eq!(firsts, [Asset::Rd, Asset::Dfabi].into());
+    }
+
+    /// Unreachable Torii and no client.toml: any network use fails with another message than the ones asserted below.
+    fn offline_config(dir: &Path) -> Config {
+        let text = format!(
+            r#"
+chain = "c"
+network_id_file = "/n"
+account_domain = "d"
+peers_json = "/p.json"
+key_dir = "{dir}"
+pools_file = "{dir}/pools.json"
+fee_asset = "f"
+auditor_url = "a:1"
+[torii]
+bi = "http://127.0.0.1:9"
+[assets]
+rd = "r"
+dfabi = "d"
+[lanes]
+rd = 1
+dfabi = 2
+"#,
+            dir = dir.display()
+        );
+        toml::from_str(&text).unwrap()
+    }
+
+    fn error_of<T>(result: Result<T>) -> String {
+        format!("{:#}", result.err().expect("expected an error"))
+    }
+
+    #[test]
+    fn pool_add_refuses_existing_key() {
+        let dir = temp_dir();
+        std::fs::create_dir_all(&dir).unwrap();
+        let cfg = offline_config(&dir);
+        PoolFile { pools: vec![entry(1, Asset::Rd, &[])], carriers: BTreeMap::new() }.save(&cfg.pools_file).unwrap();
+        let refused = error_of(pool_add(&cfg, 1, &[(Asset::Rd, 5)], &mut rng(0)));
+        assert!(refused.contains("already"), "{refused}");
+        // One taken key refuses the whole transaction, whatever order the reserves are listed in.
+        let refused = error_of(pool_add(&cfg, 1, &[(Asset::Dfabi, 7), (Asset::Rd, 5)], &mut rng(0)));
+        assert!(refused.contains("already"), "{refused}");
+        // Another lane is free: it gets past the key check (and stops at the missing client.toml).
+        let free = error_of(pool_add(&cfg, 2, &[(Asset::Rd, 5)], &mut rng(0)));
+        assert!(!free.contains("already"), "{free}");
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn pool_add_refuses_an_empty_or_repeated_reserve_list() {
+        let dir = temp_dir();
+        std::fs::create_dir_all(&dir).unwrap();
+        let cfg = offline_config(&dir);
+        let none = error_of(pool_add(&cfg, 1, &[], &mut rng(0)));
+        assert!(none.contains("no reserve"), "{none}");
+        let twice = error_of(pool_add(&cfg, 1, &[(Asset::Rd, 1), (Asset::Rd, 2)], &mut rng(0)));
+        assert!(twice.contains("twice"), "{twice}");
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn pool_init_refuses_an_existing_pools_file_and_a_repeated_lane() {
+        let dir = temp_dir();
+        std::fs::create_dir_all(&dir).unwrap();
+        let cfg = offline_config(&dir);
+        let plan = vec![(1, vec![(Asset::Rd, 5)]), (1, vec![(Asset::Dfabi, 7)])];
+        let twice = error_of(pool_init(&cfg, &plan, &mut rng(0)));
+        assert!(twice.contains("lane 1 twice"), "{twice}");
+        two_pools().save(&cfg.pools_file).unwrap();
+        let exists = error_of(pool_init(&cfg, &[(1, vec![(Asset::Rd, 5)])], &mut rng(0)));
+        assert!(exists.contains("exists"), "{exists}");
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn adding_pools_creates_the_file_appends_and_refuses_a_taken_key() {
+        let dir = temp_dir();
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("pools.json");
+        PoolFile::add(&path, vec![entry(1, Asset::Rd, &[]), entry(1, Asset::Dfabi, &[])]).unwrap();
+        PoolFile::add(&path, vec![entry(2, Asset::Rd, &[])]).unwrap();
+        let file = PoolFile::load(&path).unwrap();
+        assert_eq!(file.keys(Asset::Rd).iter().map(|key| key.lane).collect::<Vec<_>>(), [1, 2]);
+        assert_eq!(file.keys(Asset::Dfabi).len(), 1);
+        let taken = error_of(PoolFile::add(&path, vec![entry(3, Asset::Rd, &[]), entry(1, Asset::Rd, &[])]));
+        assert!(taken.contains("already"), "{taken}");
+        assert_eq!(PoolFile::load(&path).unwrap().pools.len(), 3, "a refused add changes nothing");
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    fn plan(args: &str) -> Result<Vec<(u32, Vec<(Asset, u128)>)>> {
+        parse_plan(&args.split_whitespace().collect::<Vec<_>>())
+    }
+
+    #[test]
+    fn the_plan_groups_amounts_under_their_lane() {
+        let got = plan("--lane 1 --rd 10 --dfabi 20 --lane 2 --dfabi 30").unwrap();
+        assert_eq!(got, [(1, vec![(Asset::Rd, 10), (Asset::Dfabi, 20)]), (2, vec![(Asset::Dfabi, 30)])]);
+    }
+
+    #[test]
+    fn a_malformed_plan_is_refused() {
+        for bad in [
+            "",
+            "--rd 10",
+            "--lane 1",
+            "--lane 1 --rd 10 --rd 11",
+            "--lane 1 --rd 10 --lane 1 --dfabi 5",
+            "--lane 1 --rd",
+            "--lane x --rd 10",
+            "--lane 1 --rd ten",
+            "--lane 1 --other 10",
+        ] {
+            assert!(plan(bad).is_err(), "{bad:?}");
+        }
+    }
+
+    /// New pools keep `bi.origin-<lane>-<asset>.note`; the file of the first deployment (`bi.origin-<asset>.note`) still serves the lane it was written for.
+    #[test]
+    fn the_origin_note_file_falls_back_to_the_legacy_name_only_for_the_legacy_lane() {
+        let dir = temp_dir();
+        std::fs::create_dir_all(&dir).unwrap();
+        let cfg = offline_config(&dir);
+        let (legacy_lane, other_lane) = (PoolKey { lane: 1, asset: Asset::Rd }, PoolKey { lane: 3, asset: Asset::Rd });
+        assert_eq!(origin_note_file(&cfg, legacy_lane), dir.join("bi.origin-1-rd.note"), "nothing on disk: the new name");
+        std::fs::write(dir.join("bi.origin-rd.note"), "x").unwrap();
+        assert_eq!(origin_note_file(&cfg, legacy_lane), dir.join("bi.origin-rd.note"));
+        assert_eq!(origin_note_file(&cfg, other_lane), dir.join("bi.origin-3-rd.note"));
+        std::fs::write(dir.join("bi.origin-1-rd.note"), "y").unwrap();
+        assert_eq!(origin_note_file(&cfg, legacy_lane), dir.join("bi.origin-1-rd.note"), "the new name wins");
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// Task 1 follow-ups.
+    #[test]
+    fn legacy_load_save_keeps_everything() {
+        let dir = temp_dir();
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("pools.json");
+        let rd = entry(1, Asset::Rd, &[("a", 3), ("b", 0), ("c", 5)]).record;
+        let dfabi = entry(2, Asset::Dfabi, &[("a", 3), ("c", 5)]).record;
+        let legacy = serde_json::json!({ "rd": rd, "dfabi": dfabi, "carriers": { "a": "x", "c": "y" } });
+        std::fs::write(&path, legacy.to_string()).unwrap();
+        PoolFile::load(&path).unwrap().save(&path).unwrap();
+        let saved: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        assert_eq!(saved["version"], 2);
+        let back = PoolFile::load(&path).unwrap();
+        let bundles = |asset| {
+            let key = back.keys(asset)[0];
+            back.get(key).unwrap().bundles.iter().map(|b| (b.id.clone(), b.height)).collect::<Vec<_>>()
+        };
+        assert_eq!(bundles(Asset::Rd), [("a".to_string(), 3), ("b".to_string(), 0), ("c".to_string(), 5)]);
+        assert_eq!(bundles(Asset::Dfabi), [("a".to_string(), 3), ("c".to_string(), 5)]);
+        assert_eq!(back.carriers, BTreeMap::from([("a".to_owned(), "x".to_owned()), ("c".to_owned(), "y".to_owned())]));
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn a_v2_file_must_say_version_2_and_a_legacy_one_has_none() {
+        let dir = temp_dir();
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("pools.json");
+        let pools = serde_json::to_value(two_pools().pools).unwrap();
+        for (version, ok) in [(Some(2), true), (Some(3), false), (Some(1), false), (None, false)] {
+            let mut file = serde_json::json!({ "pools": pools, "carriers": {} });
+            if let Some(version) = version {
+                file["version"] = version.into();
+            }
+            std::fs::write(&path, file.to_string()).unwrap();
+            let loaded = PoolFile::load(&path);
+            assert_eq!(loaded.is_ok(), ok, "version {version:?}");
+            if let Err(err) = loaded {
+                assert!(format!("{err:#}").contains("version"), "{err:#}");
+            }
+        }
+        let rd = entry(1, Asset::Rd, &[]).record;
+        let dfabi = entry(2, Asset::Dfabi, &[]).record;
+        std::fs::write(&path, serde_json::json!({ "version": 2, "rd": rd, "dfabi": dfabi }).to_string()).unwrap();
+        assert!(PoolFile::load(&path).is_err(), "a legacy file has no version");
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn merging_into_a_key_that_names_no_pool_is_an_error() {
+        let mut pools = two_pools();
+        let missing = PoolKey { lane: 9, asset: Asset::Rd };
+        let err = error_of(pools.merge_finalized(missing, &["a".to_owned()], &BTreeMap::new()));
+        assert!(err.contains("lane 9"), "{err}");
+        assert!(pools.pools.iter().all(|e| e.record.bundles.is_empty()));
+    }
+
+    #[test]
+    fn finalized_lists_a_bundle_of_several_pools_once() {
+        let file = PoolFile {
+            pools: vec![entry(1, Asset::Rd, &[("a", 2), ("c", 6)]), entry(3, Asset::Rd, &[("c", 6), ("b", 4)])],
+            carriers: BTreeMap::new(),
+        };
+        assert_eq!(ids(file.finalized(Asset::Rd)), [("a".to_string(), 2), ("b".to_string(), 4), ("c".to_string(), 6)]);
     }
 }
