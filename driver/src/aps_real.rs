@@ -170,8 +170,11 @@ impl ApsBackend for RealBackend<'_> {
     fn merge_bundles(&self, lists: &BundleLists) -> Result<()> {
         let cfg = self.cfg();
         pools::PoolFile::update(&cfg.pools_file, |file| {
-            file.merge_finalized(Asset::Rd, &lists.rd, &lists.heights);
-            file.merge_finalized(Asset::Dfabi, &lists.dfabi, &lists.heights);
+            for (asset, ids) in [(Asset::Rd, &lists.rd), (Asset::Dfabi, &lists.dfabi)] {
+                for key in file.keys(asset) {
+                    file.merge_finalized(key, ids, &lists.heights);
+                }
+            }
             file.merge_carriers(&lists.carriers);
         })
     }

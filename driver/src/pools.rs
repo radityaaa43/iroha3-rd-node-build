@@ -50,7 +50,8 @@ use crate::{
     wallet::{pick_note, pick_notes, scan},
 };
 
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+#[derive(Serialize, Deserialize, Clone, Copy, PartialEq, Eq, Debug, Hash, PartialOrd, Ord)]
+#[serde(rename_all = "lowercase")]
 pub enum Asset {
     Rd,
     Dfabi,
@@ -65,7 +66,7 @@ impl Asset {
         }
     }
 
-    fn name(self) -> &'static str {
+    pub fn name(self) -> &'static str {
         match self {
             Self::Rd => "rd",
             Self::Dfabi => "dfabi",
@@ -99,26 +100,62 @@ pub struct PoolRecord {
     pub bundles: Vec<BundleRef>,
 }
 
+/// A pool is addressed by the dataspace lane it lives in and the asset it holds.
+#[derive(Serialize, Deserialize, Clone, Copy, PartialEq, Eq, Debug, Hash, PartialOrd, Ord)]
+pub struct PoolKey {
+    pub lane: u32,
+    pub asset: Asset,
+}
+
 #[derive(Serialize, Deserialize, Clone)]
+pub struct PoolEntry {
+    pub lane: u32,
+    pub asset: Asset,
+    #[serde(flatten)]
+    pub record: PoolRecord,
+}
+
+#[derive(Clone)]
 pub struct PoolFile {
-    pub rd: PoolRecord,
-    pub dfabi: PoolRecord,
+    pub pools: Vec<PoolEntry>,
     /// bundle id -> its finalization carrier tx hash (the tx the chain knows; the bundle id is not a tx). Known only for bundles
     /// finalized since this field exists; the coordinator records it and party drivers merge it from `GET /aps/bundles`.
-    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub carriers: BTreeMap<String, String>,
 }
 
 impl PoolFile {
+    /// Reads the v2 shape `{version, pools, carriers}` and the legacy `{rd, dfabi, carriers}` (lane = the one in the record's route).
     pub fn load(path: &Path) -> Result<Self> {
+        #[derive(Deserialize)]
+        struct Raw {
+            pools: Option<Vec<PoolEntry>>,
+            rd: Option<PoolRecord>,
+            dfabi: Option<PoolRecord>,
+            #[serde(default)]
+            carriers: BTreeMap<String, String>,
+        }
         let text = std::fs::read_to_string(path).wrap_err_with(|| format!("read {}", path.display()))?;
-        Ok(serde_json::from_str(&text)?)
+        let raw: Raw = serde_json::from_str(&text)?;
+        let legacy = |asset, record: PoolRecord| -> Result<PoolEntry> {
+            let lane = dec::<PrivateSettlementRouteV1>(&record.route)?.lane_id.as_u32();
+            Ok(PoolEntry { lane, asset, record })
+        };
+        let pools = match raw {
+            Raw { pools: Some(pools), rd: None, dfabi: None, .. } => pools,
+            Raw { pools: None, rd: Some(rd), dfabi: Some(dfabi), .. } => vec![legacy(Asset::Rd, rd)?, legacy(Asset::Dfabi, dfabi)?],
+            _ => bail!("{}: neither a v2 pool file nor the legacy {{rd, dfabi}} one", path.display()),
+        };
+        let file = Self { pools, carriers: raw.carriers };
+        let keys: std::collections::BTreeSet<_> = file.pools.iter().map(PoolEntry::key).collect();
+        ensure!(keys.len() == file.pools.len(), "{}: two pools share one (lane, asset)", path.display());
+        Ok(file)
     }
 
     /// Write through a temp file + rename: a crash never leaves a half-written index.
     pub fn save(&self, path: &Path) -> Result<()> {
         let tmp = path.with_extension("json.tmp");
-        std::fs::write(&tmp, serde_json::to_string_pretty(self)?)?;
+        let json = serde_json::json!({ "version": 2, "pools": self.pools, "carriers": self.carriers });
+        std::fs::write(&tmp, serde_json::to_string_pretty(&json)?)?;
         std::fs::rename(&tmp, path)?;
         Ok(())
     }
@@ -133,9 +170,18 @@ impl PoolFile {
         pools.save(path)
     }
 
-    /// The finalized bundles of a pool (height > 0), in ledger order: what a party driver needs to rebuild the history.
+    /// The finalized bundles (height > 0) of every pool of the asset, in ledger order: what a party driver needs to rebuild the history.
     pub fn finalized(&self, asset: Asset) -> Vec<BundleRef> {
-        self.get(asset).bundles.iter().filter(|bundle| bundle.height > 0).cloned().collect()
+        let mut bundles: Vec<BundleRef> = Vec::new();
+        for entry in self.pools.iter().filter(|entry| entry.asset == asset) {
+            for bundle in entry.record.bundles.iter().filter(|bundle| bundle.height > 0) {
+                if !bundles.iter().any(|known| known.id == bundle.id) {
+                    bundles.push(bundle.clone());
+                }
+            }
+        }
+        bundles.sort_by_key(|bundle| bundle.height);
+        bundles
     }
 
     /// Add the finalized bundles another driver listed (`ids`; `heights` may name a height per id) that are not here yet, after the
@@ -147,8 +193,10 @@ impl PoolFile {
         }
     }
 
-    pub fn merge_finalized(&mut self, asset: Asset, ids: &[String], heights: &BTreeMap<String, u64>) {
-        let bundles = &mut self.get_mut(asset).bundles;
+    /// A key that names no pool is ignored: callers take their keys from `keys()`.
+    pub fn merge_finalized(&mut self, key: PoolKey, ids: &[String], heights: &BTreeMap<String, u64>) {
+        let Some(entry) = self.pools.iter_mut().find(|entry| entry.key() == key) else { return };
+        let bundles = &mut entry.record.bundles;
         for id in ids {
             let height = heights.get(id).copied().unwrap_or(0);
             match bundles.iter().position(|bundle| bundle.id == *id) {
@@ -162,10 +210,10 @@ impl PoolFile {
         }
     }
 
-    /// Ids still at height 0 in either pool: in flight, or kept after the coordinator stopped waiting for every node's receipt.
+    /// Ids still at height 0 in any pool: in flight, or kept after the coordinator stopped waiting for every node's receipt.
     pub fn kept(&self) -> Vec<String> {
         let mut ids = Vec::new();
-        for bundle in self.rd.bundles.iter().chain(&self.dfabi.bundles) {
+        for bundle in self.pools.iter().flat_map(|entry| &entry.record.bundles) {
             if bundle.height == 0 && !ids.contains(&bundle.id) {
                 ids.push(bundle.id.clone());
             }
@@ -175,11 +223,39 @@ impl PoolFile {
 
     /// Set the height of the height-0 bundles that `heights` names (the chain finalized them after the coordinator stopped waiting).
     pub fn fill_heights(&mut self, heights: &BTreeMap<String, u64>) {
-        for bundle in self.rd.bundles.iter_mut().chain(&mut self.dfabi.bundles) {
+        for bundle in self.pools.iter_mut().flat_map(|entry| &mut entry.record.bundles) {
             if bundle.height == 0 {
                 bundle.height = heights.get(&bundle.id).copied().unwrap_or(0);
             }
         }
+    }
+
+    pub fn get(&self, key: PoolKey) -> Result<&PoolRecord> {
+        self.pools
+            .iter()
+            .find(|entry| entry.key() == key)
+            .map(|entry| &entry.record)
+            .ok_or_else(|| eyre!("no {} pool in lane {}", key.asset.name(), key.lane))
+    }
+
+    /// The keys of the asset's pools, by lane.
+    pub fn keys(&self, asset: Asset) -> Vec<PoolKey> {
+        let mut keys: Vec<_> = self.pools.iter().map(PoolEntry::key).filter(|key| key.asset == asset).collect();
+        keys.sort();
+        keys
+    }
+
+    /// Where the code still means "the" pool of an asset: it exists once. Later steps choose among several.
+    fn sole(&self, asset: Asset) -> Result<&PoolRecord> {
+        let keys = self.keys(asset);
+        ensure!(keys.len() == 1, "{} {} pools in the pools file, expected one", keys.len(), asset.name());
+        self.get(keys[0])
+    }
+}
+
+impl PoolEntry {
+    fn key(&self) -> PoolKey {
+        PoolKey { lane: self.lane, asset: self.asset }
     }
 }
 
@@ -201,23 +277,6 @@ pub fn fill_kept_heights(cfg: &Config) -> Result<()> {
         return Ok(());
     }
     PoolFile::update(&cfg.pools_file, |file| file.fill_heights(&heights))
-}
-
-impl PoolFile {
-
-    pub fn get(&self, asset: Asset) -> &PoolRecord {
-        match asset {
-            Asset::Rd => &self.rd,
-            Asset::Dfabi => &self.dfabi,
-        }
-    }
-
-    fn get_mut(&mut self, asset: Asset) -> &mut PoolRecord {
-        match asset {
-            Asset::Rd => &mut self.rd,
-            Asset::Dfabi => &mut self.dfabi,
-        }
-    }
 }
 
 impl PoolRecord {
@@ -355,7 +414,7 @@ pub fn pool_init(cfg: &Config, rd_reserve: u128, dfabi_reserve: u128) -> Result<
     let bi = cfg.note_keys("bi")?;
     let fee = bounded_fee(cfg)?;
     let account = sponsor.account_client();
-    let mut records = Vec::new();
+    let mut entries = Vec::new();
     for (asset, reserve) in [(Asset::Rd, rd_reserve), (Asset::Dfabi, dfabi_reserve)] {
         let route = route(&sponsor, lane_of(cfg, asset))?;
         let governed = crate::aps::govern_with(route, asset_id(cfg, asset).parse()?, caps.committed_height, None, &auditors, min_approvals)?;
@@ -368,20 +427,20 @@ pub fn pool_init(cfg: &Config, rd_reserve: u128, dfabi_reserve: u128) -> Result<
         let hash = sponsor.submit_transaction_and_wait(&tx).wrap_err_with(|| format!("activate {} pool", asset.name()))?;
         println!("pool_activation_tx={hash} asset={}", asset.name());
         write_secret(&origin_note_path(cfg, asset), &enc(&funding.opening)?)?;
-        records.push(PoolRecord {
+        let record = PoolRecord {
             pool_id: hex::encode(governed.governance.body.pool_id.as_ref()),
             route: enc(&governed.route)?,
             policy: enc(&governed.policy)?,
             governance: enc(&governed.governance)?,
             origin: funding.input_commitments.iter().map(|c| hex::encode(c.as_bytes())).collect(),
             bundles: Vec::new(),
-        });
+        };
+        entries.push(PoolEntry { lane: lane_of(cfg, asset), asset, record });
     }
-    let dfabi = records.pop().expect("two pools");
-    let rd = records.pop().expect("two pools");
-    let file = PoolFile { rd, dfabi, carriers: BTreeMap::new() };
+    let file = PoolFile { pools: entries, carriers: BTreeMap::new() };
     file.save(&cfg.pools_file)?;
-    println!("pool_init_json={}", serde_json::json!({ "rd": file.rd.pool_id, "dfabi": file.dfabi.pool_id }));
+    let ids: serde_json::Map<_, _> = file.pools.iter().map(|e| (e.asset.name().to_owned(), e.record.pool_id.clone().into())).collect();
+    println!("pool_init_json={}", serde_json::Value::Object(ids));
     Ok(())
 }
 
@@ -422,7 +481,7 @@ fn run_bundle(cfg: &Config, legs: [LegSpec; 2], options: &Options, kind: &str) -
     let mut spends = Vec::new();
     let mut governed = Vec::new();
     for (ordinal, leg) in legs.iter().enumerate() {
-        let record = pools.get(leg.asset);
+        let record = pools.sole(leg.asset)?;
         let history = record.history(&sponsor, &receipt_cache(cfg))?;
         let keys = cfg.note_keys(&leg.payer)?;
         let (unspent, _) = scan(&history, &keys, &origin_notes(cfg, &leg.payer, leg.asset)?)?;
@@ -497,8 +556,8 @@ fn settle_recorded(
 ) -> Result<Option<(String, u64)>> {
     let id = hex::encode(manifest.bundle_id.as_ref());
     PoolFile::update(&cfg.pools_file, |pools| {
-        for asset in [Asset::Rd, Asset::Dfabi] {
-            pools.get_mut(asset).bundles.push(BundleRef { id: id.clone(), height: 0 });
+        for entry in &mut pools.pools {
+            entry.record.bundles.push(BundleRef { id: id.clone(), height: 0 });
         }
     })?;
     let aborted = Cell::new(false);
@@ -519,7 +578,7 @@ pub(crate) struct BundleStart {
 pub(crate) fn begin_bundle(cfg: &Config) -> Result<BundleStart> {
     let pools = PoolFile::load(&cfg.pools_file)?;
     let (sponsor, sponsor_key) = cfg.acting_sponsor()?;
-    let governed = [pools.get(Asset::Rd).governed()?, pools.get(Asset::Dfabi).governed()?];
+    let governed = [pools.sole(Asset::Rd)?.governed()?, pools.sole(Asset::Dfabi)?.governed()?];
     let committees = committees_of(cfg, &governed)?;
     let network_id = *sponsor.client().network_id();
     let height = sponsor.client().get_privacy_capabilities()?.committed_height;
@@ -549,7 +608,7 @@ pub(crate) fn begin_bundle(cfg: &Config) -> Result<BundleStart> {
 pub(crate) fn settle_bundle(cfg: &Config, manifest: AtomicPrivateSettlementV1, prepared: &[AtomicPrivateSettlementPreparedLegV1]) -> Result<Option<(String, u64)>> {
     let pools = PoolFile::load(&cfg.pools_file)?;
     let (sponsor, _) = cfg.acting_sponsor()?;
-    let governed = [pools.get(Asset::Rd).governed()?, pools.get(Asset::Dfabi).governed()?];
+    let governed = [pools.sole(Asset::Rd)?.governed()?, pools.sole(Asset::Dfabi)?.governed()?];
     let committees = committees_of(cfg, &governed)?;
     let options = Options { expect: Expect::Either, replay: false };
     settle_recorded(cfg, &sponsor, manifest, prepared, &governed, &committees, Instant::now(), &options)
@@ -571,7 +630,7 @@ pub(crate) struct SplitLeg {
 /// (`aps_split::prepare_leg_split`); the recipient's and the sponsor's outputs arrive signed by their owners.
 pub(crate) fn prove_split_leg(cfg: &Config, payer: &str, asset: Asset, leg: &SplitLeg) -> Result<AtomicPrivateSettlementPreparedLegV1> {
     let pools = PoolFile::load(&cfg.pools_file)?;
-    let record = pools.get(asset);
+    let record = pools.sole(asset)?;
     let (client, _) = cfg.sponsor(payer)?;
     let history = record.history(&client, &receipt_cache(cfg))?;
     let keys = cfg.note_keys(payer)?;
@@ -635,8 +694,8 @@ fn record_end(pools: &mut PoolFile, id: &str, end: &BundleEnd) {
     if let BundleEnd::Finalized(_, carrier_tx) = end {
         pools.carriers.insert(id.to_owned(), carrier_tx.clone());
     }
-    for asset in [Asset::Rd, Asset::Dfabi] {
-        let bundles = &mut pools.get_mut(asset).bundles;
+    for entry in &mut pools.pools {
+        let bundles = &mut entry.record.bundles;
         match end {
             BundleEnd::Finalized(height, _) => bundles.iter_mut().filter(|b| b.id == id).for_each(|b| b.height = *height),
             BundleEnd::Dropped => bundles.retain(|b| b.id != id),
@@ -659,20 +718,24 @@ pub fn wallet_json(cfg: &Config, party: &str) -> Result<serde_json::Value> {
     let mut balances = serde_json::Map::new();
     let mut items = Vec::new();
     for asset in [Asset::Rd, Asset::Dfabi] {
-        let history = pools.get(asset).history(&client, &receipt_cache(cfg))?;
-        let (unspent, spent) = scan(&history, &keys, &origin_notes(cfg, party, asset)?)?;
-        let balance: u128 = unspent.iter().map(|n| n.opening.value).sum();
-        balances.insert(asset.name().into(), balance.to_string().into());
-        for bundle in &pools.get(asset).bundles {
-            let received: u128 = unspent
-                .iter()
-                .chain(spent.iter().map(|(n, _)| n))
-                .filter(|n| n.bundle_id.as_deref() == Some(bundle.id.as_str()))
-                .map(|n| n.opening.value)
-                .sum();
-            let paid: u128 = spent.iter().filter(|(_, by)| *by == bundle.id).map(|(n, _)| n.opening.value).sum();
-            items.extend(item_json(asset, bundle, received, paid, pools.carriers.get(&bundle.id).map(String::as_str)));
+        let mut balance = 0u128;
+        for key in pools.keys(asset) {
+            let record = pools.get(key)?;
+            let history = record.history(&client, &receipt_cache(cfg))?;
+            let (unspent, spent) = scan(&history, &keys, &origin_notes(cfg, party, asset)?)?;
+            balance += unspent.iter().map(|n| n.opening.value).sum::<u128>();
+            for bundle in &record.bundles {
+                let received: u128 = unspent
+                    .iter()
+                    .chain(spent.iter().map(|(n, _)| n))
+                    .filter(|n| n.bundle_id.as_deref() == Some(bundle.id.as_str()))
+                    .map(|n| n.opening.value)
+                    .sum();
+                let paid: u128 = spent.iter().filter(|(_, by)| *by == bundle.id).map(|(n, _)| n.opening.value).sum();
+                items.extend(item_json(asset, bundle, received, paid, pools.carriers.get(&bundle.id).map(String::as_str)));
+            }
         }
+        balances.insert(asset.name().into(), balance.to_string().into());
     }
     items.sort_by_key(|i| std::cmp::Reverse(i["height"].as_u64()));
     Ok(serde_json::json!({ "party": party, "balances": balances, "items": items }))
@@ -695,14 +758,16 @@ fn item_json(asset: Asset, bundle: &BundleRef, received: u128, paid: u128, carri
 pub fn pool_history(cfg: &Config, asset: Asset) -> Result<()> {
     let pools = PoolFile::load(&cfg.pools_file)?;
     let (client, _) = cfg.acting_sponsor()?;
-    let history = pools.get(asset).history(&client, &receipt_cache(cfg))?;
-    println!(
-        "pool_history asset={} epoch={} leaves={} root={}",
-        asset.name(),
-        history.epoch,
-        history.tree.len(),
-        hex::encode(history.root().as_bytes())
-    );
+    for key in pools.keys(asset) {
+        let history = pools.get(key)?.history(&client, &receipt_cache(cfg))?;
+        println!(
+            "pool_history asset={} epoch={} leaves={} root={}",
+            asset.name(),
+            history.epoch,
+            history.tree.len(),
+            hex::encode(history.root().as_bytes())
+        );
+    }
     Ok(())
 }
 
@@ -767,14 +832,8 @@ mod tests {
     /// chain's receipt names its height; a bundle still in flight stays 0 and a known height is never overwritten.
     #[test]
     fn kept_bundle_gets_its_finalized_height() {
-        let mut file = PoolFile { rd: record(), dfabi: record(), carriers: BTreeMap::new() };
-        for asset in [Asset::Rd, Asset::Dfabi] {
-            file.get_mut(asset).bundles = vec![
-                BundleRef { id: "a".into(), height: 5 },
-                BundleRef { id: "kept".into(), height: 0 },
-                BundleRef { id: "live".into(), height: 0 },
-            ];
-        }
+        let bundles = [("a", 5), ("kept", 0), ("live", 0)];
+        let mut file = PoolFile { pools: vec![entry(1, Asset::Rd, &bundles), entry(2, Asset::Dfabi, &bundles)], carriers: BTreeMap::new() };
         assert_eq!(file.kept(), vec!["kept".to_string(), "live".to_string()]);
         file.fill_heights(&BTreeMap::from([("kept".to_string(), 271), ("a".to_string(), 9)]));
         for asset in [Asset::Rd, Asset::Dfabi] {
@@ -784,8 +843,9 @@ mod tests {
         assert_eq!(file.kept(), vec!["live".to_string()]);
     }
 
-    fn record() -> PoolRecord {
-        PoolRecord { pool_id: String::new(), route: String::new(), policy: String::new(), governance: String::new(), origin: vec![], bundles: vec![] }
+    /// The two pools of today's chain, empty: RD in lane 1, DFABI in lane 2.
+    fn two_pools() -> PoolFile {
+        PoolFile { pools: vec![entry(1, Asset::Rd, &[]), entry(2, Asset::Dfabi, &[])], carriers: BTreeMap::new() }
     }
 
     #[test]
@@ -810,13 +870,13 @@ mod tests {
         let dir = temp_dir();
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("pools.json");
-        PoolFile { rd: record(), dfabi: record(), carriers: BTreeMap::new() }.save(&path).unwrap();
+        two_pools().save(&path).unwrap();
         let writers: Vec<_> = (0..4)
             .map(|t| {
                 let path = path.clone();
                 std::thread::spawn(move || {
                     for i in 0..50 {
-                        PoolFile::update(&path, |p| p.rd.bundles.push(BundleRef { id: format!("{t}-{i}"), height: 0 })).unwrap();
+                        PoolFile::update(&path, |p| p.pools[0].record.bundles.push(BundleRef { id: format!("{t}-{i}"), height: 0 })).unwrap();
                     }
                 })
             })
@@ -824,37 +884,39 @@ mod tests {
         for writer in writers {
             writer.join().unwrap();
         }
-        assert_eq!(PoolFile::load(&path).unwrap().rd.bundles.len(), 200);
+        assert_eq!(PoolFile::load(&path).unwrap().pools[0].record.bundles.len(), 200);
         std::fs::remove_dir_all(dir).unwrap();
     }
 
     /// A party driver starts with no bundles and learns BI's finalized list: no duplicates, its own order kept, heights filled in.
     #[test]
     fn merging_the_coordinators_finalized_bundles_adds_the_missing_ones_once() {
-        let mut pools = PoolFile { rd: record(), dfabi: record(), carriers: BTreeMap::new() };
-        pools.rd.bundles = vec![BundleRef { id: "a".into(), height: 3 }, BundleRef { id: "p".into(), height: 0 }];
+        let mut pools = two_pools();
+        let (rd, dfabi) = (PoolKey { lane: 1, asset: Asset::Rd }, PoolKey { lane: 2, asset: Asset::Dfabi });
+        pools.pools[0].record.bundles = vec![BundleRef { id: "a".into(), height: 3 }, BundleRef { id: "p".into(), height: 0 }];
         let ids: Vec<String> = ["a", "b", "p"].iter().map(|id| id.to_string()).collect();
         let heights = std::collections::BTreeMap::from([("a".to_owned(), 3), ("b".to_owned(), 5), ("p".to_owned(), 7)]);
-        pools.merge_finalized(Asset::Rd, &ids, &heights);
-        pools.merge_finalized(Asset::Rd, &ids, &heights);
-        let merged: Vec<_> = pools.rd.bundles.iter().map(|b| (b.id.as_str(), b.height)).collect();
+        pools.merge_finalized(rd, &ids, &heights);
+        pools.merge_finalized(rd, &ids, &heights);
+        let merged: Vec<_> = pools.get(rd).unwrap().bundles.iter().map(|b| (b.id.as_str(), b.height)).collect();
         assert_eq!(merged, [("a", 3), ("p", 7), ("b", 5)]);
-        assert!(pools.dfabi.bundles.is_empty());
-        pools.merge_finalized(Asset::Dfabi, &["z".to_owned()], &heights);
-        assert_eq!((pools.dfabi.bundles[0].id.as_str(), pools.dfabi.bundles[0].height), ("z", 0), "an unknown height stays 0");
+        assert!(pools.get(dfabi).unwrap().bundles.is_empty());
+        pools.merge_finalized(dfabi, &["z".to_owned()], &heights);
+        let z = &pools.get(dfabi).unwrap().bundles[0];
+        assert_eq!((z.id.as_str(), z.height), ("z", 0), "an unknown height stays 0");
     }
 
     #[test]
     fn only_finalized_bundles_are_listed() {
-        let mut pools = PoolFile { rd: record(), dfabi: record(), carriers: BTreeMap::new() };
-        pools.rd.bundles = vec![BundleRef { id: "a".into(), height: 3 }, BundleRef { id: "inflight".into(), height: 0 }, BundleRef { id: "b".into(), height: 4 }];
+        let mut pools = two_pools();
+        pools.pools[0].record.bundles = vec![BundleRef { id: "a".into(), height: 3 }, BundleRef { id: "inflight".into(), height: 0 }, BundleRef { id: "b".into(), height: 4 }];
         let ids: Vec<_> = pools.finalized(Asset::Rd).into_iter().map(|b| b.id).collect();
         assert_eq!(ids, ["a", "b"]);
     }
 
     fn listed(id: &str) -> PoolFile {
-        let mut pools = PoolFile { rd: record(), dfabi: record(), carriers: BTreeMap::new() };
-        for pool in [&mut pools.rd, &mut pools.dfabi] {
+        let mut pools = two_pools();
+        for pool in pools.pools.iter_mut().map(|e| &mut e.record) {
             pool.bundles.push(BundleRef { id: id.into(), height: 0 });
         }
         pools
@@ -866,7 +928,7 @@ mod tests {
         let failed: Result<Option<(String, u64)>> = Err(eyre!("register prepare"));
         let mut pools = listed("b");
         record_end(&mut pools, "b", &bundle_end(&failed, true));
-        assert!(pools.rd.bundles.is_empty() && pools.dfabi.bundles.is_empty());
+        assert!(pools.pools.iter().all(|e| e.record.bundles.is_empty()));
     }
 
     #[test]
@@ -874,10 +936,10 @@ mod tests {
         let failed: Result<Option<(String, u64)>> = Err(eyre!("register prepare"));
         let mut pools = listed("b");
         record_end(&mut pools, "b", &bundle_end(&failed, false));
-        assert_eq!((pools.rd.bundles.len(), pools.dfabi.bundles.len()), (1, 1));
+        assert_eq!(pools.pools.iter().map(|e| e.record.bundles.len()).collect::<Vec<_>>(), [1, 1]);
         let done: Result<Option<(String, u64)>> = Ok(Some(("b".into(), 42)));
         record_end(&mut pools, "b", &bundle_end(&done, false));
-        assert_eq!((pools.rd.bundles[0].height, pools.dfabi.bundles[0].height), (42, 42));
+        assert_eq!(pools.pools.iter().map(|e| e.record.bundles[0].height).collect::<Vec<_>>(), [42, 42]);
     }
 
     /// The chain knows a bundle only by its carrier tx (status, receipt view); the bundle id is not a tx hash.
