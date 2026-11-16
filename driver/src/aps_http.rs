@@ -391,11 +391,13 @@ pub struct Aps<'a> {
     intents: IntentStore,
     /// The coordinator's global mutex: the pool is serial (`old_root` must be the current root), so one bundle at a time.
     submit_lock: Mutex<()>,
+    /// One own proof at a time: a proof peaks at about 1.1 GB, two would crowd the driver's memory limit.
+    prove_lock: Mutex<()>,
 }
 
 impl<'a> Aps<'a> {
     pub fn new(backend: &'a dyn ApsBackend, peer: &'a dyn Peer, cfg: ApsConfig) -> Self {
-        Self { backend, peer, cfg, intents: IntentStore::default(), submit_lock: Mutex::new(()) }
+        Self { backend, peer, cfg, intents: IntentStore::default(), submit_lock: Mutex::new(()), prove_lock: Mutex::new(()) }
     }
 
     /// Answer one `/aps/*` request: `(HTTP status, JSON body)`.
@@ -563,6 +565,19 @@ impl<'a> Aps<'a> {
         serde_json::from_str(&answer).map_err(|e| error(502, format!("{path}: bad answer: {e}")))
     }
 
+    /// One leg's proof: the coordinator proves its own leg, any other payer proves it on its driver.
+    fn prove(&self, local: bool, payer: &str, req: &LegReq) -> Result<String, Reply> {
+        if local {
+            let _one_own_proof = self.prove_lock.lock().unwrap_or_else(|p| p.into_inner());
+            return self.backend.prove_leg(req).map_err(fail);
+        }
+        let answer: Prepared = self.ask(payer, "/aps/leg", req)?;
+        if !answer.prepared.split('.').all(hex_any) {
+            return Err(error(502, "/aps/leg: bad answer"));
+        }
+        Ok(answer.prepared)
+    }
+
     /// One bundle: manifest, then per leg the recipient's address, the sponsor's output and the payer's proof, then settle.
     fn coordinate(&self, now: Instant, legs: &[LegSpec; 2]) -> Result<Reply, Reply> {
         let me = self.backend.own_key().map_err(fail)?;
@@ -577,7 +592,9 @@ impl<'a> Aps<'a> {
             }
         }
         let bundle = self.backend.begin_bundle().map_err(fail)?;
-        let mut prepared = Vec::new();
+        // Per leg, in order: the recipient's address, the sponsor's output and, for a leg the coordinator pays, its intent.
+        // Nothing is proved before both legs are ready, so a refused intent costs no proving.
+        let mut jobs = Vec::new();
         for (index, spec) in legs.iter().enumerate() {
             let ordinal = index as u8;
             let ctx = AddressReq {
@@ -608,21 +625,20 @@ impl<'a> Aps<'a> {
                 recipient_output,
                 sponsor_output,
             };
-            let leg = if is_me(&payer) {
-                // A leg BI pays itself needs BI's own intent like any other payer's; only the companion has none.
-                if spec.intent.is_some() {
-                    self.consume(now, &req, spec.amount)?;
-                }
-                self.backend.prove_leg(&req).map_err(fail)?
-            } else {
-                let answer: Prepared = self.ask(&payer, "/aps/leg", &req)?;
-                if !answer.prepared.split('.').all(hex_any) {
-                    return Err(error(502, "/aps/leg: bad answer"));
-                }
-                answer.prepared
-            };
-            prepared.push(leg);
+            let local = is_me(&payer);
+            // A leg BI pays itself needs BI's own intent like any other payer's; only the companion has none.
+            if local && spec.intent.is_some() {
+                self.consume(now, &req, spec.amount)?;
+            }
+            jobs.push((local, payer, req));
         }
+        // The two proofs are independent (one RD and one DFABI pool, each proved by its own payer): run them at the same time.
+        // Both are joined; the first failing leg in leg order is the answer.
+        let prepared = std::thread::scope(|scope| {
+            let running: Vec<_> = jobs.iter().map(|(local, payer, req)| scope.spawn(move || self.prove(*local, payer, req))).collect();
+            let done: Vec<_> = running.into_iter().map(|job| job.join().unwrap_or_else(|_| Err(error(500, "leg prover panicked")))).collect();
+            done.into_iter().collect::<Result<Vec<_>, Reply>>()
+        })?;
         let settled = self.backend.settle(&bundle, &[prepared[0].clone(), prepared[1].clone()]).map_err(fail)?;
         Ok(match settled {
             Some(done) => reply(200, serde_json::json!({ "outcome": "finalized", "bundle_id": bundle.bundle_id, "carrier_tx": done.carrier_tx, "height": done.height })),
@@ -685,6 +701,8 @@ pub(crate) mod testkit {
         pub settle_delay: Duration,
         /// How long `prove_leg` takes.
         pub prove_delay: Duration,
+        pub proving: AtomicUsize,
+        pub max_proving: AtomicUsize,
         /// What `bundles` answers (coordinator).
         pub lists: BundleLists,
         /// Every list `merge_bundles` was given (party driver).
@@ -730,7 +748,10 @@ pub(crate) mod testkit {
         }
 
         fn prove_leg(&self, _req: &LegReq) -> Result<String> {
+            let now = self.proving.fetch_add(1, Ordering::SeqCst) + 1;
+            self.max_proving.fetch_max(now, Ordering::SeqCst);
             std::thread::sleep(self.prove_delay);
+            self.proving.fetch_sub(1, Ordering::SeqCst);
             self.note("prove")?;
             Ok("beef".to_owned())
         }
@@ -1026,6 +1047,18 @@ mod tests {
     }
 
     #[test]
+    fn the_coordinator_proves_its_own_two_legs_one_after_the_other() {
+        // BI's issuance leg and its companion are both BI's own proofs: one at a time (memory).
+        let backend = FakeBackend { prove_delay: Duration::from_millis(100), ..driver(7) };
+        let peer = FakePeer::standard();
+        let aps = Aps::new(&backend, &peer, coordinator());
+        assert_eq!(aps.route("POST", "/aps/intent", &intent_body(&id(1), "rd", &account(9), "5")).0, 200);
+        assert_eq!(aps.route("POST", "/aps/submit", &pay_body(&id(1), "rd", &account(7), &account(9), "5")).0, 200);
+        assert_eq!(calls(&backend).iter().filter(|call| **call == "prove").count(), 2);
+        assert_eq!(backend.max_proving.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
     fn a_dvp_asks_the_buyer_for_the_rd_leg_and_the_seller_for_the_dfabi_leg() {
         let (backend, peer) = (driver(7), FakePeer::standard());
         let aps = Aps::new(&backend, &peer, coordinator());
@@ -1033,8 +1066,11 @@ mod tests {
         assert_eq!(status, 200);
         let sent = peer.calls.lock().unwrap().clone();
         let route: Vec<_> = sent.iter().map(|call| (call.0.as_str(), call.2.as_str())).collect();
-        assert_eq!(route, [(BANK_B, "/aps/address"), (BANK_A, "/aps/leg"), (BANK_A, "/aps/address"), (BANK_B, "/aps/leg")]);
-        let (rd, dfabi) = (json(&sent[1].3), json(&sent[3].3));
+        // Both addresses first, in leg order; then the two legs, proved at the same time (either may be asked first).
+        assert_eq!(route[..2], [(BANK_B, "/aps/address"), (BANK_A, "/aps/address")]);
+        let leg_of = |bank: &str| sent.iter().find(|call| call.0 == bank && call.2 == "/aps/leg").map(|call| json(&call.3)).unwrap();
+        assert_eq!(route.len(), 4);
+        let (rd, dfabi) = (leg_of(BANK_A), leg_of(BANK_B));
         assert_eq!((rd["intent"].as_str(), rd["amount"].as_str(), rd["recipient"].as_str()), (Some(id(1).as_str()), Some("5"), Some(account(9).as_str())));
         assert_eq!((dfabi["intent"].as_str(), dfabi["amount"].as_str(), dfabi["recipient"].as_str()), (Some(id(2).as_str()), Some("7"), Some(account(8).as_str())));
         assert_eq!((dfabi["ordinal"].as_u64(), dfabi["sponsor_output"]["active"].as_bool()), (Some(1), Some(false)));
