@@ -777,13 +777,29 @@ pub(crate) fn resume(cfg: &Config, f: Inflight) -> Result<Option<(String, u64)>>
     let pools = PoolFile::load(&cfg.pools_file)?;
     let governed = leg_pools(&pools, f.keys)?;
     let committees = committees_of(cfg, &governed)?;
-    let manifest: AtomicPrivateSettlementV1 = dec(&f.manifest)?;
     let prepared = f.prepared.iter().map(|leg| decode_prepared(leg)).collect::<Result<Vec<_>>>()?;
+    resume_with(cfg, f, |manifest, phase, aborted, save| {
+        crate::aps::resume_bundle(cfg, manifest, &prepared, &governed, &committees, phase, aborted, save)
+    })
+}
+
+/// `resume` with the run on the nodes injected (tests: a fake chain): saves each phase, records the end.
+fn resume_with(
+    cfg: &Config,
+    f: Inflight,
+    run: impl FnOnce(
+        AtomicPrivateSettlementV1,
+        Phase,
+        &Cell<bool>,
+        &mut dyn FnMut(Phase, &AtomicPrivateSettlementV1) -> Result<()>,
+    ) -> Result<Option<crate::aps::Settlement>>,
+) -> Result<Option<(String, u64)>> {
+    let manifest: AtomicPrivateSettlementV1 = dec(&f.manifest)?;
     let (id, phase) = (f.bundle_id.clone(), f.phase);
     let mut state = f;
     let dir = inflight::dir(cfg);
     let aborted = Cell::new(false);
-    let ended = crate::aps::resume_bundle(cfg, manifest, &prepared, &governed, &committees, phase, &aborted, &mut |phase, manifest| {
+    let ended = run(manifest, phase, &aborted, &mut |phase: Phase, manifest: &AtomicPrivateSettlementV1| {
         state.phase = phase;
         state.manifest = enc(manifest)?;
         inflight::save(&dir, &state)
@@ -1440,6 +1456,39 @@ dfabi = 2
             dir = dir.display()
         );
         toml::from_str(&text).unwrap()
+    }
+
+    /// Restart past expiry with no marker: the `Expired` marker goes in once, and the bundle leaves pools.json and `inflight/`.
+    #[test]
+    fn an_expired_bundle_is_aborted_on_resume_and_leaves_the_inflight_store() {
+        use crate::{aps::continue_bundle, inflight::tests::FakeNodes};
+        use iroha::client::PrivateSettlementLifecycleDtoV1;
+        let dir = temp_dir();
+        std::fs::create_dir_all(&dir).unwrap();
+        let cfg = offline_config(&dir);
+        let manifest = crate::aps::test_manifest();
+        let id = hex::encode(manifest.bundle_id.as_ref());
+        let listed = [(id.as_str(), 0)];
+        PoolFile { pools: vec![entry(1, Asset::Rd, &listed), entry(2, Asset::Dfabi, &listed)], carriers: BTreeMap::new() }
+            .save(&cfg.pools_file)
+            .unwrap();
+        let f = Inflight {
+            bundle_id: id.clone(),
+            keys: [key(1, Asset::Rd), key(2, Asset::Dfabi)],
+            manifest: enc(&manifest).unwrap(),
+            prepared: Vec::new(),
+            phase: Phase::Registered,
+        };
+        inflight::save(&inflight::dir(&cfg), &f).unwrap();
+        let nodes = FakeNodes { expired: true, ..FakeNodes::new(Some(PrivateSettlementLifecycleDtoV1::Expired)) };
+        let ended = resume_with(&cfg, f, |manifest, phase, aborted, save| continue_bundle(&nodes, manifest, phase, aborted, save)).unwrap();
+        assert_eq!(ended, None, "nothing moved");
+        assert_eq!(nodes.carriers.get(), 1, "exactly one abort carrier: {:?}", nodes.calls.borrow());
+        assert_eq!(*nodes.calls.borrow(), ["abort refused", "abort"]);
+        assert!(inflight::load_all(&inflight::dir(&cfg)).unwrap().is_empty(), "no longer in flight");
+        let pools = PoolFile::load(&cfg.pools_file).unwrap();
+        assert!(pools.pools.iter().all(|e| e.record.bundles.is_empty()) && pools.carriers.is_empty());
+        std::fs::remove_dir_all(dir).unwrap();
     }
 
     fn error_of<T>(result: Result<T>) -> String {

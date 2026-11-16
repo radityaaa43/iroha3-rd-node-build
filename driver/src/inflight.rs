@@ -6,9 +6,12 @@
 //! party or asset (official docs: secret witnesses never go into durable coordination records). No certificate either: a
 //! resumed bundle recovers its Prepare and Commit certificates from the nodes (`recover_or_*`), never from a local file.
 
-use std::path::{Path, PathBuf};
+use std::{
+    io::Write,
+    path::{Path, PathBuf},
+};
 
-use eyre::{Result, WrapErr};
+use eyre::Result;
 use serde::{Deserialize, Serialize};
 
 use crate::{config::Config, pools::PoolKey};
@@ -48,12 +51,17 @@ pub fn save(dir: &Path, f: &Inflight) -> Result<()> {
     std::fs::create_dir_all(dir)?;
     let file = dir.join(format!("{}.json", f.bundle_id));
     let tmp = file.with_extension("json.tmp");
-    std::fs::write(&tmp, serde_json::to_string(f)?)?;
+    let mut out = std::fs::File::create(&tmp)?;
+    out.write_all(serde_json::to_string(f)?.as_bytes())?;
+    out.sync_all()?;
     std::fs::rename(&tmp, &file)?;
+    // The rename itself survives a power loss only once the directory is synced.
+    std::fs::File::open(dir)?.sync_all()?;
     Ok(())
 }
 
-/// Every bundle a previous run left in flight (the temp file of an interrupted save is skipped).
+/// Every bundle a previous run left in flight. The temp file of an interrupted save is skipped, and so is a file that cannot be read
+/// (logged by name only): one damaged file must not keep the other bundles from resuming.
 pub fn load_all(dir: &Path) -> Result<Vec<Inflight>> {
     if !dir.exists() {
         return Ok(Vec::new());
@@ -62,8 +70,7 @@ pub fn load_all(dir: &Path) -> Result<Vec<Inflight>> {
     for entry in std::fs::read_dir(dir)? {
         let path = entry?.path();
         if path.extension().is_some_and(|ext| ext == "json") {
-            let text = std::fs::read_to_string(&path)?;
-            all.push(serde_json::from_str(&text).wrap_err_with(|| format!("read {}", path.display()))?);
+            all.push(serde_json::from_str(&std::fs::read_to_string(&path)?)?); // RED stub
         }
     }
     Ok(all)
@@ -78,7 +85,7 @@ pub fn remove(dir: &Path, id: &str) -> Result<()> {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use std::cell::{Cell, RefCell};
 
     use iroha::{
@@ -189,17 +196,19 @@ mod tests {
     }
 
     /// A fake chain: every call in order, and how many carriers (registration, finalization, abort) were submitted.
-    struct FakeNodes {
-        status: Option<PrivateSettlementLifecycleDtoV1>,
-        calls: RefCell<Vec<&'static str>>,
-        carriers: Cell<usize>,
+    pub(crate) struct FakeNodes {
+        pub status: Option<PrivateSettlementLifecycleDtoV1>,
+        pub calls: RefCell<Vec<&'static str>>,
+        pub carriers: Cell<usize>,
         /// The nodes no longer hold a Prepare certificate and the bundle is past its expiry.
-        expired: bool,
+        pub expired: bool,
+        /// Torii refuses the finalization carrier (an earlier run's one is already queued).
+        pub finalize_fails: bool,
     }
 
     impl FakeNodes {
-        fn new(status: Option<PrivateSettlementLifecycleDtoV1>) -> Self {
-            Self { status, calls: RefCell::default(), carriers: Cell::new(0), expired: false }
+        pub(crate) fn new(status: Option<PrivateSettlementLifecycleDtoV1>) -> Self {
+            Self { status, calls: RefCell::default(), carriers: Cell::new(0), expired: false, finalize_fails: false }
         }
 
         fn call(&self, name: &'static str) {
@@ -246,6 +255,10 @@ mod tests {
         }
 
         fn finalize(&self, _barrier: &(), _commits: &()) -> Result<String> {
+            if self.finalize_fails {
+                self.call("finalize refused");
+                eyre::bail!("a finalization is already queued");
+            }
             self.carrier("finalize");
             Ok("finalize-tx".to_owned())
         }
@@ -296,6 +309,35 @@ mod tests {
         assert!(error.to_string().contains("no Prepare quorum"), "{error:#}");
         assert!(aborted.get(), "the bundle ended aborted: nothing moved, nothing stays reserved");
         assert_eq!(*nodes.calls.borrow(), ["prepare", "abort refused", "abort"]);
+    }
+
+    /// Restart after the Commit: the finalization an earlier run queued lands. A refused resubmit reads the receipt first, so the
+    /// bundle is recorded finalized and no abort races it.
+    #[test]
+    fn a_refused_finalization_on_resume_reads_the_receipt_before_aborting() {
+        let nodes = FakeNodes { finalize_fails: true, ..FakeNodes::new(Some(PrivateSettlementLifecycleDtoV1::CommitCertified)) };
+        let (ended, saved) = resume(&nodes, Phase::Committed);
+        assert_eq!(ended, Some(("finalized", String::new(), 7)));
+        assert_eq!(nodes.carriers.get(), 0, "no abort carrier: {:?}", nodes.calls.borrow());
+        assert_eq!(*nodes.calls.borrow(), ["prepare", "commit", "finalize refused"]);
+        assert!(saved.is_empty());
+    }
+
+    /// A zero-length file (a crash mid-write on a filesystem that lost the data) is skipped; the other bundles still resume.
+    #[test]
+    fn an_unreadable_inflight_file_is_skipped() {
+        let dir = temp_dir();
+        let good = Inflight {
+            bundle_id: "ab".repeat(32),
+            keys: [PoolKey { lane: 1, asset: Asset::Rd }, PoolKey { lane: 2, asset: Asset::Dfabi }],
+            manifest: "00".into(),
+            prepared: Vec::new(),
+            phase: Phase::Uploaded,
+        };
+        save(&dir, &good).unwrap();
+        std::fs::write(dir.join(format!("{}.json", "cd".repeat(32))), "").unwrap();
+        assert_eq!(load_all(&dir).unwrap(), vec![good]);
+        std::fs::remove_dir_all(dir).unwrap();
     }
 
     #[test]

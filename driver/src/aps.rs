@@ -394,7 +394,9 @@ pub(crate) struct Settlement {
 pub(crate) trait Nodes {
     type Barrier;
     type Commits;
-    /// The bundle's public lifecycle on the coordinator's node, `None` when that node cannot say.
+    /// The bundle's public lifecycle on the coordinator's node, `None` when that node cannot say. `Aborted` covers both global abort
+    /// markers (an applied `Expired` marker too); `Expired` means past its expiry with no global marker yet: its pools stay
+    /// reserved until one is applied.
     fn status(&self, manifest: &AtomicPrivateSettlementV1) -> Option<PrivateSettlementLifecycleDtoV1>;
     /// Certify availability and upload every leg; returns the final manifest.
     fn upload(&self, provisional: &AtomicPrivateSettlementV1) -> Result<AtomicPrivateSettlementV1>;
@@ -414,8 +416,8 @@ pub(crate) trait Nodes {
     fn receipt(&self, manifest: &AtomicPrivateSettlementV1) -> Result<(&'static str, u64)>;
 }
 
-/// A bundle a previous run left at `phase`: its end when the nodes report one; `None` when it never reached Prepare (nothing is
-/// reserved; it is dropped and its sidecars expire); else the phases after `phase`.
+/// A bundle a previous run left at `phase`: its end when the nodes report one; past its expiry with no marker, the `Expired` marker;
+/// `None` when it never reached Prepare (nothing is reserved; it is dropped and its sidecars expire); else the phases after `phase`.
 pub(crate) fn continue_bundle<N: Nodes>(
     nodes: &N,
     manifest: AtomicPrivateSettlementV1,
@@ -424,10 +426,19 @@ pub(crate) fn continue_bundle<N: Nodes>(
     save: &mut dyn FnMut(Phase, &AtomicPrivateSettlementV1) -> Result<()>,
 ) -> Result<Option<Settlement>> {
     use PrivateSettlementLifecycleDtoV1::{Aborted, Expired, Finalized};
-    if matches!(nodes.status(&manifest), Some(Finalized | Aborted | Expired)) {
-        // The carrier tx of an earlier run is not known here.
-        let (outcome, height) = nodes.receipt(&manifest)?;
-        return Ok(Some(Settlement { manifest, carrier_tx: String::new(), outcome, height }));
+    match nodes.status(&manifest) {
+        Some(Finalized | Aborted | Expired) => { // RED stub: Expired treated as ended
+            // The carrier tx of an earlier run is not known here.
+            let (outcome, height) = nodes.receipt(&manifest)?;
+            return Ok(Some(Settlement { manifest, carrier_tx: String::new(), outcome, height }));
+        }
+        #[allow(unreachable_patterns)]
+        Some(Expired) => {
+            let (carrier_tx, height) = abort_and_wait(nodes, &manifest)?;
+            aborted.set(true);
+            return Ok(Some(Settlement { manifest, carrier_tx, outcome: "aborted", height }));
+        }
+        _ => {}
     }
     if phase == Phase::Proved {
         return Ok(None);
@@ -480,7 +491,18 @@ fn drive<N: Nodes>(
         if from < Phase::Committed {
             save(Phase::Committed, &manifest)?;
         }
-        let carrier_tx = nodes.finalize(&barrier, &commits)?;
+        let carrier_tx = match nodes.finalize(&barrier, &commits) {
+            Ok(carrier_tx) => carrier_tx,
+            // An earlier run's finalization may already be queued: its receipt wins over an abort.
+            Err(error) if false && from == Phase::Committed => { // RED stub
+                return match nodes.receipt(&manifest) {
+                    Ok((outcome, height)) => Ok((String::new(), outcome, height)),
+                    Err(seen) if seen.downcast_ref::<FinalizedSeen>().is_some() => Err(seen),
+                    Err(_) => Err(error),
+                };
+            }
+            Err(error) => return Err(error),
+        };
         let (outcome, height) = nodes.receipt(&manifest)?;
         Ok((carrier_tx, outcome, height))
     })();
@@ -490,22 +512,23 @@ fn drive<N: Nodes>(
 
 /// Abort a bundle that has not finalized and wait until all four validators report it aborted; this releases its
 /// pool/nullifier/output reservations.
-fn abort_and_wait<N: Nodes>(nodes: &N, manifest: &AtomicPrivateSettlementV1) -> Result<()> {
+/// Returns the abort carrier tx and the aborted height.
+fn abort_and_wait<N: Nodes>(nodes: &N, manifest: &AtomicPrivateSettlementV1) -> Result<(String, u64)> {
     // Past its expiry only the `Expired` marker is admissible (Torii's authoritative-height rule): a bundle resumed late still ends.
-    nodes
+    let carrier_tx = nodes
         .abort(manifest, PrivateSettlementAbortReasonV1::ParticipantRejected)
         .or_else(|first| nodes.abort(manifest, PrivateSettlementAbortReasonV1::Expired).map_err(|_| first))?;
-    let (outcome, _) = nodes.receipt(manifest)?;
+    let (outcome, height) = nodes.receipt(manifest)?;
     if outcome == "finalized" {
         return Err(eyre::Report::new(FinalizedSeen("abort ended as finalized".into())));
     }
     ensure!(outcome == "aborted", "abort ended as {outcome}");
-    Ok(())
+    Ok((carrier_tx, height))
 }
 
 /// `abort-bundle`: abort with the key that is `manifest.sponsor` (`Config::signer_for`).
 pub(crate) fn abort_bundle(cfg: &Config, manifest: &AtomicPrivateSettlementV1) -> Result<()> {
-    abort_and_wait(&RealNodes::new(cfg, manifest, &[], &[], &[])?, manifest)
+    abort_and_wait(&RealNodes::new(cfg, manifest, &[], &[], &[])?, manifest).map(|_| ())
 }
 
 /// Torii of the committee nodes and the auditors for one bundle; every carrier is signed by the key that is `manifest.sponsor`
@@ -558,7 +581,21 @@ impl Nodes for RealNodes<'_> {
     type Commits = Vec<PrivateSettlementPhaseCertificateV1>;
 
     fn status(&self, manifest: &AtomicPrivateSettlementV1) -> Option<PrivateSettlementLifecycleDtoV1> {
-        self.sponsor.client().private_settlement_bundle_status_v1(manifest.bundle_id).ok().map(|status| status.lifecycle)
+        let client = self.sponsor.client();
+        match client.private_settlement_bundle_status_v1(manifest.bundle_id) {
+            // A global marker has a finalized height; an applied `Expired` marker ends the bundle like an abort.
+            Ok(status) if status.finalized_height.is_some() && status.lifecycle == PrivateSettlementLifecycleDtoV1::Expired => {
+                Some(PrivateSettlementLifecycleDtoV1::Aborted)
+            }
+            Ok(status) => Some(status.lifecycle),
+            // Past expiry with no marker Torii answers `Expired` without a finalized height, which the upstream client refuses as
+            // malformed: read the height instead.
+            Err(_) => client
+                .get_privacy_capabilities()
+                .ok()
+                .filter(|caps| caps.committed_height > manifest.expiry_height)
+                .map(|_| PrivateSettlementLifecycleDtoV1::Expired),
+        }
     }
 
     /// Upstream certifies availability (exactly 3 of 4 shares) and promotes every leg on all four nodes; only a certificate signer
