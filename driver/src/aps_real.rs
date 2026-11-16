@@ -233,7 +233,7 @@ dfabi = 2
         std::fs::write(dir.join("bank-a.seed"), hex::encode([7u8; 32])).unwrap();
         let keys = NoteKeys { spend: [3; 32], view: [4; 32] };
         std::fs::write(dir.join("bank-a.note"), format!("{}{}", hex::encode(keys.spend), hex::encode(keys.view))).unwrap();
-        let cfg = Mutex::new(config_in(&dir));
+        let cfg = config_in(&dir);
         let backend = RealBackend::new(&cfg);
         let network_id = NetworkId::from_genesis_hash(iroha_crypto::HashOf::from_untyped_unchecked(Hash::new(b"aps-real-test")));
         let route = PrivateSettlementRouteV1 { dataspace_id: DataSpaceId::new(1), lane_id: LaneId::new(1), lane_incarnation: Hash::new(b"aps-real-test") };
@@ -260,7 +260,7 @@ dfabi = 2
 
     #[test]
     fn address_refuses_a_malformed_bundle_before_reading_any_key() {
-        let cfg = Mutex::new(config_in(Path::new("/nonexistent")));
+        let cfg = config_in(Path::new("/nonexistent"));
         let backend = RealBackend::new(&cfg);
         let req = AddressReq { bundle_id: "zz".into(), pool_id: hex::encode([1u8; 32]), leg_ordinal: 0, route: "0a".into(), expiry_height: 1, network_id: "x".into() };
         let error = format!("{:#}", backend.address(&req).unwrap_err());
