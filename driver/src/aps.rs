@@ -427,12 +427,12 @@ pub(crate) fn continue_bundle<N: Nodes>(
 ) -> Result<Option<Settlement>> {
     use PrivateSettlementLifecycleDtoV1::{Aborted, Expired, Finalized};
     match nodes.status(&manifest) {
-        Some(Finalized | Aborted | Expired) => { // RED stub: Expired treated as ended
+        Some(Finalized | Aborted) => {
             // The carrier tx of an earlier run is not known here.
             let (outcome, height) = nodes.receipt(&manifest)?;
             return Ok(Some(Settlement { manifest, carrier_tx: String::new(), outcome, height }));
         }
-        #[allow(unreachable_patterns)]
+        // The receipt stays pending until a marker is applied: submit it, or the pools stay reserved.
         Some(Expired) => {
             let (carrier_tx, height) = abort_and_wait(nodes, &manifest)?;
             aborted.set(true);
@@ -494,7 +494,7 @@ fn drive<N: Nodes>(
         let carrier_tx = match nodes.finalize(&barrier, &commits) {
             Ok(carrier_tx) => carrier_tx,
             // An earlier run's finalization may already be queued: its receipt wins over an abort.
-            Err(error) if false && from == Phase::Committed => { // RED stub
+            Err(error) if from == Phase::Committed => {
                 return match nodes.receipt(&manifest) {
                     Ok((outcome, height)) => Ok((String::new(), outcome, height)),
                     Err(seen) if seen.downcast_ref::<FinalizedSeen>().is_some() => Err(seen),

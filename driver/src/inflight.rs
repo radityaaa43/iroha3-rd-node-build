@@ -70,7 +70,10 @@ pub fn load_all(dir: &Path) -> Result<Vec<Inflight>> {
     for entry in std::fs::read_dir(dir)? {
         let path = entry?.path();
         if path.extension().is_some_and(|ext| ext == "json") {
-            all.push(serde_json::from_str(&std::fs::read_to_string(&path)?)?); // RED stub
+            match std::fs::read_to_string(&path).ok().and_then(|text| serde_json::from_str(&text).ok()) {
+                Some(f) => all.push(f),
+                None => eprintln!("inflight: skipping unreadable {}", path.file_name().unwrap_or_default().to_string_lossy()),
+            }
         }
     }
     Ok(all)
