@@ -211,7 +211,10 @@ impl Config {
     /// The account that signs everything `manifest.sponsor` must sign: the `[aps.sponsor]` client.toml key, submitting to the
     /// acting party's own Torii. Without that section, `governance()` (before the sponsor key exists).
     pub fn acting_sponsor(&self) -> Result<(Client, KeyPair)> {
-        self.governance() // RED stub
+        match &self.aps.sponsor {
+            Some(sponsor) => load_client(&sponsor.dir.join("client.toml"), self.acting_torii()?),
+            None => self.governance(),
+        }
     }
 
     /// The acting party's own client.toml key (CanEnactGovernance, fee asset): pool activation only.
@@ -221,7 +224,8 @@ impl Config {
 
     /// `<dir>/<name>.note` of `[aps.sponsor]`: the keys of the sponsor's reimbursement notes.
     pub fn sponsor_note_keys(&self) -> Result<crate::wallet::NoteKeys> {
-        Err(eyre!("RED stub"))
+        let sponsor = self.aps.sponsor.as_ref().ok_or_else(|| eyre!("no [aps.sponsor] section"))?;
+        read_note_keys(&sponsor.dir.join(format!("{}.note", sponsor.name)))
     }
 
     /// Operator client (BI's client.toml, read-only use) bound to `party`'s Torii, plus its key.

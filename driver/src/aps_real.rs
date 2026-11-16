@@ -101,9 +101,12 @@ impl ApsBackend for RealBackend<'_> {
     }
 
     fn sponsor_output(&self, ctx: &AddressReq, active: bool) -> Result<SponsorOutput> {
+        let cfg = self.cfg();
+        let (bundle, pool) = (bytes32(&ctx.bundle_id)?, bytes32(&ctx.pool_id)?);
         let ctx = output_ctx(ctx)?;
-        let (_, sponsor_key) = self.cfg().acting_sponsor()?;
-        let notes = NoteKeys::random();
+        let (_, sponsor_key) = cfg.acting_sponsor()?;
+        // The sponsor owns its reimbursement (role 2, as `wallet sponsor` scans); with no `[aps.sponsor]` yet nobody can spend it.
+        let notes = if cfg.aps.sponsor.is_some() { cfg.sponsor_note_keys()?.one_time(&bundle, &pool, 2) } else { NoteKeys::random() };
         let key = aps_split::sign_output_key(&sponsor_key, &ctx, 2, PrivateSettlementAuditOutputRoleV1::SponsorReimbursement, &notes, active)?;
         let key = to_wire(key)?;
         Ok(SponsorOutput { authority: key.authority, view_public: key.view_public, authorization: key.authorization, active })

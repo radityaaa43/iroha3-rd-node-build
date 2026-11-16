@@ -523,7 +523,7 @@ pub fn pool_add(cfg: &Config, lane: u32, reserves: &[(Asset, u128)], rng: &mut i
     }
     let left_over = pending_path(cfg, lane);
     ensure!(!left_over.exists(), "{} exists: an earlier activation of lane {lane} did not finish; check the chain, then resolve it by hand", left_over.display());
-    let (sponsor, _) = cfg.acting_sponsor()?;
+    let (sponsor, _) = cfg.governance()?;
     let caps = sponsor.client().get_privacy_capabilities()?;
     ensure!(
         caps.protocols.iter().any(|row| row.protocol_id == PrivacyProtocolIdV1::IrohaIvmPrivateNoteStarkV1 && row.activation.is_some()),
@@ -900,6 +900,28 @@ fn record_end(pools: &mut PoolFile, id: &str, end: &BundleEnd) {
 /// `wallet --party P`: balances and per-bundle movements read from both pools on chain.
 pub fn wallet(cfg: &Config, party: &str) -> Result<()> {
     println!("wallet_json={}", wallet_json(cfg, party)?);
+    Ok(())
+}
+
+/// `wallet sponsor`: the reimbursement notes of the `[aps.sponsor]` account, read from both pools on chain.
+pub fn sponsor_wallet(cfg: &Config) -> Result<()> {
+    let pools = PoolFile::load(&cfg.pools_file)?;
+    let (client, _) = cfg.acting_sponsor()?;
+    let keys = cfg.sponsor_note_keys()?;
+    let mut notes = Vec::new();
+    for asset in [Asset::Rd, Asset::Dfabi] {
+        for key in pools.keys(asset) {
+            let history = pools.get(key)?.history(&client, &receipt_cache(cfg))?;
+            let (unspent, spent) = scan(&history, &keys, &[])?;
+            let rows = unspent.iter().map(|n| (n, false)).chain(spent.iter().map(|(n, _)| (n, true)));
+            for (note, spent) in rows {
+                notes.push(serde_json::json!({
+                    "asset": asset.name(), "lane": key.lane, "bundle_id": note.bundle_id, "value": note.opening.value.to_string(), "spent": spent,
+                }));
+            }
+        }
+    }
+    println!("sponsor_json={}", serde_json::json!({ "notes": notes }));
     Ok(())
 }
 

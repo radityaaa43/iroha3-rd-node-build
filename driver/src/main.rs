@@ -12,6 +12,7 @@
 //!   rd-dfabi pay <config> --asset rd|dfabi --from P --to Q --amount N  private payment in the shared pools
 //!   rd-dfabi dvp-shared <config> --buyer P --seller P --rd N --dfabi N   DvP in the shared pools
 //!   rd-dfabi wallet <config> --party P   balances and movements from the chain (wallet_json=)
+//!   rd-dfabi wallet <config> sponsor     the [aps.sponsor] account's reimbursement notes (sponsor_json=)
 //!   rd-dfabi settle-grant <config> --to <public-key> --give <asset>:<n> --take <asset>:<n> --intent <64-hex>
 //!            D-native DvP (iroha3 S17): grant CanExecuteSettlement from the config's OWN account (its client.toml key)
 //!            to <public-key>, bound to the exact DvP (own --give leaves me, --take arrives at me)
@@ -180,6 +181,7 @@ fn main() -> Result<()> {
         }
         ["server", config, "--listen", addr] => server::run(Config::load(Path::new(config))?, addr),
         ["abort-bundle", config, "--bundle", bundle] => pools::abort_bundle(&Config::load(Path::new(config))?, bundle),
+        ["wallet", config, "sponsor"] => pools::sponsor_wallet(&Config::load(Path::new(config))?),
         ["wallet", config, "--party", party] => pools::wallet(&Config::load(Path::new(config))?, party),
         _ => bail!("usage: see the header of apps/rd-dfabi/src/main.rs"),
     }

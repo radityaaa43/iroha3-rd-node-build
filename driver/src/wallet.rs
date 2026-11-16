@@ -141,7 +141,7 @@ pub fn scan(
         let bundle: [u8; 32] = hex::decode(&row.bundle_id)?.try_into().map_err(|_| eyre!("bundle id"))?;
         let pool = *history.pool_id.as_ref();
         let mut opened = None;
-        for role in [0, 1] {
+        for role in [0, 1, 2] {
             if let Some(opening) = open_output(history.pool_id, row.commitment, &row.encrypted, &keys.one_time(&bundle, &pool, role))? {
                 opened = Some(opening);
                 break;
