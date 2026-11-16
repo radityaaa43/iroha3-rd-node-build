@@ -261,7 +261,6 @@ impl Config {
     /// settle without it.
     pub fn max_carrier_bytes(&self) -> Result<u64> {
         Ok(self.aps.max_carrier_bytes.unwrap_or(1)) // RED stub
-            .and_then(|b: u64| Some(b).ok_or_else(|| eyre!("[aps] max_carrier_bytes is missing or 0: set the deployment's governed carrier limit"))
     }
 
     /// Operator client (BI's client.toml, read-only use) bound to `party`'s Torii, plus its key.
