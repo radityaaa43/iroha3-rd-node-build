@@ -437,6 +437,23 @@ fn route(client: &Client, lane: u32) -> Result<PrivateSettlementRouteV1> {
     Ok(PrivateSettlementRouteV1 { dataspace_id: DataSpaceId::new(u64::from(lane)), lane_id, lane_incarnation: incarnation })
 }
 
+/// A pool built but not yet activated: its public record and the opening of BI's reserve note (a secret).
+struct Pending {
+    asset: Asset,
+    record: PoolRecord,
+    opening: String,
+}
+
+/// Where the public records of an activation in flight wait until the pools file has them.
+fn pending_path(cfg: &Config, lane: u32) -> PathBuf {
+    cfg.pools_file.with_extension(format!("json.pending-{lane}"))
+}
+
+/// RED stub: persist, submit, record.
+fn commit_pools(cfg: &Config, lane: u32, pending: Vec<Pending>, _submit: impl FnOnce() -> Result<String>) -> Result<Vec<PoolKey>> {
+    todo!("RED: {} {lane} {}", cfg.pools_file.display(), pending.len())
+}
+
 /// Activate pools in ONE dataspace (`lane`), one per `(asset, reserve)`, each holding a BI reserve note: ONE transaction with
 /// one `ActivatePrivateSettlementPoolV1` per pool, in an order shuffled with `rng` (the position of an instruction must not
 /// tell which asset it is). One transaction must stay inside ONE dataspace: each activation routes to its own dataspace
@@ -1372,5 +1389,72 @@ dfabi = 2
             carriers: BTreeMap::new(),
         };
         assert_eq!(ids(file.finalized(Asset::Rd)), [("a".to_string(), 2), ("b".to_string(), 4), ("c".to_string(), 6)]);
+    }
+
+    fn pending(asset: Asset, lane: u32) -> Pending {
+        Pending { asset, record: entry(lane, asset, &[]).record, opening: format!("opening-{}", asset.name()) }
+    }
+
+    /// The reserve opening cannot be recovered once dropped, and the tx may commit although the submit failed (timeout, network drop):
+    /// notes and the public records are on disk before the submit, and a retry is refused before any network call.
+    #[test]
+    fn a_failed_submit_leaves_the_notes_and_the_pending_records_and_blocks_a_retry() {
+        let dir = temp_dir();
+        std::fs::create_dir_all(&dir).unwrap();
+        let cfg = offline_config(&dir);
+        let both = vec![pending(Asset::Rd, 1), pending(Asset::Dfabi, 1)];
+        let seen = std::cell::Cell::new(false);
+        let failed = error_of(commit_pools(&cfg, 1, both, || {
+            seen.set(dir.join("bi.origin-1-rd.note").exists() && dir.join("bi.origin-1-dfabi.note").exists() && pending_path(&cfg, 1).exists());
+            Err(eyre!("wait timed out"))
+        }));
+        assert!(failed.contains("wait timed out"), "{failed}");
+        assert!(seen.get(), "notes and pending records are written before the submit");
+        assert_eq!(std::fs::read_to_string(dir.join("bi.origin-1-rd.note")).unwrap(), "opening-rd");
+        assert_eq!(std::fs::read_to_string(dir.join("bi.origin-1-dfabi.note")).unwrap(), "opening-dfabi");
+        assert!(!cfg.pools_file.exists(), "nothing is recorded as active");
+        let records: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(pending_path(&cfg, 1)).unwrap()).unwrap();
+        assert_eq!(records.as_array().unwrap().len(), 2);
+        assert!(!records.to_string().contains("opening"), "the pending file holds public material only");
+        // A second pool_add for the same key stops at the leftover files, before any network call (a network call would say client.toml).
+        let retry = error_of(pool_add(&cfg, 1, &[(Asset::Rd, 5)], &mut rng(0)));
+        assert!(retry.contains("exists") && !retry.contains("client"), "{retry}");
+        let other_asset_same_lane = error_of(pool_add(&cfg, 1, &[(Asset::Dfabi, 5)], &mut rng(0)));
+        assert!(other_asset_same_lane.contains("exists") && !other_asset_same_lane.contains("client"), "{other_asset_same_lane}");
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn a_successful_submit_records_the_pools_and_removes_the_pending_file() {
+        let dir = temp_dir();
+        std::fs::create_dir_all(&dir).unwrap();
+        let cfg = offline_config(&dir);
+        let keys = commit_pools(&cfg, 1, vec![pending(Asset::Rd, 1), pending(Asset::Dfabi, 1)], || Ok("txhash".into())).unwrap();
+        assert_eq!(keys, [PoolKey { lane: 1, asset: Asset::Rd }, PoolKey { lane: 1, asset: Asset::Dfabi }]);
+        let file = PoolFile::load(&cfg.pools_file).unwrap();
+        assert!(file.get(keys[0]).is_ok() && file.get(keys[1]).is_ok());
+        assert!(!pending_path(&cfg, 1).exists());
+        assert!(dir.join("bi.origin-1-rd.note").exists() && dir.join("bi.origin-1-dfabi.note").exists());
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// A note that cannot be written (the second one) means nothing was submitted: the first note is taken back, no pending file stays.
+    #[test]
+    fn a_note_that_cannot_be_written_stops_before_the_submit_and_leaves_nothing() {
+        let dir = temp_dir();
+        std::fs::create_dir_all(&dir).unwrap();
+        let cfg = offline_config(&dir);
+        std::fs::write(dir.join("bi.origin-1-dfabi.note"), "stale").unwrap();
+        let submitted = std::cell::Cell::new(false);
+        let failed = error_of(commit_pools(&cfg, 1, vec![pending(Asset::Rd, 1), pending(Asset::Dfabi, 1)], || {
+            submitted.set(true);
+            Ok("txhash".into())
+        }));
+        assert!(failed.contains("bi.origin-1-dfabi.note"), "{failed}");
+        assert!(!submitted.get());
+        assert!(!dir.join("bi.origin-1-rd.note").exists(), "the note written first is removed again");
+        assert_eq!(std::fs::read_to_string(dir.join("bi.origin-1-dfabi.note")).unwrap(), "stale", "a file that was not ours stays");
+        assert!(!pending_path(&cfg, 1).exists() && !cfg.pools_file.exists());
+        std::fs::remove_dir_all(dir).unwrap();
     }
 }
