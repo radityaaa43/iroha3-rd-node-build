@@ -68,6 +68,17 @@ pub struct ApsConfig {
     /// Coordinator only: account public key (`ed0120...`) -> gateway URL of the party that holds that account.
     #[serde(default)]
     pub peers: BTreeMap<String, String>,
+    /// Only the BI driver: the neutral sponsor account (`manifest.sponsor`), kept apart from BI's own keys. Absent = BI's
+    /// own client.toml sponsors, as before the conformance chain.
+    #[serde(default)]
+    pub sponsor: Option<SponsorConfig>,
+}
+
+/// `[aps.sponsor]`: `dir` holds `<name>.seed`, `<name>.note` and `client.toml` (`rd-dfabi keys client-toml <dir> <name>`).
+#[derive(Clone, Debug, Deserialize)]
+pub struct SponsorConfig {
+    pub name: String,
+    pub dir: PathBuf,
 }
 
 /// `[tls]`: mutual TLS to other parties' gateways (iroha3 S13 transport A). Only used for `https://` auditor URLs.
@@ -197,23 +208,30 @@ impl Config {
         self.torii(&self.party)
     }
 
-    /// Sponsor of a command = the acting party: its client.toml key, submitting to its OWN Torii.
+    /// The account that signs everything `manifest.sponsor` must sign: the `[aps.sponsor]` client.toml key, submitting to the
+    /// acting party's own Torii. Without that section, `governance()` (before the sponsor key exists).
     pub fn acting_sponsor(&self) -> Result<(Client, KeyPair)> {
+        self.governance() // RED stub
+    }
+
+    /// The acting party's own client.toml key (CanEnactGovernance, fee asset): pool activation only.
+    pub fn governance(&self) -> Result<(Client, KeyPair)> {
         self.sponsor(&self.party)
     }
 
-    /// Sponsor client (operator client.toml) bound to `party`'s Torii, plus its key.
+    /// `<dir>/<name>.note` of `[aps.sponsor]`: the keys of the sponsor's reimbursement notes.
+    pub fn sponsor_note_keys(&self) -> Result<crate::wallet::NoteKeys> {
+        Err(eyre!("RED stub"))
+    }
+
+    /// Operator client (BI's client.toml, read-only use) bound to `party`'s Torii, plus its key.
     pub fn sponsor(&self, party: &str) -> Result<(Client, KeyPair)> {
         self.sponsor_at(self.torii(party)?)
     }
 
-    /// Sponsor client bound to one Torii URL (a committee node), plus its key.
+    /// Operator client bound to one Torii URL (a committee node), plus its key.
     pub fn sponsor_at(&self, torii: &Url) -> Result<(Client, KeyPair)> {
-        let mut config = iroha::config::Config::load_file(&self.client_toml)
-            .map_err(|e| eyre!("load {}: {e:?}", self.client_toml.display()))?;
-        config.torii_api_url = torii.clone();
-        let key = config.key_pair.clone();
-        Ok((Client::new(config)?, key))
+        load_client(&self.client_toml, torii)
     }
 
     /// Client whose account is `key` itself (the auditor: no operator key in its pod).
@@ -240,16 +258,27 @@ impl Config {
 
     /// `<key_dir>/<name>.note`: hex spend secret followed by hex view secret (64 bytes).
     pub fn note_keys(&self, name: &str) -> Result<crate::wallet::NoteKeys> {
-        let path = self.key_dir.join(format!("{name}.note"));
-        let text = std::fs::read_to_string(&path).wrap_err_with(|| format!("read {}", path.display()))?;
-        let bytes = hex::decode(text.trim()).wrap_err("note key is not hex")?;
-        eyre::ensure!(bytes.len() == 64, "{} is not 64 bytes", path.display());
-        Ok(crate::wallet::NoteKeys { spend: bytes[..32].try_into()?, view: bytes[32..].try_into()? })
+        read_note_keys(&self.key_dir.join(format!("{name}.note")))
     }
 
     pub fn seed(&self, name: &str) -> Result<[u8; 32]> {
         read_seed(&self.key_dir.join(format!("{name}.seed")))
     }
+}
+
+fn read_note_keys(path: &Path) -> Result<crate::wallet::NoteKeys> {
+    let text = std::fs::read_to_string(path).wrap_err_with(|| format!("read {}", path.display()))?;
+    let bytes = hex::decode(text.trim()).wrap_err("note key is not hex")?;
+    eyre::ensure!(bytes.len() == 64, "{} is not 64 bytes", path.display());
+    Ok(crate::wallet::NoteKeys { spend: bytes[..32].try_into()?, view: bytes[32..].try_into()? })
+}
+
+/// A client.toml's client and key, its Torii URL replaced by `torii`.
+fn load_client(file: &Path, torii: &Url) -> Result<(Client, KeyPair)> {
+    let mut config = iroha::config::Config::load_file(file).map_err(|e| eyre!("load {}: {e:?}", file.display()))?;
+    config.torii_api_url = torii.clone();
+    let key = config.key_pair.clone();
+    Ok((Client::new(config)?, key))
 }
 
 pub fn read_seed(path: &Path) -> Result<[u8; 32]> {
@@ -263,6 +292,21 @@ pub fn read_seed(path: &Path) -> Result<[u8; 32]> {
 /// Ed25519 key of a wallet or the auditor, derived from its seed.
 pub fn signing_key(seed: &[u8; 32]) -> KeyPair {
     KeyPair::from_seed(seed.to_vec(), Algorithm::Ed25519)
+}
+
+/// Test only: a throw-away directory with `client.toml` (key of `[seed; 32]`, Torii `torii`) and its network id file.
+#[cfg(test)]
+pub(crate) fn test_client_dir(seed: u8, torii: &str) -> PathBuf {
+    use iroha::data_model::NetworkId;
+    use iroha_crypto::{Hash, HashOf};
+
+    let dir = std::env::temp_dir().join(format!("rd-dfabi-cfg-{}", rand::random::<u64>()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let id_file = dir.join("network-id");
+    std::fs::write(&id_file, format!("{}\n", NetworkId::from_genesis_hash(HashOf::from_untyped_unchecked(Hash::new(b"config-test"))))).unwrap();
+    let text = crate::client_toml::render(&[seed; 32], torii, "11111111-2222-4333-8444-555555555555", id_file.to_str().unwrap(), "wonderland.universal").unwrap();
+    std::fs::write(dir.join("client.toml"), text).unwrap();
+    dir
 }
 
 #[cfg(test)]
@@ -310,6 +354,39 @@ dfabi = 2
             assert_eq!(cfg.party, party);
             assert_eq!(cfg.acting_torii().unwrap().as_str(), format!("http://{party}:8080/"), "{party} submits to its OWN Torii");
         }
+    }
+
+    /// `extra` for a BI driver with BI's own client.toml (seed 7) and a `[aps.sponsor]` dir (seed 9, note 3/4).
+    fn with_sponsor() -> Config {
+        let (bi, sponsor) = (test_client_dir(7, "http://bi-own:1/"), test_client_dir(9, "http://sponsor-own:1/"));
+        std::fs::write(sponsor.join("sponsor.note"), format!("{}{}", hex::encode([3u8; 32]), hex::encode([4u8; 32]))).unwrap();
+        config(&format!(
+            "client_toml = \"{}\"\nparty = \"bank-a\"\n[aps.sponsor]\nname = \"sponsor\"\ndir = \"{}\"\n",
+            bi.join("client.toml").display(),
+            sponsor.display()
+        ))
+    }
+
+    #[test]
+    fn acting_sponsor_uses_sponsor_section() {
+        let cfg = with_sponsor();
+        let (client, key) = cfg.acting_sponsor().unwrap();
+        assert_eq!(key.public_key(), signing_key(&[9; 32]).public_key(), "the sponsor key, not BI's");
+        assert_eq!(client.account_client().endpoint().as_str(), "http://bank-a:8080/", "the client.toml Torii is overridden by the acting party's");
+        let notes = cfg.sponsor_note_keys().unwrap();
+        assert_eq!((notes.spend, notes.view), ([3; 32], [4; 32]));
+        let mut absent = with_sponsor();
+        absent.aps.sponsor = None;
+        assert_eq!(absent.acting_sponsor().unwrap().1.public_key(), signing_key(&[7; 32]).public_key(), "no section: BI's own key, as before");
+        assert!(absent.sponsor_note_keys().is_err());
+    }
+
+    #[test]
+    fn governance_stays_party_key() {
+        let cfg = with_sponsor();
+        let (client, key) = cfg.governance().unwrap();
+        assert_eq!(key.public_key(), signing_key(&[7; 32]).public_key());
+        assert_eq!(client.account_client().endpoint().as_str(), "http://bank-a:8080/");
     }
 
     #[test]

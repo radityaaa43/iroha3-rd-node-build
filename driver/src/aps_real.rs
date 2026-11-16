@@ -103,8 +103,8 @@ impl ApsBackend for RealBackend<'_> {
     fn sponsor_output(&self, ctx: &AddressReq, active: bool) -> Result<SponsorOutput> {
         let ctx = output_ctx(ctx)?;
         let (_, sponsor_key) = self.cfg().acting_sponsor()?;
-        // The sponsor's note is never spent: random keys, as `aps::prepare_leg_to` does.
-        let key = aps_split::sign_output_key(&sponsor_key, &ctx, 2, PrivateSettlementAuditOutputRoleV1::SponsorReimbursement, &NoteKeys::random(), active)?;
+        let notes = NoteKeys::random();
+        let key = aps_split::sign_output_key(&sponsor_key, &ctx, 2, PrivateSettlementAuditOutputRoleV1::SponsorReimbursement, &notes, active)?;
         let key = to_wire(key)?;
         Ok(SponsorOutput { authority: key.authority, view_public: key.view_public, authorization: key.authorization, active })
     }
@@ -285,6 +285,32 @@ dfabi = 2
         assert!(authorization.signatures.iter().any(|entry| entry.signature.verify(&entry.signer, &authorization.body).is_ok()), "signed by the own seed");
         assert_eq!(backend.own_key().unwrap(), signing_key(&[7; 32]).public_key().to_string());
         std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn reimbursement_output_belongs_to_the_sponsor() {
+        let dir = std::env::temp_dir().join(format!("rd-dfabi-aps-real-{}", rand::random::<u64>()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let bi = NoteKeys { spend: [5; 32], view: [6; 32] };
+        std::fs::write(dir.join("bank-a.note"), format!("{}{}", hex::encode(bi.spend), hex::encode(bi.view))).unwrap();
+        let sponsor_dir = crate::config::test_client_dir(9, "http://sponsor-own:1/");
+        let sponsor = NoteKeys { spend: [3; 32], view: [4; 32] };
+        std::fs::write(sponsor_dir.join("sponsor.note"), format!("{}{}", hex::encode(sponsor.spend), hex::encode(sponsor.view))).unwrap();
+        let mut cfg = config_in(&dir);
+        cfg.aps.sponsor = Some(crate::config::SponsorConfig { name: "sponsor".into(), dir: sponsor_dir });
+        let network_id = NetworkId::from_genesis_hash(iroha_crypto::HashOf::from_untyped_unchecked(Hash::new(b"aps-real-test")));
+        let route = PrivateSettlementRouteV1 { dataspace_id: DataSpaceId::new(1), lane_id: LaneId::new(1), lane_incarnation: Hash::new(b"aps-real-test") };
+        let (bundle, pool) = ([0xbb; 32], [0x01; 32]);
+        let req = AddressReq { bundle_id: hex::encode(bundle), pool_id: hex::encode(pool), leg_ordinal: 0, route: enc(&route).unwrap(), expiry_height: 99, network_id: network_id.to_string() };
+        let out = RealBackend::new(&cfg).sponsor_output(&req, true).unwrap();
+        // The output is addressed to the sponsor's one-time keys (role 2), which only the sponsor's note keys derive.
+        let mine = sponsor.one_time(&bundle, &pool, 2);
+        assert_eq!((out.authority, out.view_public), (hex::encode(mine.authority().unwrap()), hex::encode(mine.view_public().unwrap())));
+        let theirs = bi.one_time(&bundle, &pool, 2);
+        assert_ne!(hex::encode(theirs.authority().unwrap()), hex::encode(mine.authority().unwrap()), "BI's keys do not open it");
+        let authorization: PrivateSettlementAuditViewKeyAuthorizationV1 = dec(&out.authorization).unwrap();
+        assert_eq!(authorization.body.authorized_account, AccountId::new(signing_key(&[9; 32]).public_key().clone()), "authorized by the sponsor key");
+        assert_eq!((authorization.body.output_ordinal, authorization.body.output_active), (2, true));
     }
 
     #[test]
