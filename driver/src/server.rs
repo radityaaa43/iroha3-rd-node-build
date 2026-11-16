@@ -181,8 +181,10 @@ impl Submitter for Real {
 pub fn run(cfg: Config, listen: &str) -> Result<()> {
     let peer = aps_http::RealPeer { tls: cfg.tls.clone() };
     let aps_cfg = cfg.aps.clone();
+    // The APS backend reads its own copy without the lock (aps_real::RealBackend); `Real` keeps one submission at a time.
+    let aps_conf = cfg.clone();
     let real = Real { cfg: Mutex::new(cfg) };
-    let backend = aps_real::RealBackend::new(&real.cfg);
+    let backend = aps_real::RealBackend::new(&aps_conf);
     let aps = aps_http::Aps::new(&backend, &peer, aps_cfg);
     // One thread per connection: a bank's forwarded `/aps/submit` waits on BI while BI calls back into the same bank.
     http::serve_threaded(listen, |method, path, body| {
