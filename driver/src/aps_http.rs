@@ -974,6 +974,11 @@ mod tests {
         .to_string()
     }
 
+    /// `leg_body` as leg `ordinal` in `lane`.
+    fn leg_at(intent: &str, to: &str, amount: &str, ordinal: u8, lane: u32) -> String {
+        leg_body(intent, "rd", to, amount).replace(r#""ordinal":0"#, &format!(r#""ordinal":{ordinal}"#)).replace(r#""lane":1"#, &format!(r#""lane":{lane}"#))
+    }
+
     fn address_body() -> String {
         serde_json::json!({ "bundle_id": id(0xbb), "pool_id": id(1), "leg_ordinal": 0, "route": "0a", "expiry_height": 10, "network_id": "ee" }).to_string()
     }
@@ -1536,12 +1541,38 @@ mod tests {
         let aps = Aps::new(&backend, &peer, bank());
         let (to, intent) = (account(9), id(1));
         assert_eq!(aps.route("POST", "/aps/intent", &intent_body(&intent, "rd", &to, "9")).0, 200);
-        let lane_2 = |amount: &str| leg_body(&intent, "rd", &to, amount).replace(r#""lane":1"#, r#""lane":2"#);
-        assert_eq!(aps.route("POST", "/aps/leg", &leg_body(&intent, "rd", &to, "5")).0, 200);
-        assert_eq!(aps.route("POST", "/aps/leg", &lane_2("5")).0, 403, "more than is left of the intent");
-        assert_eq!(aps.route("POST", "/aps/leg", &lane_2("4")).0, 200);
-        assert_eq!(aps.route("POST", "/aps/leg", &lane_2("1")).0, 403, "the intent is spent");
+        assert_eq!(aps.route("POST", "/aps/leg", &leg_at(&intent, &to, "5", 0, 1)).0, 200);
+        assert_eq!(aps.route("POST", "/aps/leg", &leg_at(&intent, &to, "4", 0, 2)).0, 403, "leg 0 (it pays the reimbursement) again");
+        assert_eq!(aps.route("POST", "/aps/leg", &leg_at(&intent, &to, "4", 1, 1)).0, 403, "lane 1 again");
+        assert_eq!(aps.route("POST", "/aps/leg", &leg_at(&intent, &to, "5", 1, 2)).0, 403, "more than is left of the intent");
+        assert_eq!(aps.route("POST", "/aps/leg", &leg_at(&intent, &to, "4", 1, 2)).0, 200, "the refused legs spent nothing");
+        for (ordinal, lane) in [(0, 1), (1, 2), (0, 2), (1, 1)] {
+            assert_eq!(aps.route("POST", "/aps/leg", &leg_at(&intent, &to, "1", ordinal, lane)).0, 403, "the intent is spent");
+        }
         assert_eq!(calls(&backend).iter().filter(|call| **call == "prove").count(), 2);
+    }
+
+    /// A leg smaller than the intent is the first half of a split: the rest stays open for the TTL, but only for the other ordinal in
+    /// the other lane. So one intent is at most two legs, at most once leg 0 (one reimbursement), and never more than its amount.
+    #[test]
+    fn a_partial_intent_takes_one_more_leg_at_most() {
+        let (backend, peer) = (driver(8), FakePeer::standard());
+        let aps = Aps::new(&backend, &peer, bank());
+        let (to, intent) = (account(9), id(1));
+        assert_eq!(aps.route("POST", "/aps/intent", &intent_body(&intent, "rd", &to, "9")).0, 200);
+        assert_eq!(aps.route("POST", "/aps/leg", &leg_at(&intent, &to, "3", 0, 1)).0, 200);
+        assert_eq!(aps.route("POST", "/aps/leg", &leg_at(&intent, &to, "3", 1, 2)).0, 200);
+        // 3 of 9 are left, and no third leg can take them: both ordinals and both lanes are used
+        for (ordinal, lane) in [(0, 1), (1, 2), (0, 2), (1, 1), (0, 3), (1, 3)] {
+            let (status, response) = aps.route("POST", "/aps/leg", &leg_at(&intent, &to, "3", ordinal, lane));
+            assert_eq!(status, 403, "ordinal {ordinal} lane {lane}: {response}");
+        }
+        assert_eq!(calls(&backend).iter().filter(|call| **call == "prove").count(), 2, "6 of 9 proved, never more");
+        // a single leg 0 above the intent is refused outright
+        assert_eq!(aps.route("POST", "/aps/intent", &intent_body(&id(2), "rd", &to, "9")).0, 200);
+        assert_eq!(aps.route("POST", "/aps/leg", &leg_at(&id(2), &to, "10", 0, 1)).0, 403);
+        assert_eq!(aps.route("POST", "/aps/leg", &leg_at(&id(2), &to, "9", 0, 1)).0, 200, "the refusal spent nothing");
+        assert_eq!(aps.route("POST", "/aps/leg", &leg_at(&id(2), &to, "1", 1, 2)).0, 403, "the intent is spent");
     }
 
     #[test]
@@ -1552,8 +1583,7 @@ mod tests {
         let aps = Aps::new(&backend, &peer, bank());
         let (to, intent) = (account(9), id(1));
         assert_eq!(aps.route("POST", "/aps/intent", &intent_body(&intent, "rd", &to, "9")).0, 200);
-        let first = leg_body(&intent, "rd", &to, "5");
-        let second = leg_body(&intent, "rd", &to, "4").replace(r#""lane":1"#, r#""lane":2"#);
+        let (first, second) = (leg_at(&intent, &to, "5", 0, 1), leg_at(&intent, &to, "4", 1, 2));
         std::thread::scope(|scope| {
             let one = scope.spawn(|| aps.route("POST", "/aps/leg", &first).0);
             let two = scope.spawn(|| aps.route("POST", "/aps/leg", &second).0);
