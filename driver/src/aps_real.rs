@@ -20,8 +20,8 @@ use crate::{
     aps_http::{AddressReq, ApsBackend, BundleCtx, BundleLists, LegCtx, LegReq, OutputKey, Settled, SponsorOutput},
     aps_split::{self, OutputCtx},
     config::{Config, signing_key},
-    pools::{self, Asset},
-    wallet::NoteKeys,
+    plan::Capacity,
+    pools::{self, Asset, PoolKey},
 };
 
 /// Reads the config without a lock: a guard held across a leg proof (~12 s) or a settle (~80 s) made BI's `GET /aps/bundles`
@@ -66,11 +66,11 @@ fn from_wire(authority: &str, view_public: &str, authorization: &str, active: bo
 
 /// `AtomicPrivateSettlementPreparedLegV1` is a native client-side value without a norito codec: on the wire it is
 /// `statement.proof.capsule`, each hex, and the delta is derived again on the way in (`complete_..._prepared_leg_v1`).
-fn encode_prepared(leg: &AtomicPrivateSettlementPreparedLegV1) -> Result<String> {
+pub(crate) fn encode_prepared(leg: &AtomicPrivateSettlementPreparedLegV1) -> Result<String> {
     Ok(format!("{}.{}.{}", enc(&leg.statement)?, hex::encode(&leg.proof), enc(&leg.audit_capsule)?))
 }
 
-fn decode_prepared(text: &str) -> Result<AtomicPrivateSettlementPreparedLegV1> {
+pub(crate) fn decode_prepared(text: &str) -> Result<AtomicPrivateSettlementPreparedLegV1> {
     let parts: Vec<&str> = text.split('.').collect();
     let [statement, proof, capsule] = parts.as_slice() else {
         bail!("prepared leg: expected statement.proof.capsule");
@@ -100,19 +100,34 @@ impl ApsBackend for RealBackend<'_> {
     }
 
     fn sponsor_output(&self, ctx: &AddressReq, active: bool) -> Result<SponsorOutput> {
+        let cfg = self.cfg();
+        let (bundle, pool) = (bytes32(&ctx.bundle_id)?, bytes32(&ctx.pool_id)?);
         let ctx = output_ctx(ctx)?;
-        let (_, sponsor_key) = self.cfg().acting_sponsor()?;
-        // The sponsor's note is never spent: random keys, as `aps::prepare_leg_to` does.
-        let key = aps_split::sign_output_key(&sponsor_key, &ctx, 2, PrivateSettlementAuditOutputRoleV1::SponsorReimbursement, &NoteKeys::random(), active)?;
+        let (_, sponsor_key) = cfg.acting_sponsor()?;
+        // The sponsor owns its reimbursement (role 2, as `wallet sponsor` scans); with no `[aps.sponsor]` yet nobody can spend it.
+        let notes = cfg.reimbursement_keys(&bundle, &pool)?;
+        let key = aps_split::sign_output_key(&sponsor_key, &ctx, 2, PrivateSettlementAuditOutputRoleV1::SponsorReimbursement, &notes, active)?;
         let key = to_wire(key)?;
         Ok(SponsorOutput { authority: key.authority, view_public: key.view_public, authorization: key.authorization, active })
     }
 
-    fn begin_bundle(&self) -> Result<BundleCtx> {
-        let start = pools::begin_bundle(&self.cfg())?;
+    fn capacity(&self, asset: Asset) -> Result<Vec<(u32, Capacity)>> {
+        let cfg = self.cfg();
+        let pools = pools::unspent_values(cfg, &cfg.party, asset)?;
+        Ok(pools.into_iter().map(|(lane, values)| (lane, Capacity::of(&values))).collect())
+    }
+
+    fn begin_bundle(&self, keys: [PoolKey; 2]) -> Result<BundleCtx> {
+        let start = pools::begin_bundle(self.cfg(), keys)?;
         let leg = |index: usize| -> Result<LegCtx> {
-            let (route, pool, digest) = &start.legs[index];
-            Ok(LegCtx { pool_id: hex::encode(pool), route: enc(route)?, authority_digest: hex::encode(digest.as_ref()) })
+            let (key, route, pool, digest) = &start.legs[index];
+            Ok(LegCtx {
+                pool_id: hex::encode(pool),
+                route: enc(route)?,
+                authority_digest: hex::encode(digest.as_ref()),
+                lane: key.lane,
+                asset: key.asset.name().to_owned(),
+            })
         };
         Ok(BundleCtx {
             bundle_id: hex::encode(start.manifest.bundle_id.as_ref()),
@@ -140,15 +155,24 @@ impl ApsBackend for RealBackend<'_> {
                 req.sponsor_output.active,
             )?,
         };
-        let asset = if req.ordinal == 0 { Asset::Rd } else { Asset::Dfabi };
+        let key = PoolKey { lane: req.lane, asset: Asset::parse(&req.asset)? };
         let cfg = self.cfg();
-        encode_prepared(&pools::prove_split_leg(&cfg, &cfg.party, asset, &leg)?)
+        encode_prepared(&pools::prove_split_leg(cfg, &cfg.party, key, &leg)?)
+    }
+
+    fn is_leg_pool(&self, req: &LegReq) -> Result<bool> {
+        let Ok(manifest) = dec::<AtomicPrivateSettlementV1>(&req.manifest) else {
+            return Ok(false);
+        };
+        let pools = pools::PoolFile::load(&self.cfg().pools_file)?;
+        Ok(pools::is_leg_pool(&pools, PoolKey { lane: req.lane, asset: Asset::parse(&req.asset)? }, &manifest, usize::from(req.ordinal)))
     }
 
     fn settle(&self, bundle: &BundleCtx, prepared: &[String; 2]) -> Result<Option<Settled>> {
         let manifest = dec::<AtomicPrivateSettlementV1>(&bundle.manifest)?;
         let legs = [decode_prepared(&prepared[0])?, decode_prepared(&prepared[1])?];
-        let done = pools::settle_bundle(&self.cfg(), manifest, &legs)?;
+        let key = |leg: &LegCtx| Ok::<_, eyre::Report>(PoolKey { lane: leg.lane, asset: Asset::parse(&leg.asset)? });
+        let done = pools::settle_bundle(self.cfg(), [key(&bundle.legs[0])?, key(&bundle.legs[1])?], manifest, &legs)?;
         Ok(done.map(|(carrier_tx, height)| Settled { carrier_tx, height }))
     }
 
@@ -169,16 +193,29 @@ impl ApsBackend for RealBackend<'_> {
 
     fn merge_bundles(&self, lists: &BundleLists) -> Result<()> {
         let cfg = self.cfg();
+        // The lists name no lane: each id goes to every pool of its asset, and `history()` applies a bundle only where it has a leg.
         pools::PoolFile::update(&cfg.pools_file, |file| {
-            file.merge_finalized(Asset::Rd, &lists.rd, &lists.heights);
-            file.merge_finalized(Asset::Dfabi, &lists.dfabi, &lists.heights);
+            for (asset, ids) in [(Asset::Rd, &lists.rd), (Asset::Dfabi, &lists.dfabi)] {
+                for key in file.keys(asset) {
+                    file.merge_finalized(key, ids, &lists.heights)?;
+                }
+            }
             file.merge_carriers(&lists.carriers);
+            Ok(())
         })
     }
 
     fn wallet(&self) -> Result<serde_json::Value> {
         let cfg = self.cfg();
         pools::wallet_json(&cfg, &cfg.party)
+    }
+
+    fn pool_lanes(&self, asset: Asset) -> Result<Vec<u32>> {
+        Ok(pools::PoolFile::load(&self.cfg().pools_file)?.keys(asset).into_iter().map(|key| key.lane).collect())
+    }
+
+    fn resume_all(&self) -> Result<()> {
+        pools::resume_all(self.cfg())
     }
 }
 
@@ -193,6 +230,7 @@ mod tests {
     use iroha_model_base::topology::{DataSpaceId, LaneId};
 
     use super::*;
+    use crate::wallet::NoteKeys;
 
     fn config_in(dir: &Path) -> Config {
         let text = format!(
@@ -258,6 +296,32 @@ dfabi = 2
         assert!(authorization.signatures.iter().any(|entry| entry.signature.verify(&entry.signer, &authorization.body).is_ok()), "signed by the own seed");
         assert_eq!(backend.own_key().unwrap(), signing_key(&[7; 32]).public_key().to_string());
         std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn reimbursement_output_belongs_to_the_sponsor() {
+        let dir = std::env::temp_dir().join(format!("rd-dfabi-aps-real-{}", rand::random::<u64>()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let bi = NoteKeys { spend: [5; 32], view: [6; 32] };
+        std::fs::write(dir.join("bank-a.note"), format!("{}{}", hex::encode(bi.spend), hex::encode(bi.view))).unwrap();
+        let sponsor_dir = crate::config::test_client_dir(9, "http://sponsor-own:1/");
+        let sponsor = NoteKeys { spend: [3; 32], view: [4; 32] };
+        std::fs::write(sponsor_dir.join("sponsor.note"), format!("{}{}", hex::encode(sponsor.spend), hex::encode(sponsor.view))).unwrap();
+        let mut cfg = config_in(&dir);
+        cfg.aps.sponsor = Some(crate::config::SponsorConfig { name: "sponsor".into(), dir: sponsor_dir });
+        let network_id = NetworkId::from_genesis_hash(iroha_crypto::HashOf::from_untyped_unchecked(Hash::new(b"aps-real-test")));
+        let route = PrivateSettlementRouteV1 { dataspace_id: DataSpaceId::new(1), lane_id: LaneId::new(1), lane_incarnation: Hash::new(b"aps-real-test") };
+        let (bundle, pool) = ([0xbb; 32], [0x01; 32]);
+        let req = AddressReq { bundle_id: hex::encode(bundle), pool_id: hex::encode(pool), leg_ordinal: 0, route: enc(&route).unwrap(), expiry_height: 99, network_id: network_id.to_string() };
+        let out = RealBackend::new(&cfg).sponsor_output(&req, true).unwrap();
+        // The output is addressed to the sponsor's one-time keys (role 2), which only the sponsor's note keys derive.
+        let mine = sponsor.one_time(&bundle, &pool, 2);
+        assert_eq!((out.authority, out.view_public), (hex::encode(mine.authority().unwrap()), hex::encode(mine.view_public().unwrap())));
+        let theirs = bi.one_time(&bundle, &pool, 2);
+        assert_ne!(hex::encode(theirs.authority().unwrap()), hex::encode(mine.authority().unwrap()), "BI's keys do not open it");
+        let authorization: PrivateSettlementAuditViewKeyAuthorizationV1 = dec(&out.authorization).unwrap();
+        assert_eq!(authorization.body.authorized_account, AccountId::new(signing_key(&[9; 32]).public_key().clone()), "authorized by the sponsor key");
+        assert_eq!((authorization.body.output_ordinal, authorization.body.output_active), (2, true));
     }
 
     #[test]

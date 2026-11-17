@@ -141,7 +141,7 @@ pub fn scan(
         let bundle: [u8; 32] = hex::decode(&row.bundle_id)?.try_into().map_err(|_| eyre!("bundle id"))?;
         let pool = *history.pool_id.as_ref();
         let mut opened = None;
-        for role in [0, 1] {
+        for role in [0, 1, 2] {
             if let Some(opening) = open_output(history.pool_id, row.commitment, &row.encrypted, &keys.one_time(&bundle, &pool, role))? {
                 opened = Some(opening);
                 break;
@@ -232,6 +232,29 @@ mod tests {
         assert_eq!(views.iter().collect::<std::collections::BTreeSet<_>>().len(), 4);
         assert_eq!(k.one_time(&b1, &p, 0).spend, k.spend);
         assert_eq!(k.one_time(&b1, &p, 0).view, k.one_time(&b1, &p, 0).view);
+    }
+
+    /// The sponsor's reimbursement (output role 2) is found by `scan` with the sponsor's note keys, and not with BI's.
+    #[test]
+    fn a_role_two_output_opens_with_the_sponsor_note_keys_only() {
+        use iroha_core::privacy_engines::ivm_private_note::{PrivateNotePlaintextV1, encrypt_ivm_private_wallet_note_with_os_rng_v1};
+        let pool = PrivacyPoolIdV1::new([9; 32]);
+        let bundle = [0xbb; 32];
+        let (sponsor, bi) = (NoteKeys::random(), NoteKeys::random());
+        let to = sponsor.one_time(&bundle, pool.as_ref(), 2);
+        let note = PrivateNotePlaintextV1::new(1, to.authority().unwrap(), rand::random(), rand::random(), [0; 32]).unwrap();
+        let encrypted = encrypt_ivm_private_wallet_note_with_os_rng_v1(pool, atomic_private_settlement_program_id_v1().unwrap(), &note, to.view_public().unwrap()).unwrap();
+        let history = crate::history::PoolHistory {
+            pool_id: pool,
+            tree: crate::tree::PoolTree::new(pool).unwrap(),
+            epoch: 1,
+            outputs: vec![crate::history::OutputRow { commitment: encrypted.commitment, encrypted, bundle_id: hex::encode(bundle), height: 5 }],
+            spent_in: Default::default(),
+            leg0: Default::default(),
+        };
+        let (found, _) = scan(&history, &sponsor, &[]).unwrap();
+        assert_eq!(found.iter().map(|n| (n.opening.value, n.height)).collect::<Vec<_>>(), [(1, 5)]);
+        assert!(scan(&history, &bi, &[]).unwrap().0.is_empty(), "BI's note keys do not open the sponsor's reimbursement");
     }
 
     #[test]

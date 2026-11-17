@@ -4,7 +4,7 @@ use std::{
 };
 
 use eyre::{Result, WrapErr, eyre};
-use iroha::blocking::Client;
+use iroha::{blocking::Client, data_model::account::AccountId};
 use iroha_crypto::{Algorithm, ExposedPrivateKey, KeyPair};
 use serde::Deserialize;
 use url::Url;
@@ -68,6 +68,20 @@ pub struct ApsConfig {
     /// Coordinator only: account public key (`ed0120...`) -> gateway URL of the party that holds that account.
     #[serde(default)]
     pub peers: BTreeMap<String, String>,
+    /// Only the BI driver: the neutral sponsor account (`manifest.sponsor`), kept apart from BI's own keys. Absent = BI's
+    /// own client.toml sponsors, as before the conformance chain.
+    #[serde(default)]
+    pub sponsor: Option<SponsorConfig>,
+    /// Coordinator only: the deployment's governed carrier byte limit (`Config::max_carrier_bytes`).
+    #[serde(default)]
+    pub max_carrier_bytes: Option<u64>,
+}
+
+/// `[aps.sponsor]`: `dir` holds `<name>.seed`, `<name>.note` and `client.toml` (`rd-dfabi keys client-toml <dir> <name>`).
+#[derive(Clone, Debug, Deserialize)]
+pub struct SponsorConfig {
+    pub name: String,
+    pub dir: PathBuf,
 }
 
 /// `[tls]`: mutual TLS to other parties' gateways (iroha3 S13 transport A). Only used for `https://` auditor URLs.
@@ -197,23 +211,69 @@ impl Config {
         self.torii(&self.party)
     }
 
-    /// Sponsor of a command = the acting party: its client.toml key, submitting to its OWN Torii.
+    /// The account that signs everything `manifest.sponsor` must sign: the `[aps.sponsor]` client.toml key, submitting to the
+    /// acting party's own Torii. Without that section, `governance()` (before the sponsor key exists).
     pub fn acting_sponsor(&self) -> Result<(Client, KeyPair)> {
+        match &self.aps.sponsor {
+            Some(sponsor) => load_client(&sponsor.dir.join("client.toml"), self.acting_torii()?),
+            None => self.governance(),
+        }
+    }
+
+    /// The acting party's own client.toml key (CanEnactGovernance, fee asset): pool activation only.
+    pub fn governance(&self) -> Result<(Client, KeyPair)> {
         self.sponsor(&self.party)
     }
 
-    /// Sponsor client (operator client.toml) bound to `party`'s Torii, plus its key.
+    /// `<dir>/<name>.note` of `[aps.sponsor]`: the keys of the sponsor's reimbursement notes.
+    pub fn sponsor_note_keys(&self) -> Result<crate::wallet::NoteKeys> {
+        let sponsor = self.aps.sponsor.as_ref().ok_or_else(|| eyre!("no [aps.sponsor] section"))?;
+        read_note_keys(&sponsor.dir.join(format!("{}.note", sponsor.name)))
+    }
+
+    /// The keys a leg's reimbursement output (role 2) is addressed to: the one-time keys of the `[aps.sponsor]` note keys, which
+    /// `wallet sponsor` scans. Without that section nobody owns it (random keys, as before the conformance chain).
+    pub fn reimbursement_keys(&self, bundle: &[u8; 32], pool: &[u8; 32]) -> Result<crate::wallet::NoteKeys> {
+        Ok(match &self.aps.sponsor {
+            Some(_) => self.sponsor_note_keys()?.one_time(bundle, pool, 2),
+            None => crate::wallet::NoteKeys::random(),
+        })
+    }
+
+    /// The signer of a bundle's carriers: the key that is its `manifest.sponsor`. That is the `[aps.sponsor]` key, or the
+    /// governance key for a bundle prepared before that section was set (it can still be aborted or finished).
+    pub fn signer_for(&self, sponsor: &AccountId) -> Result<(Client, KeyPair)> {
+        let acting = self.acting_sponsor()?;
+        if AccountId::new(acting.1.public_key().clone()) == *sponsor {
+            return Ok(acting);
+        }
+        let governance = self.governance()?;
+        if AccountId::new(governance.1.public_key().clone()) == *sponsor {
+            return Ok(governance);
+        }
+        Err(eyre!("neither the sponsor nor the governance key is this bundle's sponsor"))
+    }
+
+    /// `[aps] max_carrier_bytes`: the governed carrier limit of the deployment, the peers' `[nexus.atomic_private_settlement]
+    /// max_carrier_bytes` (Torii exposes no read of it). Every carrier is measured against it, so a coordinator refuses to start or
+    /// settle without it.
+    pub fn max_carrier_bytes(&self) -> Result<u64> {
+        // Above the V1 ceiling every carrier builder refuses it, and only once Prepare reserved the pools.
+        let ceiling = iroha::data_model::nexus::PRIVATE_SETTLEMENT_MAX_RECEIPT_BYTES_V1 as u64;
+        self.aps
+            .max_carrier_bytes
+            .filter(|bytes| (1..=ceiling).contains(bytes))
+            .ok_or_else(|| eyre!("[aps] max_carrier_bytes is missing, 0 or above the V1 ceiling: set the deployment's governed carrier limit"))
+    }
+
+    /// Operator client (BI's client.toml, read-only use) bound to `party`'s Torii, plus its key.
     pub fn sponsor(&self, party: &str) -> Result<(Client, KeyPair)> {
         self.sponsor_at(self.torii(party)?)
     }
 
-    /// Sponsor client bound to one Torii URL (a committee node), plus its key.
+    /// Operator client bound to one Torii URL (a committee node), plus its key.
     pub fn sponsor_at(&self, torii: &Url) -> Result<(Client, KeyPair)> {
-        let mut config = iroha::config::Config::load_file(&self.client_toml)
-            .map_err(|e| eyre!("load {}: {e:?}", self.client_toml.display()))?;
-        config.torii_api_url = torii.clone();
-        let key = config.key_pair.clone();
-        Ok((Client::new(config)?, key))
+        load_client(&self.client_toml, torii)
     }
 
     /// Client whose account is `key` itself (the auditor: no operator key in its pod).
@@ -240,16 +300,27 @@ impl Config {
 
     /// `<key_dir>/<name>.note`: hex spend secret followed by hex view secret (64 bytes).
     pub fn note_keys(&self, name: &str) -> Result<crate::wallet::NoteKeys> {
-        let path = self.key_dir.join(format!("{name}.note"));
-        let text = std::fs::read_to_string(&path).wrap_err_with(|| format!("read {}", path.display()))?;
-        let bytes = hex::decode(text.trim()).wrap_err("note key is not hex")?;
-        eyre::ensure!(bytes.len() == 64, "{} is not 64 bytes", path.display());
-        Ok(crate::wallet::NoteKeys { spend: bytes[..32].try_into()?, view: bytes[32..].try_into()? })
+        read_note_keys(&self.key_dir.join(format!("{name}.note")))
     }
 
     pub fn seed(&self, name: &str) -> Result<[u8; 32]> {
         read_seed(&self.key_dir.join(format!("{name}.seed")))
     }
+}
+
+fn read_note_keys(path: &Path) -> Result<crate::wallet::NoteKeys> {
+    let text = std::fs::read_to_string(path).wrap_err_with(|| format!("read {}", path.display()))?;
+    let bytes = hex::decode(text.trim()).wrap_err("note key is not hex")?;
+    eyre::ensure!(bytes.len() == 64, "{} is not 64 bytes", path.display());
+    Ok(crate::wallet::NoteKeys { spend: bytes[..32].try_into()?, view: bytes[32..].try_into()? })
+}
+
+/// A client.toml's client and key, its Torii URL replaced by `torii`.
+fn load_client(file: &Path, torii: &Url) -> Result<(Client, KeyPair)> {
+    let mut config = iroha::config::Config::load_file(file).map_err(|e| eyre!("load {}: {e:?}", file.display()))?;
+    config.torii_api_url = torii.clone();
+    let key = config.key_pair.clone();
+    Ok((Client::new(config)?, key))
 }
 
 pub fn read_seed(path: &Path) -> Result<[u8; 32]> {
@@ -263,6 +334,21 @@ pub fn read_seed(path: &Path) -> Result<[u8; 32]> {
 /// Ed25519 key of a wallet or the auditor, derived from its seed.
 pub fn signing_key(seed: &[u8; 32]) -> KeyPair {
     KeyPair::from_seed(seed.to_vec(), Algorithm::Ed25519)
+}
+
+/// Test only: a throw-away directory with `client.toml` (key of `[seed; 32]`, Torii `torii`) and its network id file.
+#[cfg(test)]
+pub(crate) fn test_client_dir(seed: u8, torii: &str) -> PathBuf {
+    use iroha::data_model::NetworkId;
+    use iroha_crypto::{Hash, HashOf};
+
+    let dir = std::env::temp_dir().join(format!("rd-dfabi-cfg-{}", rand::random::<u64>()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let id_file = dir.join("network-id");
+    std::fs::write(&id_file, format!("{}\n", NetworkId::from_genesis_hash(HashOf::from_untyped_unchecked(Hash::new(b"config-test"))))).unwrap();
+    let text = crate::client_toml::render(&[seed; 32], torii, "11111111-2222-4333-8444-555555555555", id_file.to_str().unwrap(), "wonderland.universal").unwrap();
+    std::fs::write(dir.join("client.toml"), text).unwrap();
+    dir
 }
 
 #[cfg(test)]
@@ -309,6 +395,73 @@ dfabi = 2
             let cfg = config(&format!("party = \"{party}\""));
             assert_eq!(cfg.party, party);
             assert_eq!(cfg.acting_torii().unwrap().as_str(), format!("http://{party}:8080/"), "{party} submits to its OWN Torii");
+        }
+    }
+
+    /// `extra` for a BI driver with BI's own client.toml (seed 7) and a `[aps.sponsor]` dir (seed 9, note 3/4).
+    fn with_sponsor() -> Config {
+        let (bi, sponsor) = (test_client_dir(7, "http://bi-own:1/"), test_client_dir(9, "http://sponsor-own:1/"));
+        std::fs::write(sponsor.join("sponsor.note"), format!("{}{}", hex::encode([3u8; 32]), hex::encode([4u8; 32]))).unwrap();
+        config(&format!(
+            "client_toml = \"{}\"\nparty = \"bank-a\"\n[aps.sponsor]\nname = \"sponsor\"\ndir = \"{}\"\n",
+            bi.join("client.toml").display(),
+            sponsor.display()
+        ))
+    }
+
+    #[test]
+    fn acting_sponsor_uses_sponsor_section() {
+        let cfg = with_sponsor();
+        let (client, key) = cfg.acting_sponsor().unwrap();
+        assert_eq!(key.public_key(), signing_key(&[9; 32]).public_key(), "the sponsor key, not BI's");
+        assert_eq!(client.account_client().endpoint().as_str(), "http://bank-a:8080/", "the client.toml Torii is overridden by the acting party's");
+        let notes = cfg.sponsor_note_keys().unwrap();
+        assert_eq!((notes.spend, notes.view), ([3; 32], [4; 32]));
+        let mut absent = with_sponsor();
+        absent.aps.sponsor = None;
+        assert_eq!(absent.acting_sponsor().unwrap().1.public_key(), signing_key(&[7; 32]).public_key(), "no section: BI's own key, as before");
+        assert!(absent.sponsor_note_keys().is_err());
+    }
+
+    #[test]
+    fn governance_stays_party_key() {
+        let cfg = with_sponsor();
+        let (client, key) = cfg.governance().unwrap();
+        assert_eq!(key.public_key(), signing_key(&[7; 32]).public_key());
+        assert_eq!(client.account_client().endpoint().as_str(), "http://bank-a:8080/");
+    }
+
+    /// A bundle's carriers (an abort too) are signed by the key its manifest names: the sponsor key, or for a bundle prepared
+    /// before `[aps.sponsor]` was set, the governance key.
+    #[test]
+    fn the_abort_signer_is_the_key_the_manifest_names() {
+        let cfg = with_sponsor();
+        let id = |seed: u8| AccountId::new(signing_key(&[seed; 32]).public_key().clone());
+        assert_eq!(cfg.signer_for(&id(9)).unwrap().1.public_key(), signing_key(&[9; 32]).public_key(), "the sponsor key");
+        assert_eq!(cfg.signer_for(&id(7)).unwrap().1.public_key(), signing_key(&[7; 32]).public_key(), "the governance key");
+        assert!(cfg.signer_for(&id(1)).is_err(), "a key this driver does not hold");
+    }
+
+    /// The CLI's legs and `/aps` legs address the reimbursement to the same keys: the sponsor's role-2 one-time keys.
+    #[test]
+    fn the_reimbursement_belongs_to_the_sponsor_only_with_a_sponsor_section() {
+        let cfg = with_sponsor();
+        let (bundle, pool) = ([1; 32], [2; 32]);
+        let keys = cfg.reimbursement_keys(&bundle, &pool).unwrap();
+        let sponsor = cfg.sponsor_note_keys().unwrap().one_time(&bundle, &pool, 2);
+        assert_eq!((keys.spend, keys.view), (sponsor.spend, sponsor.view));
+        let mut absent = with_sponsor();
+        absent.aps.sponsor = None;
+        assert_ne!(absent.reimbursement_keys(&bundle, &pool).unwrap().view, sponsor.view, "no section: nobody's keys");
+    }
+
+    #[test]
+    fn the_governed_carrier_limit_is_required_and_not_zero() {
+        assert_eq!(config("[aps]\nmax_carrier_bytes = 262144\n").max_carrier_bytes().unwrap(), 262_144);
+        let above = format!("[aps]\nmax_carrier_bytes = {}\n", iroha::data_model::nexus::PRIVATE_SETTLEMENT_MAX_RECEIPT_BYTES_V1 + 1);
+        for missing in ["", "[aps]\nmax_carrier_bytes = 0\n", above.as_str()] {
+            let error = config(missing).max_carrier_bytes().unwrap_err();
+            assert!(error.to_string().contains("max_carrier_bytes"), "{error}");
         }
     }
 

@@ -179,6 +179,11 @@ impl Submitter for Real {
 
 /// `rd-dfabi server <config> --listen <addr>`.
 pub fn run(cfg: Config, listen: &str) -> Result<()> {
+    let coordinator = cfg.aps.coordinator;
+    if coordinator {
+        // Refused at start, not at the first bundle: every carrier is measured against the governed limit.
+        cfg.max_carrier_bytes()?;
+    }
     let peer = aps_http::RealPeer { tls: cfg.tls.clone() };
     let aps_cfg = cfg.aps.clone();
     // The APS backend reads its own copy without the lock (aps_real::RealBackend); `Real` keeps one submission at a time.
@@ -186,11 +191,19 @@ pub fn run(cfg: Config, listen: &str) -> Result<()> {
     let real = Real { cfg: Mutex::new(cfg) };
     let backend = aps_real::RealBackend::new(&aps_conf);
     let aps = aps_http::Aps::new(&backend, &peer, aps_cfg);
-    // One thread per connection: a bank's forwarded `/aps/submit` waits on BI while BI calls back into the same bank.
-    http::serve_threaded(listen, |method, path, body| {
-        let (status, response) = dispatch(method, path, body, &real, &aps);
-        eprintln!("{method} {path} -> {status}");
-        (status, response)
+    std::thread::scope(|scope| {
+        if coordinator {
+            // The bundles a previous run left in flight finish before any new submit; `/healthz` answers meanwhile.
+            let (locked, held) = std::sync::mpsc::channel();
+            scope.spawn(|| aps.resume(move || drop(locked.send(()))));
+            let _ = held.recv();
+        }
+        // One thread per connection: a bank's forwarded `/aps/submit` waits on BI while BI calls back into the same bank.
+        http::serve_threaded(listen, |method, path, body| {
+            let (status, response) = dispatch(method, path, body, &real, &aps);
+            eprintln!("{method} {path} -> {status}");
+            (status, response)
+        })
     })
 }
 
@@ -559,6 +572,20 @@ mod tests {
         assert_eq!(dispatch("GET", "/nope", "", &fake, &aps).0, 404);
         assert_eq!(dispatch("POST", "/settle-grant", &body("to"), &fake, &aps).0, 200);
         assert_eq!(fake.calls.borrow().len(), 1, "only the non-APS grant reached the submitter");
+    }
+
+    /// Every carrier is measured against the deployment's governed limit: a coordinator without it does not start.
+    #[test]
+    fn a_coordinator_without_the_governed_carrier_limit_refuses_to_start() {
+        let base = "chain = \"c\"\nnetwork_id_file = \"/n\"\naccount_domain = \"d\"\npeers_json = \"/p\"\nkey_dir = \"/k\"\nfee_asset = \"f\"\n\
+                    auditor_url = \"a:1\"\npools_file = \"/nonexistent/pools.json\"\n[torii]\n[assets]\nrd = \"r\"\ndfabi = \"d\"\n[lanes]\nrd = 1\ndfabi = 2\n\
+                    [aps]\ncoordinator = true\n";
+        for (extra, refused) in [("", true), ("max_carrier_bytes = 0\n", true), ("max_carrier_bytes = 262144\n", false)] {
+            let cfg: Config = toml::from_str(&format!("{base}{extra}")).unwrap();
+            // An address nothing can bind: a coordinator that passes the check fails there instead of serving.
+            let error = format!("{:#}", run(cfg, "not-an-address").unwrap_err());
+            assert_eq!(error.contains("max_carrier_bytes"), refused, "{extra:?}: {error}");
+        }
     }
 
     /// Live: a submit takes 100-200 s and kubelet kills the pod when `/healthz` stays unanswered for about 365 s.
