@@ -85,10 +85,13 @@ use crate::{
 pub(crate) const EXPIRY_BLOCKS: u64 = 1_000;
 /// Must be >= the peers' `nexus.atomic_private_settlement.sidecar_retention_blocks`: Torii
 /// rejects an availability share whose retention ends before `stored_at + that value`
-/// (torii private_settlement.rs validate_availability_share_policy). Our network keeps the
-/// upstream default 1_000_000 (network/nexus.toml does not override it; the upstream localnet
-/// test sets 4096, which made every committee member answer 400).
-const SIDECAR_RETENTION_BLOCKS: u64 = 1_000_000;
+/// (torii private_settlement.rs validate_availability_share_policy), and a record is pruned only
+/// after the height passes the retention this driver signs. Equal to network/nexus.toml (1200 since
+/// chain #4): the upstream default 1_000_000 never expired on a chain that makes a block only per
+/// tx, so every peer's store filled at 256 records and each upload answered 503 (chain #3).
+const SIDECAR_RETENTION_BLOCKS: u64 = 1_200;
+// Upstream config refuses sidecar_retention_blocks < max_expiry_blocks, and a bundle may live EXPIRY_BLOCKS.
+const _: () = assert!(SIDECAR_RETENTION_BLOCKS >= EXPIRY_BLOCKS);
 /// Fee ceiling signed into the manifest; each carrier costs per_instruction_fee = 0.001.
 const FEE_SIGNED_MAXIMUM: u64 = 1;
 /// Private note the sponsor gets back on leg 0 (reimbursement leg). Same value goes into
