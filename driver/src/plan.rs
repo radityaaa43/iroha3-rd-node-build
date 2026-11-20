@@ -4,7 +4,8 @@
 //! reimbursement `R`). A one-asset payment X is a main leg in one lane plus a BI -> BI companion of 1 X in the other lane (the
 //! same asset, so the pool pair does not tell RD from DFABI); its lane is random among the lanes that cover it, except issuance,
 //! which goes to the pool where the recipient holds less. When no single pool of the payer covers the amount, the payment is
-//! split into two legs payer -> recipient, one per lane. A DvP puts its RD leg in a random covering lane, DFABI in the other.
+//! split into two legs payer -> recipient, one per lane. A DvP puts its RD leg in a random covering lane, DFABI in the other. A pay
+//! nothing covers although the payer's pools hold enough first runs merge bundles payer -> payer (`merge`).
 
 use rand::{Rng, seq::IndexedRandom};
 use serde::{Deserialize, Serialize};
@@ -16,6 +17,13 @@ use crate::{
 
 /// The whole 422 message: no amounts, no parties (it reaches Lensa and the logs).
 pub const NO_ARRANGEMENT: &str = "no pool arrangement covers the payment";
+
+/// Most merge bundles (`merge`) one submit runs before its payment. The whole submit sits behind Envoy's 600 s route timeout and
+/// a bundle takes about 80-100 s on the live chain: 4 merges and the payment fit.
+pub const MAX_MERGES: usize = 4;
+
+/// The 422 after merges ran and the payer's notes still do not cover the payment. A new submit merges on from there.
+pub const NOT_MERGED_ENOUGH: &str = "the payer's notes were merged but do not cover the payment yet; submit it again with a new intent";
 
 /// A submit, as `POST /aps/submit` carries it (accounts are `ed0120...` keys).
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -135,6 +143,44 @@ pub fn plan(
     };
     legs.sort_by_key(|leg| leg.key.lane);
     Ok(legs)
+}
+
+/// A merge bundle for a pay `plan` refused. A leg spends at most two notes and always outputs two (recipient and change), so notes
+/// cannot be joined, only reshaped: in every lane not `stalled` where the payer holds more than its two largest notes, one leg
+/// payer -> payer of `two_notes` (less the reimbursement on leg 0) under the pay's intent. `wallet::pick_notes` then spends exactly the
+/// two largest notes into one of their sum - 1 (- R) and a change of 1, and the next `two_notes` also counts the third-largest note.
+/// A lane with nothing to merge gets the BI -> BI companion. `None`: the payer's pools together do not hold the amount plus the
+/// reimbursement, nothing is left to merge, BI cannot pay the companion, or a DvP.
+pub fn merge(req: &Request, bi: &str, lanes: [u32; 2], stalled: &[u32], cap: &dyn Fn(Option<&str>, PoolKey) -> Capacity) -> Option<[PlannedLeg; 2]> {
+    let Request::Pay { asset, from, amount, intent, .. } = req else {
+        return None;
+    };
+    let payer = (!from.eq_ignore_ascii_case(bi)).then(|| from.clone());
+    let at = |lane: u32| PoolKey { lane, asset: *asset };
+    let reimbursement = |lane: u32| if lane == lanes[0] { R } else { 0 };
+    let total: u128 = lanes.iter().map(|&lane| cap(payer.as_deref(), at(lane)).total).sum();
+    if amount.saturating_add(R) > total {
+        return None;
+    }
+    let merges = lanes.map(|lane| {
+        let c = cap(payer.as_deref(), at(lane));
+        let amount = c.two_notes.saturating_sub(reimbursement(lane));
+        (!stalled.contains(&lane) && c.total > c.two_notes.saturating_add(1) && amount >= 1)
+            .then(|| PlannedLeg { key: at(lane), payer: payer.clone(), recipient: payer.clone(), amount, intent: Some(intent.clone()) })
+    });
+    if merges.iter().all(Option::is_none) {
+        return None;
+    }
+    let mut legs = Vec::new();
+    for (lane, leg) in lanes.into_iter().zip(merges) {
+        let leg = match leg {
+            Some(leg) => leg,
+            None if cap(None, at(lane)).two_notes > reimbursement(lane) => PlannedLeg { key: at(lane), payer: None, recipient: None, amount: 1, intent: None },
+            None => return None,
+        };
+        legs.push(leg);
+    }
+    legs.try_into().ok()
 }
 
 #[cfg(test)]
@@ -272,5 +318,43 @@ mod tests {
         }
         assert_eq!(main_lanes, BTreeSet::from([1, 2]));
         assert_eq!(rd_lanes, BTreeSet::from([1, 2]));
+    }
+
+    /// The live case 2026-11-20: notes of about 1000 each, two_notes 1999 of 12000 (lane 1) and of 14030 (lane 2). Both lanes merge in
+    /// one bundle, payer -> payer: the two largest notes minus 1, less the reimbursement on leg 0.
+    #[test]
+    fn merge_spends_the_two_largest_notes_in_every_lane_that_holds_more() {
+        let cap = caps(&[(Some(P), 1, Asset::Rd, 1999, 12000), (Some(P), 2, Asset::Rd, 1999, 14030), (None, 1, Asset::Rd, 100, 100), (None, 2, Asset::Rd, 100, 100)]);
+        let req = pay(Asset::Rd, P, Q, 5000);
+        assert!(plan(&req, BI, [1, 2], &cap, &mut rng(1)).is_err(), "two notes per leg do not carry it");
+        let legs = merge(&req, BI, [1, 2], &[], &cap).unwrap();
+        assert_eq!(legs, [leg(1, Asset::Rd, Some(P), Some(P), 1998, Some("i")), leg(2, Asset::Rd, Some(P), Some(P), 1999, Some("i"))]);
+    }
+
+    /// A lane holding at most its two largest notes, or one the last merge did not grow (`stalled`), gets BI's companion instead.
+    #[test]
+    fn merge_pairs_a_lane_with_nothing_to_merge_with_the_companion() {
+        let rows = [(Some(P), 1, Asset::Dfabi, 1999, 2000), (Some(P), 2, Asset::Dfabi, 1999, 14030), (None, 1, Asset::Dfabi, 2, 2)];
+        let req = pay(Asset::Dfabi, P, Q, 5000);
+        let legs = merge(&req, BI, [1, 2], &[], &caps(&rows)).unwrap();
+        assert_eq!(legs, [leg(1, Asset::Dfabi, None, None, 1, None), leg(2, Asset::Dfabi, Some(P), Some(P), 1999, Some("i"))]);
+        assert_eq!(merge(&req, BI, [1, 2], &[2], &caps(&rows)), None, "lane 2 stalled, lane 1 has nothing to merge");
+        // the companion in lane 1 is leg 0: BI needs 1 + 1
+        let poor = [(Some(P), 1, Asset::Dfabi, 1999, 2000), (Some(P), 2, Asset::Dfabi, 1999, 14030), (None, 1, Asset::Dfabi, 1, 1)];
+        assert_eq!(merge(&req, BI, [1, 2], &[], &caps(&poor)), None);
+        // the other lane stalled: lane 1 merges next to the companion in lane 2
+        let both = caps(&[(Some(P), 1, Asset::Rd, 1999, 12000), (Some(P), 2, Asset::Rd, 1999, 14030), (None, 2, Asset::Rd, 1, 1)]);
+        let legs = merge(&pay(Asset::Rd, P, Q, 5000), BI, [1, 2], &[2], &both).unwrap();
+        assert_eq!(legs, [leg(1, Asset::Rd, Some(P), Some(P), 1998, Some("i")), leg(2, Asset::Rd, None, None, 1, None)]);
+    }
+
+    /// No merge when the payer's pools together do not hold the payment plus the reimbursement (the plain 422), nor for a DvP.
+    #[test]
+    fn merge_refuses_what_the_total_cannot_cover() {
+        let cap = caps(&[(Some(P), 1, Asset::Rd, 1999, 2400), (None, 2, Asset::Rd, 100, 100)]);
+        assert_eq!(merge(&pay(Asset::Rd, P, Q, 2400), BI, [1, 2], &[], &cap), None);
+        assert_eq!(merge(&pay(Asset::Rd, P, Q, 2399), BI, [1, 2], &[], &cap).map(|legs| legs[0].amount), Some(1998));
+        let dvp_cap = caps(&[(Some(P), 1, Asset::Rd, 1999, 12000), (Some(Q), 2, Asset::Dfabi, 1999, 12000)]);
+        assert_eq!(merge(&dvp(5000, 5000), BI, [1, 2], &[], &dvp_cap), None);
     }
 }

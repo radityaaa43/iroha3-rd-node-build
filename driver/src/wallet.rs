@@ -285,6 +285,14 @@ mod tests {
         assert_eq!(got, vec![4, 7]);
     }
 
+    /// A merge leg (`plan::merge`) asks for `Capacity::two_notes` (amount + reimbursement): only the two largest notes cover it.
+    #[test]
+    fn pick_notes_for_a_merge_takes_the_two_largest_notes() {
+        let notes = [note(1000), note(700), note(1000), note(300), note(1)];
+        let two_notes = crate::plan::Capacity::of(&[1000, 700, 1000, 300, 1]).two_notes;
+        assert_eq!(values(&pick_notes(&notes, two_notes).unwrap()), vec![1000, 1000]);
+    }
+
     #[test]
     fn pick_notes_refuses_when_two_notes_do_not_leave_change() {
         assert!(pick_notes(&[note(4), note(5), note(1)], 9).is_err());
