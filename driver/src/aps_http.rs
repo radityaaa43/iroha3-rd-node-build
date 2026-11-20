@@ -26,6 +26,9 @@ use crate::{
 /// How long a registered intent stays usable (a restart forgets all of them: Lensa repeats the flow).
 pub const INTENT_TTL: Duration = Duration::from_secs(15 * 60);
 
+/// Most merge legs (payer -> payer, `plan::merge`) one open pay intent allows: every merge bundle of a submit may merge both lanes.
+pub const MERGE_LEGS: usize = 2 * plan::MAX_MERGES;
+
 /// Body of `POST /aps/address` (coordinator -> recipient). Also the context of the sponsor's output 2.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -1757,5 +1760,134 @@ mod tests {
             assert_eq!(calls(&backend), own, "nothing prepared or proved");
             assert!(peer.calls.lock().unwrap().iter().all(|call| call.2 == "/aps/capacity"));
         }
+    }
+
+    /// `(lane, two_notes, total)` per pool.
+    fn capacity_rows(pools: &[(u32, u128, u128)]) -> String {
+        let pools: Vec<_> =
+            pools.iter().map(|(lane, two, total)| serde_json::json!({ "lane": lane, "two_notes": two.to_string(), "total": total.to_string() })).collect();
+        serde_json::json!({ "pools": pools }).to_string()
+    }
+
+    /// A healthy peer whose bank A holds 12000 RD in notes of about 1000 in lane 1 and nothing in lane 2; `two_notes(n)` is its
+    /// lane-1 answer to the `n`-th capacity question.
+    fn merging_peer(two_notes: impl Fn(usize) -> u128 + Send + Sync + 'static) -> FakePeer {
+        let asked = std::sync::atomic::AtomicUsize::new(0);
+        FakePeer::with(move |target, path, body| match path {
+            "/aps/capacity" => Ok((200, capacity_rows(&[(1, two_notes(asked.fetch_add(1, Ordering::SeqCst)), 12000), (2, 0, 0)]))),
+            _ => standard_answer(target, path, body),
+        })
+    }
+
+    fn settles(backend: &FakeBackend) -> usize {
+        calls(backend).iter().filter(|call| **call == "settle").count()
+    }
+
+    /// Live 2026-11-20: bank C held 12000 RD in lane 1 but its two largest notes only 2000, so a pay of 2500 was a 422. Now one merge
+    /// bundle (bank A -> bank A, the two largest notes into one of 1998, next to BI's companion) runs first, then the payment.
+    #[test]
+    fn a_payment_the_two_largest_notes_do_not_cover_is_paid_after_a_merge_bundle() {
+        let backend = driver(7);
+        let peer = merging_peer(|n| if n == 0 { 1999 } else { 2997 });
+        let aps = Aps::new(&backend, &peer, coordinator());
+        let (status, response) = aps.route("POST", "/aps/submit", &pay_body(&id(1), "rd", &account(8), &account(9), "2500"));
+        assert_eq!((status, json(&response)["outcome"].as_str()), (200, Some("finalized")), "{response}");
+        let sent = peer.calls.lock().unwrap().clone();
+        let route: Vec<_> = sent.iter().map(|call| (call.0.as_str(), call.2.as_str())).collect();
+        let expected = [
+            (BANK_A, "/aps/capacity"),
+            (BANK_A, "/aps/address"),
+            (BANK_A, "/aps/leg"),
+            (BANK_A, "/aps/capacity"),
+            (BANK_B, "/aps/address"),
+            (BANK_A, "/aps/leg"),
+        ];
+        assert_eq!(route, expected, "the merge pays bank A's own address");
+        let summary = |leg: &serde_json::Value| {
+            let text = |field: &str| leg[field].as_str().map(str::to_owned);
+            (text("recipient"), text("amount"), text("intent"), leg["lane"].as_u64(), leg["ordinal"].as_u64())
+        };
+        let (merge, pay) = (json(&sent[2].3), json(&sent[5].3));
+        assert_eq!(summary(&merge), (Some(account(8)), Some("1998".to_owned()), Some(id(1)), Some(1), Some(0)), "under the pay's own intent");
+        assert_eq!(summary(&pay), (Some(account(9)), Some("2500".to_owned()), Some(id(1)), Some(1), Some(0)));
+        assert_eq!(settles(&backend), 2, "the merge bundle, then the payment");
+    }
+
+    #[test]
+    fn a_submit_runs_at_most_max_merges_merge_bundles_then_is_422() {
+        let backend = driver(7);
+        let peer = merging_peer(|n| 1999 + 999 * n as u128);
+        let aps = Aps::new(&backend, &peer, coordinator());
+        let (status, response) = aps.route("POST", "/aps/submit", &pay_body(&id(1), "rd", &account(8), &account(9), "11000"));
+        assert_eq!((status, json(&response)), (422, serde_json::json!({ "error": plan::NOT_MERGED_ENOUGH })));
+        assert_eq!(settles(&backend), plan::MAX_MERGES);
+        let legs = peer.calls.lock().unwrap().iter().filter(|call| call.2 == "/aps/leg").count();
+        assert_eq!(legs, plan::MAX_MERGES, "merge legs only, never the payment");
+    }
+
+    #[test]
+    fn a_lane_the_last_merge_did_not_grow_is_not_merged_again() {
+        let backend = driver(7);
+        let peer = merging_peer(|_| 1999);
+        let aps = Aps::new(&backend, &peer, coordinator());
+        let (status, response) = aps.route("POST", "/aps/submit", &pay_body(&id(1), "rd", &account(8), &account(9), "2500"));
+        assert_eq!((status, json(&response)), (422, serde_json::json!({ "error": plan::NOT_MERGED_ENOUGH })));
+        assert_eq!(settles(&backend), 1);
+    }
+
+    /// The payer's pools together do not hold the payment plus the reimbursement: the plain 422, nothing merged.
+    #[test]
+    fn a_payment_above_the_payers_total_is_the_plain_422_without_merging() {
+        let backend = driver(7);
+        let peer = merging_peer(|_| 1999);
+        let aps = Aps::new(&backend, &peer, coordinator());
+        let (status, response) = aps.route("POST", "/aps/submit", &pay_body(&id(1), "rd", &account(8), &account(9), "12000"));
+        assert_eq!((status, json(&response)), (422, serde_json::json!({ "error": plan::NO_ARRANGEMENT })));
+        assert!(!calls(&backend).contains(&"begin_bundle"));
+        assert!(peer.calls.lock().unwrap().iter().all(|call| call.2 == "/aps/capacity"));
+    }
+
+    /// An aborted merge bundle moved nothing: the submit ends there as aborted, like an aborted payment.
+    #[test]
+    fn an_aborted_merge_bundle_ends_the_submit_as_aborted() {
+        let backend = FakeBackend { aborts: true, ..driver(7) };
+        let peer = merging_peer(|n| if n == 0 { 1999 } else { 2997 });
+        let aps = Aps::new(&backend, &peer, coordinator());
+        let (status, response) = aps.route("POST", "/aps/submit", &pay_body(&id(1), "rd", &account(8), &account(9), "2500"));
+        assert_eq!((status, json(&response)), (200, serde_json::json!({ "outcome": "aborted", "bundle_id": id(0xbb), "carrier_tx": null, "height": null })));
+        assert_eq!(settles(&backend), 1);
+        assert_eq!(peer.calls.lock().unwrap().iter().filter(|call| call.2 == "/aps/capacity").count(), 1);
+    }
+
+    /// Bank side: a merge leg (recipient = the own account) under an open pay intent of its asset spends nothing of the intent and
+    /// takes neither an ordinal nor a lane, so the payment's legs still go through after it.
+    #[test]
+    fn a_merge_leg_spends_nothing_of_the_pay_intent() {
+        let (backend, peer) = (driver(8), FakePeer::standard());
+        let aps = Aps::new(&backend, &peer, bank());
+        let (me, to, intent) = (account(8), account(9), id(1));
+        assert_eq!(aps.route("POST", "/aps/intent", &intent_body(&intent, "rd", &to, "2500")).0, 200);
+        assert_eq!(aps.route("POST", "/aps/leg", &leg_at(&intent, &me, "1998", 0, 1)).0, 200);
+        assert_eq!(aps.route("POST", "/aps/leg", &leg_at(&intent, &me, "1999", 1, 2)).0, 200);
+        assert_eq!(aps.route("POST", "/aps/leg", &leg_at(&intent, &to, "2500", 0, 1)).0, 200, "the whole payment is still open");
+        assert_eq!(aps.route("POST", "/aps/leg", &leg_at(&intent, &me, "1998", 0, 1)).0, 403, "the intent is spent");
+        assert_eq!(calls(&backend).iter().filter(|call| **call == "prove").count(), 3);
+    }
+
+    #[test]
+    fn a_merge_leg_needs_an_open_intent_of_its_asset_and_stops_at_merge_legs() {
+        let (backend, peer) = (driver(8), FakePeer::standard());
+        let aps = Aps::new(&backend, &peer, bank());
+        let (me, to, intent) = (account(8), account(9), id(1));
+        assert_eq!(aps.route("POST", "/aps/leg", &leg_at(&intent, &me, "5", 0, 1)).0, 403, "no intent");
+        assert_eq!(aps.route("POST", "/aps/intent", &intent_body(&intent, "rd", &to, "9")).0, 200);
+        assert_eq!(aps.route("POST", "/aps/leg", &leg_body(&intent, "dfabi", &me, "5")).0, 403, "a DFABI merge under an RD intent");
+        for n in 0..MERGE_LEGS {
+            let (ordinal, lane) = ((n % 2) as u8, 1 + (n % 2) as u32);
+            assert_eq!(aps.route("POST", "/aps/leg", &leg_at(&intent, &me, "5", ordinal, lane)).0, 200, "merge leg {n}");
+        }
+        assert_eq!(aps.route("POST", "/aps/leg", &leg_at(&intent, &me, "5", 0, 1)).0, 403, "one merge leg too many");
+        assert_eq!(aps.route("POST", "/aps/leg", &leg_at(&intent, &to, "9", 0, 1)).0, 200, "the payment itself still goes through");
+        assert_eq!(calls(&backend).iter().filter(|call| **call == "prove").count(), MERGE_LEGS + 1);
     }
 }
