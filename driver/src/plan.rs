@@ -4,7 +4,8 @@
 //! reimbursement `R`). A one-asset payment X is a main leg in one lane plus a BI -> BI companion of 1 X in the other lane (the
 //! same asset, so the pool pair does not tell RD from DFABI); its lane is random among the lanes that cover it, except issuance,
 //! which goes to the pool where the recipient holds less. When no single pool of the payer covers the amount, the payment is
-//! split into two legs payer -> recipient, one per lane. A DvP puts its RD leg in a random covering lane, DFABI in the other.
+//! split into two legs payer -> recipient, one per lane. A DvP puts its RD leg in a random covering lane, DFABI in the other. A pay
+//! nothing covers although the payer's pools hold enough first runs merge bundles payer -> payer (`merge`).
 
 use rand::{Rng, seq::IndexedRandom};
 use serde::{Deserialize, Serialize};
