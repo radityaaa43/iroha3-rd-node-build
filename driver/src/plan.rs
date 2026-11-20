@@ -144,9 +144,42 @@ pub fn plan(
     Ok(legs)
 }
 
-/// A merge bundle for a pay `plan` refused. Stub.
-pub fn merge(_req: &Request, _bi: &str, _lanes: [u32; 2], _stalled: &[u32], _cap: &dyn Fn(Option<&str>, PoolKey) -> Capacity) -> Option<[PlannedLeg; 2]> {
-    None
+/// A merge bundle for a pay `plan` refused. A leg spends at most two notes and always outputs two (recipient and change), so notes
+/// cannot be joined, only reshaped: in every lane not `stalled` where the payer holds more than its two largest notes, one leg
+/// payer -> payer of `two_notes` (less the reimbursement on leg 0) under the pay's intent. `wallet::pick_notes` then spends exactly the
+/// two largest notes into one of their sum - 1 (- R) and a change of 1, and the next `two_notes` also counts the third-largest note.
+/// A lane with nothing to merge gets the BI -> BI companion. `None`: the payer's pools together do not hold the amount plus the
+/// reimbursement, nothing is left to merge, BI cannot pay the companion, or a DvP.
+pub fn merge(req: &Request, bi: &str, lanes: [u32; 2], stalled: &[u32], cap: &dyn Fn(Option<&str>, PoolKey) -> Capacity) -> Option<[PlannedLeg; 2]> {
+    let Request::Pay { asset, from, amount, intent, .. } = req else {
+        return None;
+    };
+    let payer = (!from.eq_ignore_ascii_case(bi)).then(|| from.clone());
+    let at = |lane: u32| PoolKey { lane, asset: *asset };
+    let reimbursement = |lane: u32| if lane == lanes[0] { R } else { 0 };
+    let total: u128 = lanes.iter().map(|&lane| cap(payer.as_deref(), at(lane)).total).sum();
+    if amount.saturating_add(R) > total {
+        return None;
+    }
+    let merges = lanes.map(|lane| {
+        let c = cap(payer.as_deref(), at(lane));
+        let amount = c.two_notes.saturating_sub(reimbursement(lane));
+        (!stalled.contains(&lane) && c.total > c.two_notes.saturating_add(1) && amount >= 1)
+            .then(|| PlannedLeg { key: at(lane), payer: payer.clone(), recipient: payer.clone(), amount, intent: Some(intent.clone()) })
+    });
+    if merges.iter().all(Option::is_none) {
+        return None;
+    }
+    let mut legs = Vec::new();
+    for (lane, leg) in lanes.into_iter().zip(merges) {
+        let leg = match leg {
+            Some(leg) => leg,
+            None if cap(None, at(lane)).two_notes > reimbursement(lane) => PlannedLeg { key: at(lane), payer: None, recipient: None, amount: 1, intent: None },
+            None => return None,
+        };
+        legs.push(leg);
+    }
+    legs.try_into().ok()
 }
 
 #[cfg(test)]

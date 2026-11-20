@@ -171,9 +171,10 @@ struct IntentTerms {
 }
 
 enum Slot {
-    /// The approved terms, the amount no leg has spent yet and the `(ordinal, lane)` of the legs taken. A split pay spends one intent
-    /// over two legs: leg 0 and leg 1, each in its own lane, so the payer pays the sponsor's reimbursement (leg 0) at most once.
-    Open(IntentTerms, u128, Vec<(u8, u32)>),
+    /// The approved terms, the amount no leg has spent yet, the `(ordinal, lane)` of the legs taken and the merge legs taken. A split
+    /// pay spends one intent over two legs: leg 0 and leg 1, each in its own lane, so the payer pays the sponsor's reimbursement (leg 0)
+    /// at most once.
+    Open(IntentTerms, u128, Vec<(u8, u32)>, usize),
     Used,
 }
 
@@ -196,7 +197,7 @@ impl IntentStore {
         let mut slots = self.slots.lock().unwrap_or_else(|p| p.into_inner());
         slots.retain(|_, (_, expires)| *expires > now);
         let known = match slots.get(intent) {
-            Some((Slot::Open(old, _, _), _)) => Some(*old == terms),
+            Some((Slot::Open(old, _, _, _), _)) => Some(*old == terms),
             Some((Slot::Used, _)) => Some(false),
             None => None,
         };
@@ -204,23 +205,33 @@ impl IntentStore {
             Some(same) => same,
             None => {
                 let amount = terms.amount;
-                slots.insert(intent.to_owned(), (Slot::Open(terms, amount, Vec::new()), now + INTENT_TTL));
+                slots.insert(intent.to_owned(), (Slot::Open(terms, amount, Vec::new(), 0), now + INTENT_TTL));
                 true
             }
         }
     }
 
     /// Spend `leg.amount` of the intent when asset and recipient match, that much is left, and no taken leg had this ordinal or
-    /// this lane; spent in full, it is used. A refused leg spends nothing.
-    fn take(&self, now: Instant, intent: &str, leg: &IntentTerms, ordinal: u8, lane: u32) -> Take {
+    /// this lane; spent in full, it is used. A refused leg spends nothing. `own` is the payer's own account (lower-case).
+    fn take(&self, now: Instant, intent: &str, leg: &IntentTerms, ordinal: u8, lane: u32, own: &str) -> Take {
         let mut slots = self.slots.lock().unwrap_or_else(|p| p.into_inner());
         slots.retain(|_, (_, expires)| *expires > now);
         let Some((slot, _)) = slots.get_mut(intent) else {
             return Take::Missing;
         };
-        let Slot::Open(terms, left, taken) = slot else {
+        let Slot::Open(terms, left, taken, merges) = slot else {
             return Take::Missing;
         };
+        // A merge leg (payer -> payer, `plan::merge`) under an open pay intent of its asset: its outputs are the payer's own notes
+        // (output 0 carries the payer's own signed authorization), so only the reimbursement on leg 0 leaves. It spends nothing of
+        // the intent and takes no ordinal or lane; at most `MERGE_LEGS` per intent.
+        if leg.to == own && terms.to != own {
+            if terms.asset != leg.asset || *merges >= MERGE_LEGS {
+                return Take::Mismatch;
+            }
+            *merges += 1;
+            return Take::Taken;
+        }
         let reused = taken.iter().any(|&(o, l)| o == ordinal || l == lane);
         if terms.asset != leg.asset || terms.to != leg.to || leg.amount > *left || reused {
             return Take::Mismatch;
@@ -517,7 +528,11 @@ impl<'a> Aps<'a> {
             Ok(false) => return error(400, "lane and asset do not name the manifest's pool for this leg"),
             Err(e) => return fail(e),
         }
-        if let Err(reply) = self.consume(now, &req, amount) {
+        let own = match self.backend.own_key() {
+            Ok(own) => own,
+            Err(e) => return fail(e),
+        };
+        if let Err(reply) = self.consume(now, &req, amount, &own) {
             return reply;
         }
         if let Err(reply) = self.refresh() {
@@ -530,10 +545,10 @@ impl<'a> Aps<'a> {
         }
     }
 
-    /// Match the leg against the intent this driver registered and spend it, before any proving.
-    fn consume(&self, now: Instant, req: &LegReq, amount: u128) -> Result<(), Reply> {
+    /// Match the leg against the intent this driver registered and spend it, before any proving. `own`: this driver's account.
+    fn consume(&self, now: Instant, req: &LegReq, amount: u128, own: &str) -> Result<(), Reply> {
         let terms = IntentTerms { asset: req.asset.clone(), to: norm(&req.recipient), amount };
-        match self.intents.take(now, &norm(&req.intent), &terms, req.ordinal, req.lane) {
+        match self.intents.take(now, &norm(&req.intent), &terms, req.ordinal, req.lane, &norm(own)) {
             Take::Taken => Ok(()),
             Take::Missing => Err(error(403, "no open intent for this leg (unknown, already used or expired)")),
             Take::Mismatch => Err(error(403, "the intent's terms do not match this leg")),
@@ -668,11 +683,43 @@ impl<'a> Aps<'a> {
         answer.pools.iter().map(row).collect::<Result<_, _>>().map_err(|e| error(502, format!("/aps/capacity: bad answer: {e}")))
     }
 
-    /// One bundle: the payers' capacities and the plan, the manifest, then per leg the recipient's address, the sponsor's output
-    /// and the payer's proof, then settle.
+    /// One submit: the payers' capacities and the plan, then the bundle (`bundle`). A pay `plan` refuses although the payer's
+    /// pools hold enough runs merge bundles first (`plan::merge`, at most `plan::MAX_MERGES`), each on fresh capacities.
     fn coordinate(&self, now: Instant, req: &Request) -> Result<Reply, Reply> {
         let me = self.backend.own_key().map_err(fail)?;
-        let is_me = |key: &str| norm(key) == norm(&me);
+        let (mut merges, mut stalled) = (0, Vec::new());
+        // The payer, pool and two_notes before the last merge, per merged lane.
+        let mut merged: Vec<(Option<String>, PoolKey, u128)> = Vec::new();
+        loop {
+            let (caps, lanes) = self.capacities(req, &me)?;
+            let cap = |who: Option<&str>, key: PoolKey| caps.get(&(who.map(norm), key)).copied().unwrap_or_default();
+            // A lane the last merge did not grow holds nothing more worth merging.
+            for (payer, key, before) in merged.drain(..) {
+                if cap(payer.as_deref(), key).two_notes <= before {
+                    stalled.push(key.lane);
+                }
+            }
+            let message = match plan::plan(req, &me, lanes, &cap, &mut rand::rng()) {
+                Ok(legs) => return self.bundle(now, &me, &legs).map(|(bundle_id, settled)| outcome(&bundle_id, settled)),
+                Err(PlanError::Insufficient(message)) => message,
+            };
+            let Some(legs) = plan::merge(req, &me, lanes, &stalled, &cap).filter(|_| merges < plan::MAX_MERGES) else {
+                return Err(error(422, if merges == 0 { message } else { plan::NOT_MERGED_ENOUGH.to_owned() }));
+            };
+            merged = legs.iter().filter(|leg| leg.intent.is_some()).map(|leg| (leg.payer.clone(), leg.key, cap(leg.payer.as_deref(), leg.key).two_notes)).collect();
+            let (bundle_id, settled) = self.bundle(now, &me, &legs)?;
+            if settled.is_none() {
+                return Ok(outcome(&bundle_id, None));
+            }
+            merges += 1;
+            println!("aps: merge bundle {bundle_id} finalized ({merges} of at most {})", plan::MAX_MERGES);
+        }
+    }
+
+    /// The capacities `plan` reads (`None` = BI), and the two lanes of the pools.
+    #[allow(clippy::type_complexity)]
+    fn capacities(&self, req: &Request, me: &str) -> Result<(HashMap<(Option<String>, PoolKey), Capacity>, [u32; 2]), Reply> {
+        let is_me = |key: &str| norm(key) == norm(me);
         let other = |key: &String| (!is_me(key)).then(|| key.clone());
         // The capacities `plan` reads: each payer's; for a pay also BI's (the companion) and, for an issuance, the recipient's.
         let (accounts, mut asked) = match req {
@@ -713,9 +760,14 @@ impl<'a> Aps<'a> {
             return Err(error(422, "no pool arrangement covers the payment"));
         }
         let lanes: [u32; 2] = Vec::from_iter(lanes).try_into().map_err(|_| error(502, "/aps/capacity: the pools are not in exactly two lanes"))?;
-        let cap = |who: Option<&str>, key: PoolKey| caps.get(&(who.map(norm), key)).copied().unwrap_or_default();
-        let legs = plan::plan(req, &me, lanes, &cap, &mut rand::rng()).map_err(|PlanError::Insufficient(message)| error(422, message))?;
-        let party = |key: &Option<String>| key.clone().unwrap_or_else(|| me.clone());
+        Ok((caps, lanes))
+    }
+
+    /// One planned bundle: the manifest, then per leg the recipient's address, the sponsor's output and the payer's proof, then
+    /// settle. `None` = aborted.
+    fn bundle(&self, now: Instant, me: &str, legs: &[plan::PlannedLeg; 2]) -> Result<(String, Option<Settled>), Reply> {
+        let is_me = |key: &str| norm(key) == norm(me);
+        let party = |key: &Option<String>| key.clone().unwrap_or_else(|| me.to_owned());
         let bundle = self.backend.begin_bundle([legs[0].key, legs[1].key]).map_err(fail)?;
         // Per leg, in order: the recipient's address, the sponsor's output and, for a leg the coordinator pays, its intent.
         // Nothing is proved before both legs are ready, so a refused intent costs no proving.
@@ -755,7 +807,7 @@ impl<'a> Aps<'a> {
             let local = is_me(&payer);
             // A leg BI pays itself needs BI's own intent like any other payer's; only the companion has none.
             if local && spec.intent.is_some() {
-                self.consume(now, &req, spec.amount)?;
+                self.consume(now, &req, spec.amount, me)?;
             }
             jobs.push((local, payer, req));
         }
@@ -767,10 +819,15 @@ impl<'a> Aps<'a> {
             done.into_iter().collect::<Result<Vec<_>, Reply>>()
         })?;
         let settled = self.backend.settle(&bundle, &[prepared[0].clone(), prepared[1].clone()]).map_err(fail)?;
-        Ok(match settled {
-            Some(done) => reply(200, serde_json::json!({ "outcome": "finalized", "bundle_id": bundle.bundle_id, "carrier_tx": done.carrier_tx, "height": done.height })),
-            None => reply(200, serde_json::json!({ "outcome": "aborted", "bundle_id": bundle.bundle_id, "carrier_tx": null, "height": null })),
-        })
+        Ok((bundle.bundle_id, settled))
+    }
+}
+
+/// The submit's answer for its last bundle.
+fn outcome(bundle_id: &str, settled: Option<Settled>) -> Reply {
+    match settled {
+        Some(done) => reply(200, serde_json::json!({ "outcome": "finalized", "bundle_id": bundle_id, "carrier_tx": done.carrier_tx, "height": done.height })),
+        None => reply(200, serde_json::json!({ "outcome": "aborted", "bundle_id": bundle_id, "carrier_tx": null, "height": null })),
     }
 }
 
